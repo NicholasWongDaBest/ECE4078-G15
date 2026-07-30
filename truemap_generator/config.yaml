@@ -1,0 +1,33 @@
+# Config file for the map generator
+---
+# ===============================================
+# Main params to modify
+# ===============================================
+input_image: sample.jpg
+output_map_name: truemap.txt
+
+# a reference map to display objects on the map
+reference_map: ref_map.txt
+
+# change this for different GUI size for your screen
+image_display_res:
+  x: 1080
+  y: 720
+
+# increase this if it is difficult to click on the objects
+max_click_radius: 25  # unit: [pixels]
+
+arena_size: # unit: [m]
+  x: 2.5
+  y: 2.5
+
+# ===============================================
+# less important params (recommend not to change)
+# ===============================================
+ArUco_block_size: 0.06  # unit: [m]
+border_size: 2
+grid_size: 1
+reference_error_line_size: 1
+object_point_size: 12
+ArUco_font_size: 0.5
+ArUco_font_thickness: 1
