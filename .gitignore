@@ -38,6 +38,10 @@ pip-delete-this-directory.txt
 
 # Robot txt files
 *.txt
+!intrinsic.txt
+!distCoeffs.txt
+!scale.txt
+!baseline.txt
 
 # Unit test / coverage reports
 htmlcov/
