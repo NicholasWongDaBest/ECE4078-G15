@@ -206,19 +206,19 @@ class Operate:
         for event in pygame.event.get():
             # drive forward
             if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
-                self.command['wheel_speed'] = [0.6, 0.6]
+                pass # TODO
             # drive backward
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
-                self.command['wheel_speed'] = [-0.6, -0.6]
+                pass # TODO
             # turn left
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.command['wheel_speed'] = [-0.6, 0.6]
+                pass # TODO
             # drive right
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.command['wheel_speed'] = [0.6, -0.6]
+                pass # TODO
             # stop (set speed to zero)
             elif event.type == pygame.KEYUP or (event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE):
-                self.command['wheel_speed'] = [0, 0]
+                pass # TODO
             # run SLAM
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
                 n_observed_markers = len(self.ekf.taglist)
@@ -257,16 +257,13 @@ class Operate:
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
                 self.command['save_obj_detector'] = True
             # capture and save raw image
-            elif event.type == pygame.KEYDOWN and event.key  == pygame.K_i:
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_i:
                 self.command['save_image'] = True
             # quit
             elif event.type == pygame.QUIT:
                 self.quit = True
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self.quit = True
-
-            self.botconnect.move_manual(self.command['wheel_speed'])
-
         if self.quit:
             pygame.quit()
             sys.exit()
