@@ -43,6 +43,8 @@ pip-delete-this-directory.txt
 !scale.txt
 !baseline.txt
 
+*.png
+
 # Unit test / coverage reports
 htmlcov/
 .tox/

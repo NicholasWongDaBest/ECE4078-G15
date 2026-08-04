@@ -27,6 +27,7 @@ class BotConnect:
         self.left_count = 0
         self.right_count = 0
         self.move_mode = 0 # 0 is manual driving, 1 is autonomous based on time, 2 is autonomous based on encoder count
+        self.speed_lock = threading.Lock()
         self.autonomous_done = False
         
         # Camera frame
@@ -66,27 +67,30 @@ class BotConnect:
     def move_manual(self, wheel_speed):
         # Change the robot speed here. The value should be between -1 and 1.
         # Note that this is just a number specifying how fast the robot should go, not the actual speed in m/s
-        self.left_speed = max(min(wheel_speed[0], 1), -1) 
-        self.right_speed = max(min(wheel_speed[1], 1), -1)
-        self.move_mode = 0
+        with self.speed_lock:
+            self.left_speed = max(min(wheel_speed[0], 1), -1)
+            self.right_speed = max(min(wheel_speed[1], 1), -1)
+            self.move_mode = 0
         
     def move_auto_time(self, wheel_speed, duration):
         # call this function to move the robot autonomously for a specified duration (seconds)
         # to determine if the movement is done, check the self.autonomous_done flag
-        self.left_speed = max(min(wheel_speed[0], 1), -1)
-        self.right_speed = max(min(wheel_speed[1], 1), -1)
-        self.duration = duration
-        self.autonomous_done = False
-        self.move_mode = 1
+        with self.speed_lock:
+            self.left_speed = max(min(wheel_speed[0], 1), -1)
+            self.right_speed = max(min(wheel_speed[1], 1), -1)
+            self.duration = duration
+            self.autonomous_done = False
+            self.move_mode = 1
         
     def move_auto_encoder(self, wheel_speed, target_left_enc, target_right_enc):
         # call this function to move the robot autonomously for a specified number of encoder counts
-        self.left_speed = max(min(wheel_speed[0], 1), -1)
-        self.right_speed = max(min(wheel_speed[1], 1), -1)
-        self.target_left_enc = target_left_enc
-        self.target_right_enc = target_right_enc
-        self.autonomous_done = False
-        self.move_mode = 2
+        with self.speed_lock:
+            self.left_speed = max(min(wheel_speed[0], 1), -1)
+            self.right_speed = max(min(wheel_speed[1], 1), -1)
+            self.target_left_enc = target_left_enc
+            self.target_right_enc = target_right_enc
+            self.autonomous_done = False
+            self.move_mode = 2
     
     def get_image(self):
         with self.frame_lock: # need to lock when multiple threads access the same data, especially if data is bigger in size
@@ -110,10 +114,17 @@ class BotConnect:
                 prev_speed_manual = []
                 while self.running:
                     try:
+                        with self.speed_lock:
+                            mode = self.move_mode
+                            l_speed = self.left_speed
+                            r_speed = self.right_speed
+                            duration = getattr(self, 'duration', None)
+                            t_left_enc = getattr(self, 'target_left_enc', None)
+                            t_right_enc = getattr(self, 'target_right_enc', None)
                         # Manual driving mode
-                        if (self.move_mode == 0):
-                            if prev_speed_manual != (self.left_speed, self.right_speed): # only send if speeds are new
-                                data_send = struct.pack("!Bff", self.move_mode, self.left_speed, self.right_speed)
+                        if mode == 0:
+                            if prev_speed_manual != (l_speed, r_speed): # only send if speeds are new
+                                data_send = struct.pack("!Bff", mode, l_speed, r_speed)
                                 wheel_socket.sendall(data_send)
                                 
                                 # Receive encoder counts
@@ -125,11 +136,11 @@ class BotConnect:
                                 
                                 # Update encoder counts
                                 self.left_count, self.right_count = struct.unpack("!ii", data_recv)
-                                prev_speed_manual = (self.left_speed, self.right_speed)
+                                prev_speed_manual = (l_speed, r_speed)
                         
                         # Autonomous mode, based on time. Time is monitored on the robot/server side.
-                        if (self.move_mode == 1):
-                            data_send = struct.pack("!Bfff", self.move_mode, self.left_speed, self.right_speed, self.duration)
+                        if mode == 1:
+                            data_send = struct.pack("!Bfff", mode, l_speed, r_speed, duration)
                             wheel_socket.sendall(data_send)
                             
                             # Receive encoder counts
@@ -146,8 +157,8 @@ class BotConnect:
                             self.move_mode = 0
                         
                         # Autonomous mode, based on encoder count. Count is monitored on the robot/server side.
-                        if (self.move_mode == 2):
-                            data_send = struct.pack("!Bffii", self.move_mode, self.left_speed, self.right_speed, self.target_left_enc, self.target_right_enc)
+                        if mode == 2:
+                            data_send = struct.pack("!Bffii", mode, l_speed, r_speed, t_left_enc, t_left_enc)
                             wheel_socket.sendall(data_send)
                             
                             # Receive encoder counts
