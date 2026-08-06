@@ -3,7 +3,7 @@
 # ===============================================
 # Main params to modify
 # ===============================================
-input_image: sample.jpg
+input_image: testmap1.JPEG
 output_map_name: truemap.txt
 
 # a reference map to display objects on the map
@@ -11,8 +11,8 @@ reference_map: ref_map.txt
 
 # change this for different GUI size for your screen
 image_display_res:
-  x: 1080
-  y: 720
+  x: 720
+  y: 380
 
 # increase this if it is difficult to click on the objects
 max_click_radius: 25  # unit: [pixels]

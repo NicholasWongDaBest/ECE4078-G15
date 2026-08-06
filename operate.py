@@ -249,7 +249,7 @@ class Operate:
                 self.base_wheel_speed = [-0.35, 0.35]
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
                 self.base_wheel_speed = [0.35, -0.35]
-            elif event.type == pygame.KEYDOWN or (event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE):
+            elif event.type == pygame.KEYDOWN and (event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE):
                 self.base_wheel_speed = [0.0, 0.0]
             elif event.type == pygame.KEYUP and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
                 self.base_wheel_speed = [0.0, 0.0]
@@ -324,7 +324,7 @@ class Operate:
 
         self.command['wheel_speed'] = adjusted
         self.botconnect.move_manual(adjusted)
-        print(f"L:{left} R:{right}  dL:{delta_left} dR:{delta_right}")
+        # print(f"L:{left} R:{right}  dL:{delta_left} dR:{delta_right}")
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -102,9 +102,11 @@ class EKF:
         Q = self.predict_covariance(drive_measurement)
         Q[0:3,0:3] += 0.01*np.eye(3)
 
-        # TODO: add your codes here to compute the predicted x
-        pass
-        # TODO ends
+        # 1. Move the robot's state estimate forward using the motion model
+        self.robot.drive(drive_measurement)
+
+        # 2. Propagate the covariance forward: P = F P F^T + Q
+        self.P = F @ self.P @ F.T + Q
 
     # the update/correct step of EKF
     def update(self, sensor_measurement):
@@ -128,10 +130,24 @@ class EKF:
 
         x = self.get_state_vector()
 
-        # TODO: add your codes here to compute the updated x
-        pass
-        # TODO ends
+        # 1. Innovation (measurement residual)
+        y = z - z_hat
 
+        # 2. Innovation covariance
+        S = H @ self.P @ H.T + R
+
+        # 3. Kalman gain
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        # 4. Updated state estimate
+        x = x + K @ y
+
+        # 5. Updated covariance estimate (Joseph form is more numerically stable,
+        #    but the simple form is fine for this lab)
+        self.P = (np.eye(self.P.shape[0]) - K @ H) @ self.P
+
+        # 6. Write the corrected state back into robot pose + landmarks
+        self.set_state_vector(x)
 
     def state_transition(self, drive_measurement):
         n = self.number_landmarks()*2 + 3
