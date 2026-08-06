@@ -149,11 +149,21 @@ def eval_object(object_est, object_gt, transform=None):
     # print(f'Average object pose estimation error: {sum(errors.values()) / len(errors)}')
     return errors
 
+def compute_grade(aligned_rmse, num_found_markers, max_rmse, min_rmse, base, total_markers=10):
+    rating = (max_rmse - aligned_rmse) / (max_rmse - min_rmse)
+    rating = np.clip(rating, 0.0, 1.0)
+    grade = (base**rating - 1) / (base - 1) * num_found_markers / total_markers
+    return rating, grade*100
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Matching the estimated map and the true map')
     parser.add_argument('--truemap', type=str, default='truemap.txt')
     parser.add_argument('--slam-est', type=str, default='lab_output/slam.txt')
     parser.add_argument('--object-est', type=str, default='lab_output/objects.txt')
+    parser.add_argument('--max-rmse', type=float, default=0.3, help='Max RMSE for grading scale')
+    parser.add_argument('--min-rmse', type=float, default=0.0, help='Min RMSE for grading scale')
+    parser.add_argument('--base', type=float, default=10.0, help='Base for the grading curve')
+    parser.add_argument('--total-markers', type=int, default=10, help='Total possible markers')
     args, _ = parser.parse_known_args()
 
     aruco_gt, object_gt = parse_map(args.truemap)
@@ -173,10 +183,13 @@ if __name__ == '__main__':
     else:
         slam_only = True
 
-
     if slam_only: # only evaluate SLAM
         print('Evaluating SLAM only:')
         slam_rmse_aligned, _ = eval_slam(aruco_est, aruco_gt)
+        num_found = len(aruco_est)
+        rating, grade = compute_grade(slam_rmse_aligned, num_found, args.max_rmse, args.min_rmse, args.base, args.total_markers)
+        print(f'\nRating: {np.round(rating, 5)}')
+        print(f'Grade: {np.round(grade, 5)}')
     elif object_only: # only evaluate object
         print('Evaluating Object Detection only:')
         object_est_errors = eval_object(object_est, object_gt, transform=None)
@@ -184,3 +197,7 @@ if __name__ == '__main__':
         print('Evaluating both SLAM & Object Detection:')
         slam_rmse_aligned, transform = eval_slam(aruco_est, aruco_gt)
         object_est_errors = eval_object(object_est, object_gt, transform=transform)
+        num_found = len(aruco_est)
+        rating, grade = compute_grade(slam_rmse_aligned, num_found, args.max_rmse, args.min_rmse, args.base, args.total_markers)
+        print(f'\nRating: {np.round(rating, 5)}')
+        print(f'Grade: {np.round(grade, 5)}')

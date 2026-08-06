@@ -34,7 +34,7 @@ class Operate:
         # self.botconnect.set_pid(use_pid=1, kp=0, ki=0, kd=0)
 
         # PID gains — now adjustable live via keyboard, not fixed at startup
-        self.pid_gains = {'kp': 2.3, 'ki': 1.5, 'kd': 0.7}
+        self.pid_gains = {'kp': 3, 'ki': 1.6, 'kd': 0.7}
         self.pid_step = 0.01
         self.botconnect.set_pid(use_pid=1, **self.pid_gains)
 
