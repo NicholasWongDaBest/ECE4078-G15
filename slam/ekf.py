@@ -113,42 +113,36 @@ class EKF:
         if not sensor_measurement:
             return
 
-        # Tuning knobs for damped correction
-        max_alpha = 1.0        # full correction strength when innovation is normal
-        damp_threshold = 3.0   # Mahalanobis distance above which we start damping
-        min_alpha = 0.2        # floor so large errors still eventually get corrected
+        # Only use measurements for landmarks already in the map — with the
+        # add_landmarks gating, a currently-visible tag may not be in
+        # self.taglist yet if it hasn't met the anchor requirement.
+        sensor_measurement = [lm for lm in sensor_measurement if lm.tag in self.taglist]
 
-        # Construct measurement index list
+        if len(sensor_measurement) < 2:
+            return
+
+        max_alpha = 1.0
+        damp_threshold = 3.0
+        min_alpha = 0.2
+
         tags = [lm.tag for lm in sensor_measurement]
         idx_list = [self.taglist.index(tag) for tag in tags]
 
-        # Stack measurements and set covariance
         z = np.concatenate([lm.position.reshape(-1,1) for lm in sensor_measurement], axis=0)
         R = np.zeros((2*len(sensor_measurement),2*len(sensor_measurement)))
         for i in range(len(sensor_measurement)):
             R[2*i:2*i+2,2*i:2*i+2] = 0.1*np.eye(2)
 
-        # Compute own measurements
         z_hat = self.robot.measure(self.markers, idx_list)
         z_hat = z_hat.reshape((-1,1), order="F")
         H = self.robot.derivative_measure(self.markers, idx_list)
 
         x = self.get_state_vector()
 
-        # 1. Innovation (measurement residual)
         y = z - z_hat
-
-        # 2. Innovation covariance
         S = H @ self.P @ H.T + R
-
-        # 3. Kalman gain
         K = self.P @ H.T @ np.linalg.inv(S)
 
-        # 4. Determine damping factor based on how large the innovation is
-        #    relative to what the filter currently expects (Mahalanobis distance).
-        #    Small/expected innovations apply at full strength; large, sudden
-        #    innovations (e.g. right after a blind rotation) get spread out
-        #    over a few frames instead of snapping in one step.
         S_inv = np.linalg.inv(S)
         mahal_dist = np.sqrt((y.T @ S_inv @ y).item())
 
@@ -158,15 +152,9 @@ class EKF:
         else:
             alpha = max_alpha
 
-        # 5. Updated state estimate (damped)
         x = x + alpha * (K @ y)
-
-        # 6. Updated covariance estimate (damped to match — keeps P consistent
-        #    with how much correction was actually applied, so it doesn't
-        #    become overconfident before the state has actually converged)
         self.P = self.P - alpha * (K @ H @ self.P)
 
-        # 7. Write the corrected state back into robot pose + landmarks
         self.set_state_vector(x)
 
     def state_transition(self, drive_measurement):
@@ -185,22 +173,23 @@ class EKF:
         if not sensor_measurement:
             return
 
+        if len(sensor_measurement) < 2:
+            return  # need at least 2 landmarks in view to add new ones
+
         th = self.robot.state[2]
         robot_xy = self.robot.state[0:2,:]
         R_theta = np.block([[np.cos(th), -np.sin(th)],[np.sin(th), np.cos(th)]])
 
-        # Add new landmarks to the state
         for lm in sensor_measurement:
             if lm.tag in self.taglist:
-                continue # ignore known tags
-            
+                continue
+
             lm_position = lm.position
             lm_state = robot_xy + R_theta @ lm_position
 
             self.taglist.append(int(lm.tag))
             self.markers = np.concatenate((self.markers, lm_state), axis=1)
 
-            # Create a simple, large covariance to be fixed by the update step
             self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
             self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
             self.P[-2,-2] = self.init_lm_cov**2
