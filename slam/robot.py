@@ -81,8 +81,13 @@ class Robot:
         dt = drive_measurement.dt
         th = self.state[2,0]
         
-        # TODO: add your codes here to compute DFx using lin_vel, ang_vel, dt, and th
-        pass
+        # TODO: add your codes here to compute DFx using lin_vel, ang_vel, dt, and th(the robots current heading angle referenced from origin)
+        if ang_vel == 0:
+            DFx[0,2] = -lin_vel*np.sin(th)*dt
+            DFx[1,2] = lin_vel*np.cos(th)*dt
+        else:
+            DFx[0, 2] = (lin_vel / ang_vel) * (np.cos(th + dt * ang_vel) - np.cos(th))
+            DFx[1, 2] = (lin_vel / ang_vel) * (np.sin(th + dt * ang_vel) - np.sin(th))
         ##### TODO end
 
         return DFx
@@ -132,7 +137,25 @@ class Robot:
         Jac2 = np.zeros((3,2))
         
         # TODO: add your codes here to compute Jac2 using lin_vel, ang_vel, dt, th, and th2
-        pass
+        if ang_vel == 0:
+            Jac2[0, 0] = np.cos(th) * dt
+            Jac2[1, 0] = np.sin(th) * dt
+            Jac2[2, 0] = 0
+            
+            Jac2[0, 1] = 0
+            Jac2[1, 1] = 0
+            Jac2[2, 1] = dt
+        else:
+            # Derivatives with respect to linear velocity v
+            Jac2[0, 0] = (np.sin(th2) - np.sin(th)) / ang_vel
+            Jac2[1, 0] = -(np.cos(th2) - np.cos(th)) / ang_vel
+            Jac2[2, 0] = 0
+            
+            # Derivatives with respect to angular velocity w (using quotient rule)
+            Jac2[0, 1] = (lin_vel * dt * np.cos(th2)) / ang_vel - (lin_vel * (np.sin(th2) - np.sin(th))) / (ang_vel**2)
+            Jac2[1, 1] = (lin_vel * dt * np.sin(th2)) / ang_vel + (lin_vel * (np.cos(th2) - np.cos(th))) / (ang_vel**2)
+            Jac2[2, 1] = dt
+        # TODO end
         # TODO end
 
         # Derivative of x,y,theta w.r.t. left_speed, right_speed

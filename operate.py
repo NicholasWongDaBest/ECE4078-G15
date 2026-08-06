@@ -34,7 +34,7 @@ class Operate:
         # self.botconnect.set_pid(use_pid=1, kp=0, ki=0, kd=0)
 
         # PID gains — now adjustable live via keyboard, not fixed at startup
-        self.pid_gains = {'kp': 2.3, 'ki': 1.5, 'kd': 0.7}
+        self.pid_gains = {'kp': 3, 'ki': 1.6, 'kd': 0.7}
         self.pid_step = 0.01
         self.botconnect.set_pid(use_pid=1, **self.pid_gains)
 
@@ -230,28 +230,28 @@ class Operate:
 
             if event.type == pygame.KEYDOWN and event.key == pygame.K_z:
                 self.adjust_pid('kp', -self.pid_step)
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_x:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_x:
                 self.adjust_pid('kp', self.pid_step)
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_c:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_c:
                 self.adjust_pid('ki', -self.pid_step)
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_v:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_v:
                 self.adjust_pid('ki', self.pid_step)
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_b:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
                 self.adjust_pid('kd', -self.pid_step)
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_m:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_m:
                 self.adjust_pid('kd', self.pid_step)
 
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
                 self.base_wheel_speed = [0.35, 0.35]
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
                 self.base_wheel_speed = [-0.35, -0.35]
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.base_wheel_speed = [-0.35, 0.35]
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.base_wheel_speed = [0.35, -0.35]
-            elif event.type == pygame.KEYDOWN or (event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE):
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
+                self.base_wheel_speed = [-0.3, 0.3]
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
+                self.base_wheel_speed = [0.3, -0.3]
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                 self.base_wheel_speed = [0.0, 0.0]
-            elif event.type == pygame.KEYUP and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
+            if event.type == pygame.KEYUP and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
                 self.base_wheel_speed = [0.0, 0.0]
             # run SLAM
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:

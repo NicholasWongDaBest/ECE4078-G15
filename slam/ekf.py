@@ -96,15 +96,50 @@ class EKF:
 
     # the prediction step of EKF
     def predict(self, drive_measurement):
+        # # OLD CODE, ADD FLAT UNCERTAINTY (0.01) TO PURE ROTATION AND TRANSLATION
+        # F = self.state_transition(drive_measurement)
+        # x = self.get_state_vector()
+        # Q = self.predict_covariance(drive_measurement)
+        # Q[0:3,0:3] += 0.01*np.eye(3)
 
+        # # TODO: add your codes here to compute the predicted x
+        # # 1. Drive the robot forward to propagate state
+        # self.robot.drive(drive_measurement)
+        
+        # # 2. Propagate state uncertainty covariance P
+        # self.P = F @ self.P @ F.T + Q
+        # # TODO end
+
+        ## NOW DO DIFFERENT NOISE DEPENDING ON TRANSLATION OR ROTATION + SCALE Q WITH TIME
         F = self.state_transition(drive_measurement)
         x = self.get_state_vector()
         Q = self.predict_covariance(drive_measurement)
-        Q[0:3,0:3] += 0.01*np.eye(3)
 
-        # TODO: add your codes here to compute the predicted x
-        pass
-        # TODO ends
+        dt = drive_measurement.dt
+
+        # Calculate linear and angular components
+        v_left = abs(drive_measurement.left_speed)
+        v_right = abs(drive_measurement.right_speed)
+        v_avg = abs(v_left + v_right) / 2.0  # Forward speed
+
+        if v_avg < 0.05:  # Pure rotation / Turning on the spot
+            # Only add process noise to theta (heading), lock x and y!
+            Q_boost = np.diag([0.0, 0.0, 0.005 * v_avg * dt + 1e-4,])
+        else:  # Moving forward
+            # Add normal process noise to x, y, and theta
+            Q_boost = np.diag(
+                        [
+                            0.001 * v_avg * dt + 1e-5,  # x noise
+                            0.001 * v_avg * dt + 1e-5,  # y noise
+                            0.005 * v_avg * dt + 1e-4,  # theta noise
+                        ]
+                )
+
+        Q[0:3, 0:3] += Q_boost
+
+        # Propagate state and covariance
+        self.robot.drive(drive_measurement)
+        self.P = F @ self.P @ F.T + Q
 
     # the update/correct step of EKF
     def update(self, sensor_measurement):
@@ -119,7 +154,7 @@ class EKF:
         z = np.concatenate([lm.position.reshape(-1,1) for lm in sensor_measurement], axis=0)
         R = np.zeros((2*len(sensor_measurement),2*len(sensor_measurement)))
         for i in range(len(sensor_measurement)):
-            R[2*i:2*i+2,2*i:2*i+2] = 0.1*np.eye(2)
+            R[2*i:2*i+2,2*i:2*i+2] = 0.5*np.eye(2)
 
         # Compute own measurements
         z_hat = self.robot.measure(self.markers, idx_list)
@@ -127,9 +162,24 @@ class EKF:
         H = self.robot.derivative_measure(self.markers, idx_list)
 
         x = self.get_state_vector()
-
+        
         # TODO: add your codes here to compute the updated x
-        pass
+        # 1. Measurement residual (innovation)
+        y = z - z_hat
+        
+        # 2. Innovation covariance
+        S = H @ self.P @ H.T + R
+        
+        # 3. Kalman Gain
+        K = self.P @ H.T @ np.linalg.inv(S)
+        
+        # 4. Update state vector x and set it back in robot/markers
+        x_updated = x + K @ y
+        self.set_state_vector(x_updated)
+        
+        # 5. Update state covariance P
+        I = np.eye(len(x))
+        self.P = (I - K @ H) @ self.P
         # TODO ends
 
 
@@ -268,7 +318,7 @@ class EKF:
         e_vals = e_vals[idx]
         e_vecs = e_vecs[:, idx]
         alpha = np.sqrt(4.605)
-        axes_len = e_vals*2*alpha
+        axes_len = np.sqrt(np.maximum(0, e_vals)) * 2 * alpha
         if abs(e_vecs[1, 0]) > 1e-3:
             angle = np.arctan(e_vecs[0, 0]/e_vecs[1, 0])
         else:
