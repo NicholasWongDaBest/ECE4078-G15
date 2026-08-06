@@ -123,21 +123,35 @@ class BotConnect:
                             t_right_enc = getattr(self, 'target_right_enc', None)
                         # Manual driving mode
                         if mode == 0:
-                            if prev_speed_manual != (l_speed, r_speed): # only send if speeds are new
-                                data_send = struct.pack("!Bff", mode, l_speed, r_speed)
-                                wheel_socket.sendall(data_send)
+                            # if prev_speed_manual != (l_speed, r_speed): # only send if speeds are new
+                            #     data_send = struct.pack("!Bff", mode, l_speed, r_speed)
+                            #     wheel_socket.sendall(data_send)
                                 
-                                # Receive encoder counts
-                                # .recv is a blocking call and waits indefinitely until data is received
-                                data_recv = wheel_socket.recv(8)
-                                if not data_recv or len(data_recv) != 8:
-                                    print("Wheel server disconnected")
-                                    break
+                            #     # Receive encoder counts
+                            #     # .recv is a blocking call and waits indefinitely until data is received
+                            #     data_recv = wheel_socket.recv(8)
+                            #     if not data_recv or len(data_recv) != 8:
+                            #         print("Wheel server disconnected")
+                            #         break
                                 
-                                # Update encoder counts
-                                self.left_count, self.right_count = struct.unpack("!ii", data_recv)
-                                prev_speed_manual = (l_speed, r_speed)
-                        
+                            #     # Update encoder counts
+                            #     self.left_count, self.right_count = struct.unpack("!ii", data_recv)
+                            #     prev_speed_manual = (l_speed, r_speed)
+
+
+                            data_send = struct.pack("!Bff", mode, l_speed, r_speed)
+                            wheel_socket.sendall(data_send)
+                            
+                            # Receive encoder counts
+                            data_recv = wheel_socket.recv(8)
+                            if not data_recv or len(data_recv) != 8:
+                                print("Wheel server disconnected")
+                                break
+                            
+                            # Update encoder counts
+                            self.left_count, self.right_count = struct.unpack("!ii", data_recv)
+                            prev_speed_manual = (l_speed, r_speed)  # can keep for reference, no longer gates anything
+                    
                         # Autonomous mode, based on time. Time is monitored on the robot/server side.
                         if mode == 1:
                             data_send = struct.pack("!Bfff", mode, l_speed, r_speed, duration)

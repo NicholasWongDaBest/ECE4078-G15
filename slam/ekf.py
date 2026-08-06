@@ -96,11 +96,24 @@ class EKF:
 
     # the prediction step of EKF
     def predict(self, drive_measurement):
+        # # OLD CODE, ADD FLAT UNCERTAINTY (0.01) TO PURE ROTATION AND TRANSLATION
+        # F = self.state_transition(drive_measurement)
+        # x = self.get_state_vector()
+        # Q = self.predict_covariance(drive_measurement)
+        # Q[0:3,0:3] += 0.01*np.eye(3)
 
+        # # TODO: add your codes here to compute the predicted x
+        # # 1. Drive the robot forward to propagate state
+        # self.robot.drive(drive_measurement)
+        
+        # # 2. Propagate state uncertainty covariance P
+        # self.P = F @ self.P @ F.T + Q
+        # # TODO end
+
+        ## NOW DO DIFFERENT NOISE DEPENDING ON TRANSLATION OR ROTATION + SCALE Q WITH TIME
         F = self.state_transition(drive_measurement)
         x = self.get_state_vector()
         Q = self.predict_covariance(drive_measurement)
-        Q[0:3,0:3] += 0.01*np.eye(3)
 
         # 1. Move the robot's state estimate forward using the motion model
         self.robot.drive(drive_measurement)
@@ -131,7 +144,7 @@ class EKF:
         z = np.concatenate([lm.position.reshape(-1,1) for lm in sensor_measurement], axis=0)
         R = np.zeros((2*len(sensor_measurement),2*len(sensor_measurement)))
         for i in range(len(sensor_measurement)):
-            R[2*i:2*i+2,2*i:2*i+2] = 0.1*np.eye(2)
+            R[2*i:2*i+2,2*i:2*i+2] = 0.5*np.eye(2)
 
         z_hat = self.robot.measure(self.markers, idx_list)
         z_hat = z_hat.reshape((-1,1), order="F")
@@ -293,7 +306,7 @@ class EKF:
         e_vals = e_vals[idx]
         e_vecs = e_vecs[:, idx]
         alpha = np.sqrt(4.605)
-        axes_len = e_vals*2*alpha
+        axes_len = np.sqrt(np.maximum(0, e_vals)) * 2 * alpha
         if abs(e_vecs[1, 0]) > 1e-3:
             angle = np.arctan(e_vecs[0, 0]/e_vecs[1, 0])
         else:
