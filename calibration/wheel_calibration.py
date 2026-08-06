@@ -16,7 +16,7 @@ def calibrateScale():
     # Repeat the procedures multiple times (can use different raw speed), to obtain the average value for a more robust measurement.
 
     # Feel free to change the range and do more repetition
-    wheel_speed_range = [[0.4, 0.4], [0.45, 0.45], [0.5, 0.5]]
+    wheel_speed_range = [[0.35, 0.35], [0.45, 0.45], [0.5, 0.5]]
     delta_times = []
 
     for wheel_speed in wheel_speed_range:
@@ -37,7 +37,10 @@ def calibrateScale():
     num = len(wheel_speed_range)
     scale = 0
     for delta_time, wheel_speed in zip(delta_times, wheel_speed_range):
-        pass # TODO: compute the scale parameter
+        # TODO: compute the scale parameter
+        scale += 1/(delta_time*wheel_speed[0])
+
+    scale /= num 
     print("The scale parameter is estimated as {:.6f} m/M.".format(scale))
 
     return scale
@@ -70,7 +73,9 @@ def calibrateBaseline(scale):
     num = len(wheel_speed_range)
     baseline = 0
     for delta_time, wheel_speed in zip(delta_times, wheel_speed_range):
-        pass # TODO: replace with your code to compute the baseline parameter using scale, wheel_speed, and delta_time
+        # TODO: replace with your code to compute the baseline parameter using scale, wheel_speed, and delta_time
+        baseline += (wheel_speed[0]*scale*delta_time)/np.pi
+    baseline /= num
     print("The baseline parameter is estimated as {:.6f} m.".format(baseline))
 
     return baseline
@@ -82,8 +87,8 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
     
     botconnect = BotConnect(args.ip)
-    botconnect.set_pid(use_pid=1, kp=???, ki=???, kd=???) # TODO: replace with your best constants
-
+    botconnect.set_pid(use_pid=1, kp=2.3, ki=1.5, kd=0.7) # TODO: replace with your best constants
+    
     # calibrate pibot scale and baseline
     dataDir = "{}/param/".format(os.getcwd())
 
