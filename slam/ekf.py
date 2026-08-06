@@ -113,6 +113,11 @@ class EKF:
         if not sensor_measurement:
             return
 
+        # Tuning knobs for damped correction
+        max_alpha = 1.0        # full correction strength when innovation is normal
+        damp_threshold = 3.0   # Mahalanobis distance above which we start damping
+        min_alpha = 0.2        # floor so large errors still eventually get corrected
+
         # Construct measurement index list
         tags = [lm.tag for lm in sensor_measurement]
         idx_list = [self.taglist.index(tag) for tag in tags]
@@ -139,14 +144,29 @@ class EKF:
         # 3. Kalman gain
         K = self.P @ H.T @ np.linalg.inv(S)
 
-        # 4. Updated state estimate
-        x = x + K @ y
+        # 4. Determine damping factor based on how large the innovation is
+        #    relative to what the filter currently expects (Mahalanobis distance).
+        #    Small/expected innovations apply at full strength; large, sudden
+        #    innovations (e.g. right after a blind rotation) get spread out
+        #    over a few frames instead of snapping in one step.
+        S_inv = np.linalg.inv(S)
+        mahal_dist = np.sqrt((y.T @ S_inv @ y).item())
 
-        # 5. Updated covariance estimate (Joseph form is more numerically stable,
-        #    but the simple form is fine for this lab)
-        self.P = (np.eye(self.P.shape[0]) - K @ H) @ self.P
+        if mahal_dist > damp_threshold:
+            alpha = max_alpha * (damp_threshold / mahal_dist)
+            alpha = max(alpha, min_alpha)
+        else:
+            alpha = max_alpha
 
-        # 6. Write the corrected state back into robot pose + landmarks
+        # 5. Updated state estimate (damped)
+        x = x + alpha * (K @ y)
+
+        # 6. Updated covariance estimate (damped to match — keeps P consistent
+        #    with how much correction was actually applied, so it doesn't
+        #    become overconfident before the state has actually converged)
+        self.P = self.P - alpha * (K @ H @ self.P)
+
+        # 7. Write the corrected state back into robot pose + landmarks
         self.set_state_vector(x)
 
     def state_transition(self, drive_measurement):
