@@ -121,12 +121,23 @@ class MainView(QMainWindow):
         self.mainGrid.addWidget(self.ReferenceArenaLbl, 1, 20, 20, 20)
         self.mainGrid.addWidget(self.EstimatedArenaTitleLbl, 21, 20, 1, 20)
         self.mainGrid.addWidget(self.EstimatedArenaLbl, 22, 20, 20, 20)
-        self.mainGrid.addWidget(self.SaveBtn, 42, 0, 1, 40)
-
+        # Note: SaveBtn is no longer added to mainGrid -- it's pinned outside the scroll area below
 
         self.mainGridWidget = QWidget()
         self.mainGridWidget.setLayout(self.mainGrid)
-        self.setCentralWidget(self.mainGridWidget)
+
+        # Wrap the (potentially tall) image grid in a scroll area
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(self.mainGridWidget)
+
+        # Outer layout: scrollable content on top, Save button pinned at the bottom (always visible)
+        outer_widget = QWidget()
+        outer_layout = QVBoxLayout(outer_widget)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.addWidget(scroll_area)
+        outer_layout.addWidget(self.SaveBtn)
+        self.setCentralWidget(outer_widget)
 
         self.RenderImages()
 
@@ -497,5 +508,11 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     GUI = MainView()
     GUI.show()
-    GUI.setFixedSize(GUI.size())
+    # Size the window to fit the screen instead of the full (often oversized) content height,
+    # and keep it resizable so the person can adjust it further if needed.
+    screen_geom = app.primaryScreen().availableGeometry()
+    target_w = min(GUI.sizeHint().width(), int(screen_geom.width() * 0.9))
+    target_h = min(GUI.sizeHint().height(), int(screen_geom.height() * 0.9))
+    GUI.resize(target_w, target_h)
+
     sys.exit(app.exec_())
