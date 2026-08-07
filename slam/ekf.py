@@ -178,8 +178,16 @@ class EKF:
         self.set_state_vector(x_updated)
         
         # 5. Update state covariance P
+        # I = np.eye(len(x))
+        # self.P = (I - K @ H) @ self.P
+
+        # Joseph Form (Symmetric & Numerically Stable):
         I = np.eye(len(x))
-        self.P = (I - K @ H) @ self.P
+        I_KH = I - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+
+        # Force exact numerical symmetry
+        self.P = 0.5 * (self.P + self.P.T)
         # TODO ends
 
 

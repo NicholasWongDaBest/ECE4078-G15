@@ -16,7 +16,7 @@ def calibrateScale():
     # Repeat the procedures multiple times (can use different raw speed), to obtain the average value for a more robust measurement.
 
     # Feel free to change the range and do more repetition
-    wheel_speed_range = [[0.35, 0.35], [0.45, 0.45], [0.5, 0.5]]
+    wheel_speed_range = [[0.5, 0.5], [0.6, 0.6], [0.7, 0.7]]
     delta_times = []
 
     for wheel_speed in wheel_speed_range:
@@ -52,7 +52,7 @@ def calibrateBaseline(scale):
     # From the wheel_speed and delta_time, find out mathematically how to calculate the baseline.
 
     # Feel free to change the range / step and do more repetition
-    wheel_speed_range = [[-0.3, 0.3], [-0.3, 0.3], [-0.3, 0.3]]
+    wheel_speed_range = [[-0.5, 0.5], [-0.5, 0.5], [-0.5, 0.5]]
     delta_times = []
 
     for wheel_speed in wheel_speed_range:
