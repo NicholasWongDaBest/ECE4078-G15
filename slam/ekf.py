@@ -146,6 +146,7 @@ class EKF:
         if not sensor_measurement:
             return
 
+<<<<<<< Updated upstream
         # Construct measurement index list
         tags = [lm.tag for lm in sensor_measurement]
         idx_list = [self.taglist.index(tag) for tag in tags]
@@ -154,6 +155,21 @@ class EKF:
         z = np.concatenate([lm.position.reshape(-1,1) for lm in sensor_measurement], axis=0)
         R = np.zeros((2*len(sensor_measurement),2*len(sensor_measurement)))
         for i in range(len(sensor_measurement)):
+=======
+        # Only update on markers that are already part of the state (added via add_landmarks)
+        known_measurement = [lm for lm in sensor_measurement if lm.tag in self.taglist]
+        if not known_measurement:
+            return
+
+        # Construct measurement index list
+        tags = [lm.tag for lm in known_measurement]
+        idx_list = [self.taglist.index(tag) for tag in tags]
+
+        # Stack measurements and set covariance
+        z = np.concatenate([lm.position.reshape(-1,1) for lm in known_measurement], axis=0)
+        R = np.zeros((2*len(known_measurement),2*len(known_measurement)))
+        for i in range(len(known_measurement)):
+>>>>>>> Stashed changes
             R[2*i:2*i+2,2*i:2*i+2] = 0.5*np.eye(2)
 
         # Compute own measurements
@@ -217,11 +233,17 @@ class EKF:
         Q = np.zeros((n,n))
         Q[0:3,0:3] = self.robot.covariance_drive(drive_measurement)
         return Q
-
+    
     def add_landmarks(self, sensor_measurement):
         if not sensor_measurement:
             return
 
+<<<<<<< Updated upstream
+=======
+        if len(sensor_measurement) < 3:
+            return  # need at least 2 landmarks in view to add new ones
+
+>>>>>>> Stashed changes
         th = self.robot.state[2]
         robot_xy = self.robot.state[0:2,:]
         R_theta = np.block([[np.cos(th), -np.sin(th)],[np.sin(th), np.cos(th)]])
@@ -242,6 +264,7 @@ class EKF:
             self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
             self.P[-2,-2] = self.init_lm_cov**2
             self.P[-1,-1] = self.init_lm_cov**2
+
 
     @staticmethod
     def umeyama(from_points, to_points):

@@ -246,9 +246,15 @@ class Operate:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
                 self.base_wheel_speed = [-0.6, -0.6]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
+<<<<<<< Updated upstream
                 self.base_wheel_speed = [-0.5, 0.5]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
                 self.base_wheel_speed = [0.5, -0.5]
+=======
+                self.base_wheel_speed = [-0.65, 0.65]
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
+                self.base_wheel_speed = [0.65, -0.65]
+>>>>>>> Stashed changes
             if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                 self.base_wheel_speed = [0.0, 0.0]
             if event.type == pygame.KEYUP and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
