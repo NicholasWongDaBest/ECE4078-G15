@@ -1,3 +1,4 @@
+import os
 import cv2
 import math
 import json
@@ -69,6 +70,41 @@ class EKF:
         with open(fname, 'w') as map_f:
             json.dump(d, map_f, indent=4)
 
+    def save_state(self, fname):
+        """Persist markers, covariance, and taglist so they survive a restart."""
+        try:
+            state = {
+                'markers': self.markers.tolist(),
+                'P': self.P.tolist(),
+                'taglist': self.taglist,
+            }
+            tmp_fname = fname + '.tmp'
+            with open(tmp_fname, 'w') as f:
+                json.dump(state, f)
+            os.replace(tmp_fname, fname)  # atomic, avoids a corrupt file if killed mid-write
+        except Exception as e:
+            print(f"Failed to save SLAM state: {e}")
+
+    def load_state(self, fname):
+        """Restore markers, covariance, and taglist from a previous session.
+        Robot pose is intentionally NOT restored -- it stays at the origin and
+        should be re-anchored via recover_from_pause() (ENTER key) once
+        landmarks are back in view."""
+        if not os.path.exists(fname):
+            return False
+        try:
+            with open(fname, 'r') as f:
+                state = json.load(f)
+            markers = np.array(state['markers'], dtype=float)
+            markers = markers.reshape(2, -1) if markers.size else np.zeros((2, 0))
+            self.markers = markers
+            self.P = np.array(state['P'], dtype=float)
+            self.taglist = [int(t) for t in state['taglist']]
+            return True
+        except Exception as e:
+            print(f"Failed to load SLAM state: {e}")
+            return False
+
     def recover_from_pause(self, sensor_measurement):
         if not sensor_measurement:
             return False
@@ -82,7 +118,7 @@ class EKF:
                     tag.append(int(lm.tag))
                     lm_idx = self.taglist.index(lm.tag)
                     lm_prev = np.concatenate((lm_prev,self.markers[:,lm_idx].reshape(2, 1)), axis=1)
-            if int(lm_new.shape[1]) > 2:
+            if int(lm_new.shape[1]) >= 2:
                 R,t = self.umeyama(lm_new, lm_prev)
                 theta = math.atan2(R[1][0], R[0][0])
                 self.robot.state[:2]=t[:2]
@@ -165,7 +201,7 @@ class EKF:
         R = np.zeros((2*len(known_measurement),2*len(known_measurement)))
         for i in range(len(known_measurement)):
             distance = np.linalg.norm(known_measurement[i].position)
-            R[2*i:2*i+2, 2*i:2*i+2] = (0.1 + 0.05 * distance**2) * np.eye(2)  # with distance weight
+            R[2*i:2*i+2, 2*i:2*i+2] = (0.05 + 0.02 * distance**2) * np.eye(2)  # with distance weight
 
 
         x_prior = self.get_state_vector()      # x⁽⁰⁾ before any iteration
@@ -174,7 +210,7 @@ class EKF:
 
     # --- IEKF ITERATION LOOP ---
         x_iter = x_prior.copy()
-        max_iters = 5
+        max_iters = 3
 
         for iteration in range(max_iters):
             # 1. Update robot/markers state temporarily to re-evaluate z_hat and H

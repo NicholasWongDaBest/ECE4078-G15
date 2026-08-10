@@ -46,6 +46,10 @@ class Operate:
         # Initialise SLAM parameters
         self.ekf = self.init_ekf(args.calib_dir, args.ip)
         self.aruco_sensor = ArucoSensor(self.ekf.robot, marker_length=0.06) # size of the ARUCO markers (6cm)
+
+        # Persisted SLAM map: survives program restarts unless 'r','r' is pressed
+        self.slam_state_fname = os.path.join(self.lab_output_dir, 'slam_state.json')
+        self.ekf.load_state(self.slam_state_fname)  # no-op if the file doesn't exist
         
         # Initialise CV detector
         if args.yolo_path == "":
@@ -80,7 +84,10 @@ class Operate:
         self.ekf_on = False
         self.double_reset_comfirm = 0
         self.image_id = 0
-        self.notification = 'Press ENTER to start SLAM'
+        if self.ekf.number_landmarks() > 0:
+            self.notification = f'Restored {self.ekf.number_landmarks()} landmark(s) - view markers & press ENTER to relocalise'
+        else:
+            self.notification = 'Press ENTER to start SLAM'
         self.count_down = 300 # 5 min timer
         self.start_time = time.time()
         self.control_clock = time.time()
@@ -141,12 +148,18 @@ class Operate:
         scale = np.loadtxt(fileS, delimiter=',')
         fileB = os.path.join(calib_dir, 'baseline.txt')
         baseline = np.loadtxt(fileB, delimiter=',')
-        robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=183) ##change this value  
+        robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=175) ##change this value  
         return EKF(robot)
 
     # SLAM with ARUCO markers       
     def perform_slam(self, drive_measurement):
         sensor_measurement, self.aruco_img = self.aruco_sensor.detect_marker_positions(self.img)
+
+        # Discard any detected tag outside our known marker set (1-10).
+        # DICT_4X4_100 can detect tags 0-99, so a stray/misread marker would
+        # otherwise get added as a landmark and show up as "?" on the map.
+        sensor_measurement = [lm for lm in sensor_measurement if 1 <= lm.tag <= 10]
+
         if self.request_recover_robot:
             is_success = self.ekf.recover_from_pause(sensor_measurement)
             if is_success:
@@ -270,9 +283,9 @@ class Operate:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
                 self.base_wheel_speed = [-0.6, -0.6]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.base_wheel_speed = [-0.65, 0.65]
+                self.base_wheel_speed = [-0.7, 0.7]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.base_wheel_speed = [0.65, -0.65]
+                self.base_wheel_speed = [0.7, -0.7]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                 self.base_wheel_speed = [0.0, 0.0]
             if event.type == pygame.KEYUP and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
@@ -307,7 +320,9 @@ class Operate:
                 elif self.double_reset_comfirm == 1:
                     self.notification = 'SLAM Map is cleared'
                     self.double_reset_comfirm = 0
-                    self.ekf.reset()          
+                    self.ekf.reset()
+                    if os.path.exists(self.slam_state_fname):
+                        os.remove(self.slam_state_fname)       
             # run object/fruit detector
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_p:
                 self.command['run_obj_detector'] = True
@@ -326,6 +341,8 @@ class Operate:
             self.botconnect.move_manual(self.command['wheel_speed'])
 
         if self.quit:
+            if self.ekf.number_landmarks() > 0:
+                self.ekf.save_state(self.slam_state_fname)
             pygame.quit()
             sys.exit()
 
