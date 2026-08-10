@@ -2,7 +2,7 @@ import numpy as np
 
 
 class Robot:
-    def __init__(self, baseline, scale, camera_matrix, dist_coeffs):
+    def __init__(self, baseline, scale, camera_matrix, dist_coeffs,ticks_per_meter=None):
         # State is a 3 x 1 vector containing information on x-pos, y-pos, and orientation, ie [x; y; theta]
         # Positive x-axis is the direction the robot is facing, positive y-axis 90 degree anticlockwise of positive x-axis
         # For orientation, it is in radian. Positive when turning anticlockwise (left)
@@ -15,6 +15,7 @@ class Robot:
         # Camera parameters
         self.camera_matrix = camera_matrix  # Matrix of the focal lengths and camera centre
         self.dist_coeffs = dist_coeffs  # Distortion coefficients
+        self.ticks_per_meter = ticks_per_meter  # set via calibration; None disables tick-based drive
     
     def drive(self, drive_measurement):
         # This is the "f" function in EKF
@@ -22,10 +23,20 @@ class Robot:
         # dt is the length of time to drive for
 
         # Compute the linear and angular velocity
-        linear_velocity, angular_velocity = self.convert_wheel_speeds(drive_measurement.left_speed, drive_measurement.right_speed)
+        dt = drive_measurement.dt
+
+        if drive_measurement.delta_left_ticks is not None and drive_measurement.delta_right_ticks is not None:
+            # Use measured encoder displacement instead of commanded_speed * dt
+            dist_left = drive_measurement.delta_left_ticks / self.ticks_per_meter
+            dist_right = drive_measurement.delta_right_ticks / self.ticks_per_meter
+            linear_velocity = (dist_left + dist_right) / (2.0 * dt) if dt > 0 else 0.0
+            angular_velocity = (dist_right - dist_left) / (self.baseline * dt) if dt > 0 else 0.0
+        else:
+            linear_velocity, angular_velocity = self.convert_wheel_speeds(
+                drive_measurement.left_speed, drive_measurement.right_speed)
 
         # Apply the velocities
-        dt = drive_measurement.dt
+       
         if angular_velocity == 0:
             self.state[0] += np.cos(self.state[2]) * linear_velocity * dt
             self.state[1] += np.sin(self.state[2]) * linear_velocity * dt
@@ -125,13 +136,36 @@ class Robot:
     
     def covariance_drive(self, drive_measurement):
         # Derivative of lin_vel, ang_vel w.r.t. left_speed, right_speed
-        Jac1 = np.array([[self.scale/2, self.scale/2],
-                [-self.scale/self.baseline, self.scale/self.baseline]])
-        
+        # Jac1 = np.array([[self.scale/2, self.scale/2],
+        #         [-self.scale/self.baseline, self.scale/self.baseline]])
+        # distance = ticks / ticks_per_meter ; v = (d_left+d_right)/(2dt) ; ω = (d_right-d_left)/(baseline*dt)
+
+        dt = drive_measurement.dt
         lin_vel, ang_vel = self.convert_wheel_speeds(drive_measurement.left_speed, drive_measurement.right_speed)
         th = self.state[2,0]
-        dt = drive_measurement.dt
         th2 = th + dt*ang_vel
+
+        use_ticks = (drive_measurement.delta_left_ticks is not None
+                and drive_measurement.delta_right_ticks is not None
+                and self.ticks_per_meter is not None
+                and dt > 0)
+        
+        if use_ticks:
+            # Derivative of lin_vel, ang_vel w.r.t. delta_left_ticks, delta_right_ticks
+            Jac1 = np.array([
+                [1.0/(2*dt*self.ticks_per_meter),  1.0/(2*dt*self.ticks_per_meter)],
+                [-1.0/(dt*self.baseline*self.ticks_per_meter), 1.0/(dt*self.baseline*self.ticks_per_meter)]
+            ])
+            # Noise on encoder tick counts (tune empirically, e.g. ~1 tick^2 of quantization noise)
+            tick_count_variance = 1.0
+            cov_input = np.diag((tick_count_variance, tick_count_variance))
+        else:
+            # Derivative of lin_vel, ang_vel w.r.t. left_speed, right_speed (original behaviour)
+            Jac1 = np.array([[self.scale/2, self.scale/2],
+                    [-self.scale/self.baseline, self.scale/self.baseline]])
+            cov_input = np.diag((drive_measurement.left_cov, drive_measurement.right_cov))
+
+            
 
         # Derivative of x,y,theta w.r.t. lin_vel, ang_vel
         Jac2 = np.zeros((3,2))
@@ -155,14 +189,13 @@ class Robot:
             Jac2[0, 1] = (lin_vel * dt * np.cos(th2)) / ang_vel - (lin_vel * (np.sin(th2) - np.sin(th))) / (ang_vel**2)
             Jac2[1, 1] = (lin_vel * dt * np.sin(th2)) / ang_vel + (lin_vel * (np.cos(th2) - np.cos(th))) / (ang_vel**2)
             Jac2[2, 1] = dt
-        # TODO end
-        # TODO end
+
 
         # Derivative of x,y,theta w.r.t. left_speed, right_speed
         Jac = Jac2 @ Jac1
 
         # Compute covariance
-        cov = np.diag((drive_measurement.left_cov, drive_measurement.right_cov))
-        cov = Jac @ cov @ Jac.T
+        # cov = np.diag((drive_measurement.left_cov, drive_measurement.right_cov))
+        cov = Jac @ cov_input  @ Jac.T
         
         return cov

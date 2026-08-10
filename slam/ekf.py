@@ -7,12 +7,14 @@ import numpy as np
 
 # This class stores the wheel velocities of the robot, to be used in the EKF.
 class DriveMeasurement:
-    def __init__(self, left_speed, right_speed, dt, left_cov=1, right_cov=1):
+    def __init__(self, left_speed, right_speed, dt, left_cov=1, right_cov=1, delta_left_ticks=None, delta_right_ticks=None):
         self.left_speed = left_speed
         self.right_speed = right_speed
         self.dt = dt
         self.left_cov = left_cov
         self.right_cov = right_cov
+        self.delta_left_ticks = delta_left_ticks
+        self.delta_right_ticks = delta_right_ticks
 
 
 class EKF:
@@ -122,6 +124,7 @@ class EKF:
         v_right = abs(drive_measurement.right_speed)
         v_avg = abs(v_left + v_right) / 2.0  # Forward speed
 
+
         if v_avg < 0.05:  # Pure rotation / Turning on the spot
             # Only add process noise to theta (heading), lock x and y!
             Q_boost = np.diag([0.0, 0.0, 0.005 * v_avg * dt + 1e-4,])
@@ -146,16 +149,6 @@ class EKF:
         if not sensor_measurement:
             return
 
-<<<<<<< Updated upstream
-        # Construct measurement index list
-        tags = [lm.tag for lm in sensor_measurement]
-        idx_list = [self.taglist.index(tag) for tag in tags]
-
-        # Stack measurements and set covariance
-        z = np.concatenate([lm.position.reshape(-1,1) for lm in sensor_measurement], axis=0)
-        R = np.zeros((2*len(sensor_measurement),2*len(sensor_measurement)))
-        for i in range(len(sensor_measurement)):
-=======
         # Only update on markers that are already part of the state (added via add_landmarks)
         known_measurement = [lm for lm in sensor_measurement if lm.tag in self.taglist]
         if not known_measurement:
@@ -169,43 +162,88 @@ class EKF:
         z = np.concatenate([lm.position.reshape(-1,1) for lm in known_measurement], axis=0)
         R = np.zeros((2*len(known_measurement),2*len(known_measurement)))
         for i in range(len(known_measurement)):
->>>>>>> Stashed changes
-            R[2*i:2*i+2,2*i:2*i+2] = 0.5*np.eye(2)
+            distance = np.linalg.norm(known_measurement[i].position)
+            R[2*i:2*i+2, 2*i:2*i+2] = (0.1 + 0.05 * distance**2) * np.eye(2)  # with distance weight
 
-        # Compute own measurements
-        z_hat = self.robot.measure(self.markers, idx_list)
-        z_hat = z_hat.reshape((-1,1), order="F")
-        H = self.robot.derivative_measure(self.markers, idx_list)
 
-        x = self.get_state_vector()
-        
-        # TODO: add your codes here to compute the updated x
-        # 1. Measurement residual (innovation)
-        y = z - z_hat
-        
-        # 2. Innovation covariance
-        S = H @ self.P @ H.T + R
-        
-        # 3. Kalman Gain
-        K = self.P @ H.T @ np.linalg.inv(S)
-        
-        # 4. Update state vector x and set it back in robot/markers
-        x_updated = x + K @ y
-        self.set_state_vector(x_updated)
-        
-        # 5. Update state covariance P
-        # I = np.eye(len(x))
-        # self.P = (I - K @ H) @ self.P
+        x_prior = self.get_state_vector()      # x⁽⁰⁾ before any iteration
+        P_prior = self.P.copy()                # P before this update, held fixed across iterations
 
-        # Joseph Form (Symmetric & Numerically Stable):
-        I = np.eye(len(x))
+
+    # --- IEKF ITERATION LOOP ---
+        x_iter = x_prior.copy()
+        max_iters = 5
+
+        for iteration in range(max_iters):
+            # 1. Update robot/markers state temporarily to re-evaluate z_hat and H
+            self.set_state_vector(x_iter)
+
+            z_hat = self.robot.measure(self.markers, idx_list).reshape(
+                (-1, 1), order="F"
+            )
+            H = self.robot.derivative_measure(self.markers, idx_list)
+
+            # 2. Recompute Innovation with prior offset constraint
+            # y = (z - z_hat) - H @ (x_prior - x_iter)
+            y = (z - z_hat) + H @ (x_iter - x_prior)
+
+            # 3. Kalman Gain
+            S = H @ P_prior @ H.T + R
+            K = P_prior @ H.T @ np.linalg.inv(S)
+
+            # 4. Next state iterate
+            x_next = x_prior + K @ y
+
+            # Convergence check (stop early if change is negligible)
+            if np.linalg.norm(x_next - x_iter) < 1e-4:
+                x_iter = x_next
+                break
+            x_iter = x_next
+
+        # Apply final converged state and Joseph-form covariance
+        self.set_state_vector(x_iter)
+        I = np.eye(len(x_prior))
         I_KH = I - K @ H
-        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
-
-        # Force exact numerical symmetry
+        self.P = I_KH @ P_prior @ I_KH.T + K @ R @ K.T
         self.P = 0.5 * (self.P + self.P.T)
-        # TODO ends
 
+<<<<<<< Updated upstream
+=======
+        # # Compute own measurements
+        # z_hat = self.robot.measure(self.markers, idx_list)
+        # z_hat = z_hat.reshape((-1,1), order="F")
+        # H = self.robot.derivative_measure(self.markers, idx_list)
+
+        # x = self.get_state_vector()
+        
+        # # TODO: add your codes here to compute the updated x
+        # # 1. Measurement residual (innovation)
+        # y = z - z_hat
+        
+        # # 2. Innovation covariance
+        # S = H @ self.P @ H.T + R
+        
+        # # 3. Kalman Gain
+        # K = self.P @ H.T @ np.linalg.inv(S)
+        
+        # # 4. Update state vector x and set it back in robot/markers
+        # x_updated = x + K @ y
+        # self.set_state_vector(x_updated)
+        
+        # # 5. Update state covariance P
+        # # I = np.eye(len(x))
+        # # self.P = (I - K @ H) @ self.P
+
+        # # Joseph Form (Symmetric & Numerically Stable):
+        # I = np.eye(len(x))
+        # I_KH = I - K @ H
+        # self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+
+        # # Force exact numerical symmetry
+        # self.P = 0.5 * (self.P + self.P.T)
+        # # TODO ends
+
+>>>>>>> Stashed changes
 
     def state_transition(self, drive_measurement):
         n = self.number_landmarks()*2 + 3
@@ -223,28 +261,32 @@ class EKF:
         if not sensor_measurement:
             return
 
-<<<<<<< Updated upstream
-=======
-        if len(sensor_measurement) < 3:
-            return  # need at least 2 landmarks in view to add new ones
+        if len(self.taglist) == 0:
+            # Bootstrap case: map is empty, there are no "known" landmarks to require.
+            # Fall back to requiring several simultaneous markers instead, so the very
+            # first landmarks are still reasonably well-constrained by multi-marker geometry.
+            if len(sensor_measurement) < 3:
+                return
+        else:
+            known_in_view = [lm for lm in sensor_measurement if lm.tag in self.taglist]
+            if len(known_in_view) < 2:
+                return  # need at least 2 already-known landmarks to trust robot pose for new ones
 
->>>>>>> Stashed changes
+
         th = self.robot.state[2]
         robot_xy = self.robot.state[0:2,:]
         R_theta = np.block([[np.cos(th), -np.sin(th)],[np.sin(th), np.cos(th)]])
 
-        # Add new landmarks to the state
         for lm in sensor_measurement:
             if lm.tag in self.taglist:
-                continue # ignore known tags
-            
+                continue
+
             lm_position = lm.position
             lm_state = robot_xy + R_theta @ lm_position
 
             self.taglist.append(int(lm.tag))
             self.markers = np.concatenate((self.markers, lm_state), axis=1)
 
-            # Create a simple, large covariance to be fixed by the update step
             self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
             self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
             self.P[-2,-2] = self.init_lm_cov**2
