@@ -61,7 +61,7 @@ FRUIT_DIR = "images_fruits_cutout"  # input: folders of transparent-background f
 ARENA_DIR = "images_arena"          # input: arena background photos
 OUTPUT_DIR = "dataset"              # output: images/ + labels/ + classes.txt
 
-NUM_IMAGES = 50                # total synthetic images to generate
+NUM_IMAGES = 3000                # total synthetic images to generate
 MIN_FRUITS_PER_IMAGE = 1
 MAX_FRUITS_PER_IMAGE = 3
 
@@ -75,7 +75,7 @@ USE_PHYSICAL_SCALING = True
 OBJECT_LIST_CSV = "../object_list.csv"                  # has length/width/height per fruit (in meters)
 INTRINSIC_PATH = "../calibration/param/intrinsic.txt"    # camera_matrix.txt from camera_calibration.py
 DISTANCE_MIN_M = 0.15   # closest realistic distance the robot would detect a fruit from
-DISTANCE_MAX_M = 1.00   # farthest realistic distance -- tune both based on your arena size / camera FOV
+DISTANCE_MAX_M = 0.75   # farthest realistic distance -- tune both based on your arena size / camera FOV
 # NOTE: distance is sampled uniformly in 1/distance (not distance itself), so apparent
 # SIZE is spread evenly between its min and max instead of being biased toward "small".
 
@@ -95,14 +95,26 @@ Y_JITTER_PX = 12          # small random vertical jitter so placement isn't perf
 
 # --- Drop shadow (helps fruit look grounded on the floor instead of floating) ---
 SHADOW_ENABLED = True
-SHADOW_OPACITY = 80        # 0-255 alpha of the shadow at its darkest point
-SHADOW_WIDTH_FRAC = 0.85   # shadow ellipse width, as a fraction of the fruit's rendered width
-SHADOW_HEIGHT_FRAC = 0.10  # shadow ellipse height, as a fraction of the fruit's rendered width
-SHADOW_BLUR_RADIUS = 4
+SHADOW_OPACITY = 80         # 0-255 alpha of the shadow at its darkest point
+SHADOW_WIDTH_FRAC = 0.75    # shadow ellipse width, as a fraction of the fruit's rendered width
+SHADOW_HEIGHT_FRAC = 0.10   # shadow ellipse height, as a fraction of the fruit's rendered width
+SHADOW_BLUR_FRAC = 0.06     # blur radius as a fraction of fruit width -- scales down for small
+                             # fruits so blur doesn't overwhelm tiny objects (e.g. lemon, lime)
+SHADOW_BLUR_MIN = 1
+SHADOW_BLUR_MAX = 5
 
 MAX_ROTATION_DEG = 25            # random in-plane rotation applied to each fruit
 MAX_OVERLAP_IOU = 0.15           # reject placements that overlap existing fruit boxes more than this
 MAX_PLACEMENT_TRIES = 20         # tries per fruit before giving up on that one
+
+# Some rembg cutouts retain a translucent "tail" of the object's own cast shadow from
+# the original photo (rembg often treats a soft shadow gradient as semi-transparent
+# foreground rather than fully removing it). A low threshold only catches faint noise;
+# an actual retained shadow can have moderate alpha (50-150), so the threshold needs to
+# be high enough that only solidly-opaque fruit pixels count. If boxes/shadows still
+# look oversized for a specific fruit, raise this further (try 150-200) or inspect that
+# fruit's cutout PNGs directly with check_cutouts.py.
+ALPHA_THRESHOLD = 160
 
 BRIGHTNESS_JITTER = 0.15         # +/- 15% random brightness scaling per fruit paste
 JPEG_QUALITY = 95
@@ -189,7 +201,8 @@ def draw_shadow(arena_img, center_x, bottom_y, fruit_width):
     so it reads as sitting ON the floor rather than pasted on top of it.
     Composited directly onto arena_img (RGBA) before the fruit itself is pasted."""
     shadow_w = int(fruit_width * SHADOW_WIDTH_FRAC)
-    shadow_h = max(4, int(fruit_width * SHADOW_HEIGHT_FRAC))
+    shadow_h = max(2, int(fruit_width * SHADOW_HEIGHT_FRAC))
+    blur_radius = int(min(max(fruit_width * SHADOW_BLUR_FRAC, SHADOW_BLUR_MIN), SHADOW_BLUR_MAX))
 
     shadow_layer = Image.new("RGBA", arena_img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(shadow_layer)
@@ -198,7 +211,7 @@ def draw_shadow(arena_img, center_x, bottom_y, fruit_width):
     x1 = center_x + shadow_w // 2
     y1 = bottom_y + shadow_h // 2
     draw.ellipse([x0, y0, x1, y1], fill=(0, 0, 0, SHADOW_OPACITY))
-    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=SHADOW_BLUR_RADIUS))
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
     arena_img.alpha_composite(shadow_layer)
 
@@ -248,10 +261,13 @@ def paste_fruit(arena_img, fruit_img, placed_boxes, real_width_m=None, fx=None):
         rotated = resized.rotate(angle, expand=True)
 
         # rotate(expand=True) pads the canvas with transparent pixels so the
-        # rotated shape fits -- crop tightly to the actual visible (non-transparent)
-        # pixels, otherwise the padding gets treated as part of the fruit, which
-        # pushes the floor anchor/shadow/label below where the fruit actually is.
-        alpha_bbox = rotated.split()[-1].getbbox()
+        # rotated shape fits -- crop tightly to the actual visible pixels.
+        # Threshold the alpha first: faint near-zero-alpha artifacts from imperfect
+        # background removal would otherwise get included in getbbox() and inflate
+        # the box far beyond the actual fruit.
+        alpha = rotated.split()[-1]
+        mask = alpha.point(lambda a: 255 if a > ALPHA_THRESHOLD else 0)
+        alpha_bbox = mask.getbbox()
         if alpha_bbox is None:
             continue  # fully transparent, nothing to paste
         rotated = rotated.crop(alpha_bbox)

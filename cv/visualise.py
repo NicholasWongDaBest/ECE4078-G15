@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 # ---------------------------- CONFIG ----------------------------
 DATASET_DIR = "dataset"          # folder containing images/, labels/, classes.txt
 OUTPUT_DIR = "dataset_preview"   # where annotated preview images are saved
-NUM_SAMPLES = 30                 # how many random images to visualize
+NUM_SAMPLES = 60                 # how many random images to visualize
 BOX_COLOR = (0, 255, 0)          # bright green boxes
 BOX_WIDTH = 3
 TEXT_COLOR = (255, 255, 255)
