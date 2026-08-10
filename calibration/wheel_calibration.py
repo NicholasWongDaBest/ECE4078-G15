@@ -52,7 +52,7 @@ def calibrateBaseline(scale):
     # From the wheel_speed and delta_time, find out mathematically how to calculate the baseline.
 
     # Feel free to change the range / step and do more repetition
-    wheel_speed_range = [[-0.5, 0.5], [-0.5, 0.5], [-0.5, 0.5]]
+    wheel_speed_range = [[-0.5, 0.5], [-0.5, 0.5], [-0.5, 0.5],[-0.5, 0.5], [-0.5, 0.5], [-0.5, 0.5]]
     delta_times = []
 
     for wheel_speed in wheel_speed_range:
