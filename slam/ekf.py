@@ -201,7 +201,7 @@ class EKF:
         R = np.zeros((2*len(known_measurement),2*len(known_measurement)))
         for i in range(len(known_measurement)):
             distance = np.linalg.norm(known_measurement[i].position)
-            R[2*i:2*i+2, 2*i:2*i+2] = (0.05 + 0.02 * distance**2) * np.eye(2)  # with distance weight
+            R[2*i:2*i+2, 2*i:2*i+2] = (0.03 + 0.015 * distance**2) * np.eye(2)  # with distance weight
 
 
         x_prior = self.get_state_vector()      # x⁽⁰⁾ before any iteration
@@ -244,6 +244,17 @@ class EKF:
         I_KH = I - K @ H
         self.P = I_KH @ P_prior @ I_KH.T + K @ R @ K.T
         self.P = 0.5 * (self.P + self.P.T)
+
+        # Floor landmark covariance so the filter never becomes fully "locked in" --
+        # keeps landmarks correctable even after many observations, which matters
+        # while camera distortion calibration is still being refined.
+        min_lm_var = 3.75e-4   # tune: larger = more correctable, but noisier steady-state
+        for i in range(self.number_landmarks()):
+            idx = 3 + 2*i
+            if self.P[idx, idx] < min_lm_var:
+                self.P[idx, idx] = min_lm_var
+            if self.P[idx+1, idx+1] < min_lm_var:
+                self.P[idx+1, idx+1] = min_lm_var
 
         # # Compute own measurements
         # z_hat = self.robot.measure(self.markers, idx_list)
