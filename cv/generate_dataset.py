@@ -8,9 +8,9 @@ bounding box labels are written out automatically -- no manual annotation
 needed for the base dataset (Roboflow is still useful afterward for
 spot-checking / cleaning up edge cases, or for augmentation).
 
-Expected folder structure (run remove_background.py first to create images_fruits_cutout/):
+Expected folder structure (run remove_background.py first to create the cutout folders):
 
-  images_fruits_cutout/
+  images/fruits_cutout/
     redapple/
       redapple_01.png    <- RGBA, transparent background
       redapple_02.png
@@ -24,9 +24,17 @@ Expected folder structure (run remove_background.py first to create images_fruit
     lime/
       ...
 
-  images_arena/
+  images/arena/
     arena_01.jpg
     arena_02.jpg
+    ...
+
+  images/landmark_cutout/          <- OPTIONAL, enables occlusion augmentation once populated
+    aruco_cube_01.png              <- RGBA, transparent background
+    ...
+
+  images/distractors_cutout/       <- OPTIONAL, enables color-confusion mitigation once populated
+    red_distractor_01.png          <- RGBA, transparent background, non-fruit objects
     ...
 
 Output:
@@ -38,7 +46,7 @@ Output:
       ...
     labels/
       img_00000.txt     <- YOLO format: "class_idx x_center y_center width height" (normalized 0-1)
-      img_00001.txt
+      img_00001.txt      <- can be EMPTY for hard-negative background-only images
       ...
     classes.txt          <- one class name per line, in index order
 
@@ -57,11 +65,13 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 # ---------------------------- CONFIG ----------------------------
-FRUIT_DIR = "images_fruits_cutout"  # input: folders of transparent-background fruit PNGs
-ARENA_DIR = "images_arena"          # input: arena background photos
-OUTPUT_DIR = "dataset"              # output: images/ + labels/ + classes.txt
+FRUIT_DIR = "images/fruits_cutout"            # input: folders of transparent-background fruit PNGs
+ARENA_DIR = "images/arena"                    # input: arena background photos
+LANDMARK_DIR = "images/landmark_cutout"       # OPTIONAL: enables occlusion augmentation once populated
+DISTRACTOR_DIR = "images/distractors_cutout"  # OPTIONAL: enables color-distractor clutter once populated
+OUTPUT_DIR = "dataset"                        # output: images/ + labels/ + classes.txt
 
-NUM_IMAGES = 3000                # total synthetic images to generate
+NUM_IMAGES = 3000                # total synthetic images to generate (fruit-containing)
 MIN_FRUITS_PER_IMAGE = 1
 MAX_FRUITS_PER_IMAGE = 3
 
@@ -103,6 +113,45 @@ SHADOW_BLUR_FRAC = 0.06     # blur radius as a fraction of fruit width -- scales
 SHADOW_BLUR_MIN = 1
 SHADOW_BLUR_MAX = 5
 
+# --- Floor reflection (glossy arena floor mirrors the fruit -- without this the
+# model has never seen a reflection during training, so it fires a second,
+# lower-confidence "fruit" detection on the mirrored blob at inference time) ---
+REFLECTION_ENABLED = True
+REFLECTION_OPACITY = 0.28     # 0-1, overall strength of the reflection vs the real fruit
+REFLECTION_BLUR_FRAC = 0.05   # blur radius as a fraction of fruit width
+REFLECTION_BLUR_MIN = 1
+REFLECTION_BLUR_MAX = 6
+REFLECTION_FADE_RATIO = 0.85  # how much the reflection fades out toward its bottom edge (0-1)
+REFLECTION_HEIGHT_FRAC = 0.8  # reflection rendered height as a fraction of the fruit's own height
+                               # (real reflections on a short floor gap fade out before a full mirror)
+# NOTE: the reflection is composited but deliberately NEVER added to the label file --
+# that's what teaches the model "blob below the fruit" is not a second object.
+
+# --- Occlusion (landmark partially covering a fruit) ---
+# Without this, the model has never seen a fruit split into two visible blobs by
+# something in front of it, so at inference it treats each blob as a separate
+# instance of the same fruit. Requires LANDMARK_DIR to contain sprites -- if that
+# folder is missing/empty this feature is silently skipped (a warning is printed once).
+OCCLUSION_ENABLED = True
+OCCLUSION_CHANCE = 0.3        # probability, per successfully-placed fruit, that it gets occluded
+OCCLUSION_OVERLAP_MIN = 0.2   # occluder covers between 20-50% of the fruit's rendered width
+OCCLUSION_OVERLAP_MAX = 0.5
+OCCLUSION_SCALE_MIN = 0.6     # occluder size relative to the fruit's rendered width
+OCCLUSION_SCALE_MAX = 1.1
+
+# --- Hard-negative / distractor backgrounds ---
+# Pure background scenes (arena + landmarks + shadows + reflections, but NO fruit)
+# with empty label files, so the model learns shadows/reflections/clutter alone
+# are not a fruit class. Optionally sprinkle in same-colored non-fruit distractor
+# objects (DISTRACTOR_DIR) as unlabeled clutter, which directly discourages the
+# model from using color alone as a shortcut feature. Both landmark and distractor
+# scattering here are optional -- if the folders are empty, negatives are still
+# generated (just plain arena backgrounds only).
+HARD_NEGATIVE_FRAC = 0.12     # fraction of NUM_IMAGES generated as additional pure-negative scenes
+DISTRACTOR_CHANCE = 0.5       # probability a hard-negative scene also gets 1-2 distractor objects
+MIN_DISTRACTORS = 1
+MAX_DISTRACTORS = 2
+
 MAX_ROTATION_DEG = 25            # random in-plane rotation applied to each fruit
 MAX_OVERLAP_IOU = 0.15           # reject placements that overlap existing fruit boxes more than this
 MAX_PLACEMENT_TRIES = 20         # tries per fruit before giving up on that one
@@ -117,6 +166,14 @@ MAX_PLACEMENT_TRIES = 20         # tries per fruit before giving up on that one
 ALPHA_THRESHOLD = 160
 
 BRIGHTNESS_JITTER = 0.15         # +/- 15% random brightness scaling per fruit paste
+
+# --- Exposure/color matching (closes sim-to-real domain gap) ---
+# Nudges each fruit sprite's color statistics toward the local background patch
+# it's about to be pasted onto, so it doesn't look "pasted on" under different
+# lighting/color-temperature than the arena scene. Applied BEFORE random_brightness.
+COLOR_MATCH_ENABLED = True
+COLOR_MATCH_STRENGTH = 0.4       # 0 = no adjustment, 1 = fully match background color mean
+
 JPEG_QUALITY = 95
 SEED = 42
 # ------------------------------------------------------------------
@@ -142,6 +199,16 @@ def load_fruit_images(fruit_dir, classes):
             print(f"WARNING: no cutout images found for class '{c}' in {fruit_dir}/{c}")
         fruit_images[c] = imgs
     return fruit_images
+
+
+def load_sprite_folder(dir_path):
+    """Generic loader for a flat folder of RGBA cutout PNGs (landmarks, distractors).
+    Returns [] if the folder doesn't exist or is empty -- callers should treat that
+    as 'feature disabled' rather than an error."""
+    if not os.path.isdir(dir_path):
+        return []
+    paths = glob.glob(os.path.join(dir_path, "*.png"))
+    return [Image.open(p).convert("RGBA") for p in paths]
 
 
 def load_object_sizes(csv_path):
@@ -184,6 +251,43 @@ def random_brightness(img, jitter):
     return Image.fromarray(arr.astype(np.uint8), mode="RGBA")
 
 
+def match_color_to_background(fruit_img, arena_img, paste_x, paste_y, target_w, target_h,
+                               strength=COLOR_MATCH_STRENGTH):
+    """Nudges fruit_img's RGB color mean toward the color mean of the arena background
+    patch it's about to be pasted onto, so it blends into that scene's lighting/color
+    temperature instead of carrying over its original photo's lighting unchanged.
+
+    fruit_img: RGBA fruit sprite (already resized, pre-rotation)
+    arena_img: RGBA arena background
+    paste_x, paste_y, target_w, target_h: where the fruit will land on arena_img
+    strength: 0 = no change, 1 = fully match background mean (0.3-0.5 is usually plenty --
+              too high starts washing out the fruit's own natural color identity)
+    """
+    aw, ah = arena_img.size
+    x1 = max(0, paste_x)
+    y1 = max(0, paste_y)
+    x2 = min(aw, paste_x + target_w)
+    y2 = min(ah, paste_y + target_h)
+    if x2 <= x1 or y2 <= y1:
+        return fruit_img  # region off-canvas, nothing to sample -- skip
+
+    bg_patch = np.array(arena_img.crop((x1, y1, x2, y2)).convert("RGB"), dtype=np.float32)
+    bg_mean = bg_patch.reshape(-1, 3).mean(axis=0)
+
+    fruit_arr = np.array(fruit_img, dtype=np.float32)
+    alpha_mask = fruit_arr[..., 3] > ALPHA_THRESHOLD
+    if not alpha_mask.any():
+        return fruit_img  # fully transparent, nothing to adjust
+
+    fruit_rgb = fruit_arr[..., :3]
+    fruit_mean = fruit_rgb[alpha_mask].mean(axis=0)
+
+    shift = (bg_mean - fruit_mean) * strength
+    fruit_arr[..., :3] = np.clip(fruit_rgb + shift, 0, 255)
+
+    return Image.fromarray(fruit_arr.astype(np.uint8), mode="RGBA")
+
+
 def iou(box1, box2):
     x1, y1, x2, y2 = box1
     x1b, y1b, x2b, y2b = box2
@@ -216,6 +320,96 @@ def draw_shadow(arena_img, center_x, bottom_y, fruit_width):
     arena_img.alpha_composite(shadow_layer)
 
 
+def draw_reflection(arena_img, fruit_sprite, x, bottom_y, fruit_width):
+    """Composites a faded, blurred, vertically-flipped copy of the fruit sprite
+    directly below its ground-contact point, mimicking the glossy arena floor.
+
+    IMPORTANT: this is purely visual -- it must NEVER be added to the YOLO label
+    file. Training the model on unlabeled reflections is what teaches it that a
+    mirrored blob below a fruit isn't a second object.
+    """
+    reflection = fruit_sprite.transpose(Image.FLIP_TOP_BOTTOM)
+
+    # Crop the reflection's height so it fades out before becoming a full mirror
+    # (a real floor reflection off a small gloss gap doesn't fully replicate the object).
+    rw, rh = reflection.size
+    crop_h = max(1, int(rh * REFLECTION_HEIGHT_FRAC))
+    reflection = reflection.crop((0, 0, rw, crop_h))
+    rw, rh = reflection.size
+
+    # Lower overall opacity
+    alpha = reflection.split()[-1]
+    alpha = alpha.point(lambda a: int(a * REFLECTION_OPACITY))
+
+    # Vertical gradient: strongest right at the fruit's base, fading toward the bottom
+    grad = Image.new("L", (rw, rh))
+    grad_pixels = grad.load()
+    for row in range(rh):
+        fade = max(0, 255 - int(255 * REFLECTION_FADE_RATIO * (row / max(1, rh - 1))))
+        for col in range(rw):
+            grad_pixels[col, row] = fade
+    alpha = Image.composite(alpha, Image.new("L", alpha.size, 0), grad)
+    reflection.putalpha(alpha)
+
+    blur_radius = int(min(max(fruit_width * REFLECTION_BLUR_FRAC, REFLECTION_BLUR_MIN),
+                           REFLECTION_BLUR_MAX))
+    reflection = reflection.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    aw, ah = arena_img.size
+    paste_y = bottom_y
+    if paste_y >= ah:
+        return  # nothing visible would be pasted
+    # Clip if the reflection would run past the bottom edge of the image
+    visible_h = min(rh, ah - paste_y)
+    if visible_h <= 0:
+        return
+    if visible_h < rh:
+        reflection = reflection.crop((0, 0, rw, visible_h))
+
+    arena_img.alpha_composite(reflection, (x, paste_y))
+
+
+def maybe_occlude(arena_img, fruit_box, landmark_images):
+    """With probability OCCLUSION_CHANCE, pastes a landmark sprite over part of the
+    fruit's rendered region. The fruit's YOLO label bbox is deliberately left
+    UNCHANGED (it's passed in already computed) -- this teaches the model that an
+    object partly covered by a landmark is still one single instance, not two."""
+    if not landmark_images or random.random() > OCCLUSION_CHANCE:
+        return
+
+    x1, y1, x2, y2 = fruit_box
+    fruit_w = x2 - x1
+    fruit_h = y2 - y1
+    if fruit_w <= 0 or fruit_h <= 0:
+        return
+
+    landmark = random.choice(landmark_images)
+    lw, lh = landmark.size
+    if lw == 0 or lh == 0:
+        return
+
+    scale = random.uniform(OCCLUSION_SCALE_MIN, OCCLUSION_SCALE_MAX)
+    target_w = max(4, int(fruit_w * scale))
+    target_h = max(4, int(lh * (target_w / lw)))
+    landmark_resized = landmark.resize((target_w, target_h), Image.LANCZOS)
+
+    overlap_frac = random.uniform(OCCLUSION_OVERLAP_MIN, OCCLUSION_OVERLAP_MAX)
+    # Place so it overlaps the fruit's left or right side by overlap_frac of fruit width
+    if random.random() < 0.5:
+        land_x = int(x1 - target_w * (1 - overlap_frac))
+    else:
+        land_x = int(x2 - target_w * overlap_frac)
+    land_y = y1 + random.randint(0, max(1, fruit_h // 2)) - target_h // 2
+
+    aw, ah = arena_img.size
+    land_x = min(max(land_x, 0), max(0, aw - target_w))
+    land_y = min(max(land_y, 0), max(0, ah - target_h))
+
+    arena_img.paste(landmark_resized, (land_x, land_y), landmark_resized)
+    # NOTE: fruit_box is intentionally not modified/re-tightened here -- the label
+    # keeps the fruit's full original extent, occluded portion included.
+
+
 def paste_fruit(arena_img, fruit_img, placed_boxes, real_width_m=None, fx=None):
     """Try random scale/rotation/position for fruit_img on arena_img, avoiding heavy
     overlap with already-placed boxes. Pastes in-place using alpha as mask.
@@ -229,8 +423,8 @@ def paste_fruit(arena_img, fruit_img, placed_boxes, real_width_m=None, fx=None):
         (near the floor right in front of the camera), far/small fruit is anchored
         near the horizon -- using the same sampled distance, so scale and position
         are consistent with each other instead of independent random choices.
-      - A soft drop shadow is drawn under the fruit so it reads as sitting on the
-        floor instead of floating.
+      - A soft drop shadow and a soft floor reflection are rendered under the fruit
+        so it reads as sitting on the glossy floor instead of floating.
     Otherwise falls back to the old flat MIN_SCALE/MAX_SCALE + fully random position.
     """
     aw, ah = arena_img.size
@@ -256,6 +450,20 @@ def paste_fruit(arena_img, fruit_img, placed_boxes, real_width_m=None, fx=None):
             continue
 
         resized = fruit_img.resize((target_w, target_h), Image.LANCZOS)
+
+        if COLOR_MATCH_ENABLED:
+            # Estimate landing position before rotation just to sample the right
+            # background patch -- doesn't need to be exact, only close enough to grab
+            # locally-representative background color/lighting.
+            if physical_mode:
+                t_est = (distance - DISTANCE_MIN_M) / (DISTANCE_MAX_M - DISTANCE_MIN_M)
+                t_est = min(max(t_est, 0.0), 1.0)
+                est_bottom_y = FLOOR_BOTTOM_FRAC * ah - t_est * (FLOOR_BOTTOM_FRAC - FLOOR_TOP_FRAC) * ah
+                est_y = int(min(max(est_bottom_y - target_h, 0), ah - target_h))
+            else:
+                est_y = max(0, (ah - target_h) // 2)
+            est_x = max(0, (aw - target_w) // 2)
+            resized = match_color_to_background(resized, arena_img, est_x, est_y, target_w, target_h)
 
         angle = random.uniform(-MAX_ROTATION_DEG, MAX_ROTATION_DEG)
         rotated = resized.rotate(angle, expand=True)
@@ -295,9 +503,60 @@ def paste_fruit(arena_img, fruit_img, placed_boxes, real_width_m=None, fx=None):
             if physical_mode and SHADOW_ENABLED:
                 draw_shadow(arena_img, center_x=x + rw // 2, bottom_y=y + rh, fruit_width=rw)
             arena_img.paste(rotated, (x, y), rotated)  # alpha channel used as paste mask
+            if physical_mode and REFLECTION_ENABLED:
+                draw_reflection(arena_img, rotated, x=x, bottom_y=y + rh, fruit_width=rw)
             return True, box
 
     return False, None
+
+
+def generate_negative_scene(out_name, images_out, labels_out, arena_paths,
+                             landmark_images, distractor_images):
+    """Generates one pure-background image (no fruit) with an EMPTY label file.
+    Optionally scatters 1-2 landmark sprites and/or same-colored distractor
+    objects as unlabeled clutter, so the model learns these are never a fruit
+    class regardless of shape/color/shadow/reflection."""
+    arena_path = random.choice(arena_paths)
+    arena_img = Image.open(arena_path).convert("RGBA")
+    aw, ah = arena_img.size
+
+    # Scatter a landmark or two (unlabeled) so the arena isn't suspiciously empty
+    if landmark_images and random.random() < 0.7:
+        for _ in range(random.randint(1, 2)):
+            landmark = random.choice(landmark_images)
+            lw, lh = landmark.size
+            if lw == 0:
+                continue
+            scale = random.uniform(0.08, 0.18)
+            target_w = int(aw * scale)
+            target_h = int(lh * (target_w / lw))
+            if target_w < 5 or target_h < 5:
+                continue
+            resized = landmark.resize((target_w, target_h), Image.LANCZOS)
+            x = random.randint(0, max(0, aw - target_w))
+            y = random.randint(int(ah * 0.4), max(int(ah * 0.4), ah - target_h))
+            arena_img.paste(resized, (x, y), resized)
+
+    # Scatter same-colored non-fruit distractors (unlabeled) -- directly discourages
+    # the model from using color alone as a shortcut feature for fruit classes.
+    if distractor_images and random.random() < DISTRACTOR_CHANCE:
+        for _ in range(random.randint(MIN_DISTRACTORS, MAX_DISTRACTORS)):
+            distractor = random.choice(distractor_images)
+            dw, dh = distractor.size
+            if dw == 0:
+                continue
+            scale = random.uniform(0.06, 0.2)
+            target_w = int(aw * scale)
+            target_h = int(dh * (target_w / dw))
+            if target_w < 5 or target_h < 5:
+                continue
+            resized = distractor.resize((target_w, target_h), Image.LANCZOS)
+            x = random.randint(0, max(0, aw - target_w))
+            y = random.randint(int(ah * 0.3), max(int(ah * 0.3), ah - target_h))
+            arena_img.paste(resized, (x, y), resized)
+
+    arena_img.convert("RGB").save(images_out / f"{out_name}.jpg", quality=JPEG_QUALITY)
+    (labels_out / f"{out_name}.txt").write_text("")  # empty label file = background
 
 
 def generate_dataset():
@@ -307,6 +566,16 @@ def generate_dataset():
     fruit_images = load_fruit_images(FRUIT_DIR, classes)
     arena_paths = load_arena_images(ARENA_DIR)
     print(f"Found {len(arena_paths)} arena background images")
+
+    landmark_images = load_sprite_folder(LANDMARK_DIR) if OCCLUSION_ENABLED else []
+    if OCCLUSION_ENABLED and not landmark_images:
+        print(f"NOTE: no sprites found in '{LANDMARK_DIR}/' -- occlusion augmentation will be "
+              f"skipped for now. Add RGBA landmark cutout PNGs there later to enable it.")
+
+    distractor_images = load_sprite_folder(DISTRACTOR_DIR)
+    if not distractor_images:
+        print(f"NOTE: no sprites found in '{DISTRACTOR_DIR}/' -- color-distractor clutter "
+              f"will be skipped for now. Add RGBA non-fruit cutout PNGs there later to enable it.")
 
     object_sizes = None
     fx = None
@@ -355,6 +624,8 @@ def generate_dataset():
             success, box = paste_fruit(arena_img, fruit_img, placed_boxes, real_width_m, fx)
             if success:
                 placed_boxes.append(box)
+                if OCCLUSION_ENABLED:
+                    maybe_occlude(arena_img, box, landmark_images)
                 x1, y1, x2, y2 = box
                 xc = (x1 + x2) / 2 / aw
                 yc = (y1 + y2) / 2 / ah
@@ -375,7 +646,20 @@ def generate_dataset():
         if generated % 200 == 0:
             print(f"Generated {generated} images so far...")
 
-    print(f"Done. Generated {generated} labeled images in '{OUTPUT_DIR}/'.")
+    print(f"Done. Generated {generated} labeled (fruit-containing) images in '{OUTPUT_DIR}/'.")
+
+    # --- Hard-negative background scenes ---
+    num_negatives = int(NUM_IMAGES * HARD_NEGATIVE_FRAC)
+    print(f"Generating {num_negatives} hard-negative background scenes (no fruit, empty labels)...")
+    for j in range(num_negatives):
+        out_name = f"img_neg_{j:05d}"
+        generate_negative_scene(out_name, images_out, labels_out, arena_paths,
+                                 landmark_images, distractor_images)
+        if (j + 1) % 100 == 0:
+            print(f"Generated {j + 1} negative scenes so far...")
+
+    print(f"Done. Generated {num_negatives} hard-negative images in '{OUTPUT_DIR}/'.")
+    print(f"Total dataset size: {generated + num_negatives} images.")
 
 
 if __name__ == "__main__":

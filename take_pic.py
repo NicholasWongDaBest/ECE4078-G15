@@ -62,11 +62,11 @@ if __name__ == "__main__":
 
     currentDir = os.getcwd()
     # dataDir = os.path.join(currentDir,'calib_pics')
-    dataDir = "cv/images_arena"
+    dataDir = "cv/images/landmark"
     if not os.path.exists(dataDir):
         os.makedirs(dataDir)
     
-    images_to_collect = 40 # feel free to change this
+    images_to_collect = 50 # feel free to change this
 
     calib = calibration(args)
 
