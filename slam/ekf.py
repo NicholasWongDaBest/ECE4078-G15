@@ -32,6 +32,7 @@ class EKF:
         self.P = np.zeros((3,3)) # shape of this matrix changes as more landmarks are discovered
         
         self.taglist = []
+        self.lm_obs_count = []   # parallel to taglist/markers: how many times each landmark has been updated
         self.init_lm_cov = 1e3
         self.robot_init_state = None
         self.lm_pics = []
@@ -47,6 +48,7 @@ class EKF:
         self.markers = np.zeros((2,0))
         self.P = np.zeros((3,3))
         self.taglist = []
+        self.lm_obs_count = []
         self.init_lm_cov = 1e3
         self.robot_init_state = None
 
@@ -218,6 +220,8 @@ class EKF:
         x_prior = self.get_state_vector()      # x⁽⁰⁾ before any iteration
         P_prior = self.P.copy()                # P before this update, held fixed across iterations
 
+        for idx in idx_list:
+            self.lm_obs_count[idx] += 1
 
     # --- IEKF ITERATION LOOP ---
         x_iter = x_prior.copy()
@@ -256,16 +260,24 @@ class EKF:
         self.P = I_KH @ P_prior @ I_KH.T + K @ R @ K.T
         self.P = 0.5 * (self.P + self.P.T)
 
-        # Floor landmark covariance so the filter never becomes fully "locked in" --
-        # keeps landmarks correctable even after many observations, which matters
-        # while camera distortion calibration is still being refined.
-        min_lm_var = 3.75e-4   # tune: larger = more correctable, but noisier steady-state
+        # Adaptive covariance floor: sparsely-observed landmarks (few updates so far,
+        # typically edge/isolated markers on your route) keep a HIGHER floor so they
+        # stay correctable; well-observed interior landmarks get a lower floor and
+        # are allowed to converge tightly.
+        min_floor = 1e-4       # tight floor for well-observed landmarks
+        max_floor = 3e-3       # loose floor for freshly-seen landmarks
+        full_convergence_count = 20   # observations after which floor reaches min_floor
+
         for i in range(self.number_landmarks()):
+            count = self.lm_obs_count[i]
+            frac = max(0.0, 1.0 - count / full_convergence_count)
+            floor_i = min_floor + (max_floor - min_floor) * frac
+
             idx = 3 + 2*i
-            if self.P[idx, idx] < min_lm_var:
-                self.P[idx, idx] = min_lm_var
-            if self.P[idx+1, idx+1] < min_lm_var:
-                self.P[idx+1, idx+1] = min_lm_var
+            if self.P[idx, idx] < floor_i:
+                self.P[idx, idx] = floor_i
+            if self.P[idx+1, idx+1] < floor_i:
+                self.P[idx+1, idx+1] = floor_i
 
         # # Compute own measurements
         # z_hat = self.robot.measure(self.markers, idx_list)
@@ -343,6 +355,7 @@ class EKF:
 
             self.taglist.append(int(lm.tag))
             self.markers = np.concatenate((self.markers, lm_state), axis=1)
+            self.lm_obs_count.append(0)   # newly added, zero updates so far
 
             self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
             self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)

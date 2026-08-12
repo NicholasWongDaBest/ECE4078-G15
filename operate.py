@@ -104,6 +104,9 @@ class Operate:
         self.ramp_duration = 0.15      # seconds to reach full commanded speed, tune this
         self.prev_base_wheel_speed = [0.0, 0.0]
 
+        self.prev_correct_time = time.time()
+        self.sync_kp_rate = 0.00005   # NEW tunable -- replaces sync_kp, needs retuning (see below)
+
     # update control parameters for ekf
     def control(self):
         dt = time.time() - self.control_clock
@@ -338,32 +341,16 @@ class Operate:
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self.quit = True
 
-            self.botconnect.move_manual(self.command['wheel_speed'])
 
         if self.quit:
             if self.ekf.number_landmarks() > 0:
                 self.ekf.save_state(self.slam_state_fname)
             pygame.quit()
             sys.exit()
-
     def correct_straight_drive(self):
-        left, right = self.botconnect.get_encoder_counts()
-        delta_left = left - self.prev_left_count
-        delta_right = right - self.prev_right_count
-
-        # Guard against encoder counter reset (Pi resets counts to 0 whenever it
-        # detects the robot has stopped) -- without this, resuming movement after
-        # a stop can produce a huge spurious delta, causing a sudden hard turn.
-        reset_detected = (delta_left < -10 or delta_right < -10)
-        if reset_detected:
-            delta_left, delta_right = 0, 0
-            self.sync_error_integral = 0.0  # also clear integral so windup doesn't carry over
-
-        self.prev_left_count, self.prev_right_count = left, right
-
         base_l, base_r = self.base_wheel_speed
 
-        # Detect stop -> move transition, start a ramp (already direction-agnostic)
+        # Detect stop -> move transition, start a ramp
         was_stopped = (self.prev_base_wheel_speed == [0.0, 0.0])
         now_moving = (base_l != 0.0 or base_r != 0.0)
         if was_stopped and now_moving and not self.ramp_active:
@@ -380,31 +367,17 @@ class Operate:
         else:
             ramp_scale = 1.0
 
-        ramped_base_l = base_l * ramp_scale
-        ramped_base_r = base_r * ramp_scale
-
-        if base_l == base_r and base_l != 0:
-            # Only correct when driving straight (turns should curve on purpose)
-            error = delta_left - delta_right
-            self.sync_error_integral += error
-            correction = self.sync_kp * error + self.sync_ki * self.sync_error_integral
-
-            # Encoder ticks are direction-agnostic (magnitude only), but the correction's
-            # EFFECT on wheel magnitude depends on direction: for forward (positive speed),
-            # subtracting correction slows a wheel down; for backward (negative speed),
-            # subtracting correction speeds it up instead. Flip sign to keep the correction
-            # meaning consistent ("slow the faster wheel") in both directions.
-            direction_sign = 1.0 if base_l > 0 else -1.0
-            adjusted = [ramped_base_l - direction_sign * correction,
-                        ramped_base_r + direction_sign * correction]
-        else:
-            self.sync_error_integral = 0.0
-            adjusted = [ramped_base_l, ramped_base_r]
+        # Left/right sync correction is intentionally NOT done here anymore --
+        # it's already handled by the Pi's own PID loop (pid_control() in the
+        # server script), which runs at a fixed rate on a separate machine and
+        # is immune to this PC's variable SLAM/ArUco processing cost. Trying to
+        # replicate that correction here, coupled to this loop's timing, was the
+        # source of the intermittent swerving.
+        adjusted = [base_l * ramp_scale, base_r * ramp_scale]
 
         self.command['wheel_speed'] = adjusted
         self.botconnect.move_manual(adjusted)
         self.prev_base_wheel_speed = [base_l, base_r]
-        
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.
