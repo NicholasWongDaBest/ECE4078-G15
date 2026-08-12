@@ -11,8 +11,8 @@ reference_map: ref_map.txt
 
 # change this for different GUI size for your screen
 image_display_res:
-  x: 1280
-  y: 720
+  x: 1020
+  y: 680
 
 # increase this if it is difficult to click on the objects
 max_click_radius: 25  # unit: [pixels]

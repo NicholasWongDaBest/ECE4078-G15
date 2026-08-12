@@ -34,7 +34,7 @@ class Operate:
         # self.botconnect.set_pid(use_pid=1, kp=0, ki=0, kd=0)
 
         # PID gains — now adjustable live via keyboard, not fixed at startup
-        self.pid_gains = {'kp': 2.3, 'ki': 1.5, 'kd': 0.7}
+        self.pid_gains = {'kp': 0.8, 'ki': 0.02, 'kd': 0.25}
         self.pid_step = 0.01
         self.botconnect.set_pid(use_pid=1, **self.pid_gains)
 
@@ -46,6 +46,10 @@ class Operate:
         # Initialise SLAM parameters
         self.ekf = self.init_ekf(args.calib_dir, args.ip)
         self.aruco_sensor = ArucoSensor(self.ekf.robot, marker_length=0.06) # size of the ARUCO markers (6cm)
+
+        # Persisted SLAM map: survives program restarts unless 'r','r' is pressed
+        self.slam_state_fname = os.path.join(self.lab_output_dir, 'slam_state.json')
+        self.ekf.load_state(self.slam_state_fname)  # no-op if the file doesn't exist
         
         # Initialise CV detector
         if args.yolo_path == "":
@@ -80,7 +84,10 @@ class Operate:
         self.ekf_on = False
         self.double_reset_comfirm = 0
         self.image_id = 0
-        self.notification = 'Press ENTER to start SLAM'
+        if self.ekf.number_landmarks() > 0:
+            self.notification = f'Restored {self.ekf.number_landmarks()} landmark(s) - view markers & press ENTER to relocalise'
+        else:
+            self.notification = 'Press ENTER to start SLAM'
         self.count_down = 300 # 5 min timer
         self.start_time = time.time()
         self.control_clock = time.time()
@@ -88,10 +95,31 @@ class Operate:
         self.aruco_img = np.zeros([360,480,3], dtype=np.uint8)
         self.bg = pygame.image.load('ui/gui_mask.jpg')
 
+        self.prev_left_count_ekf = 0
+        self.prev_right_count_ekf = 0
+
+        # Startup ramp (avoids wheel slip from an instant full-power command)
+        self.ramp_active = False
+        self.ramp_start_time = 0.0
+        self.ramp_duration = 0.15      # seconds to reach full commanded speed, tune this
+        self.prev_base_wheel_speed = [0.0, 0.0]
+
     # update control parameters for ekf
     def control(self):
         dt = time.time() - self.control_clock
-        drive_measurement = DriveMeasurement(self.botconnect.left_speed, self.botconnect.right_speed, dt)
+        left, right = self.botconnect.get_encoder_counts()
+        delta_left = left - self.prev_left_count_ekf
+        delta_right = right - self.prev_right_count_ekf
+        # Guard against encoder counter reset on reconnect (large negative jump)
+        if delta_left < -10 or delta_right < -10:
+            delta_left, delta_right = 0, 0
+
+        self.prev_left_count_ekf, self.prev_right_count_ekf = left, right
+
+        drive_measurement = DriveMeasurement(
+            self.botconnect.left_speed, self.botconnect.right_speed, dt,
+            delta_left_ticks=delta_left, delta_right_ticks=delta_right
+        )
         self.control_clock = time.time()
         return drive_measurement
 
@@ -120,12 +148,18 @@ class Operate:
         scale = np.loadtxt(fileS, delimiter=',')
         fileB = os.path.join(calib_dir, 'baseline.txt')
         baseline = np.loadtxt(fileB, delimiter=',')
-        robot = Robot(baseline, scale, camera_matrix, dist_coeffs)
+        robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=175) ##change this value  
         return EKF(robot)
 
     # SLAM with ARUCO markers       
     def perform_slam(self, drive_measurement):
         sensor_measurement, self.aruco_img = self.aruco_sensor.detect_marker_positions(self.img)
+
+        # Discard any detected tag outside our known marker set (1-10).
+        # DICT_4X4_100 can detect tags 0-99, so a stray/misread marker would
+        # otherwise get added as a landmark and show up as "?" on the map.
+        sensor_measurement = [lm for lm in sensor_measurement if 1 <= lm.tag <= 10]
+
         if self.request_recover_robot:
             is_success = self.ekf.recover_from_pause(sensor_measurement)
             if is_success:
@@ -136,7 +170,10 @@ class Operate:
                 self.ekf_on = False
             self.request_recover_robot = False
         elif self.ekf_on:
-            self.ekf.predict(drive_measurement)
+            v_l = drive_measurement.left_speed
+            v_r = drive_measurement.right_speed
+            if not (abs(v_l) < 1e-3 and abs(v_r) < 1e-3): #prevent predict to run when bot is not moving (prevent uncertainty to be added)
+                self.ekf.predict(drive_measurement)
             self.ekf.add_landmarks(sensor_measurement)
             self.ekf.update(sensor_measurement)
             
@@ -242,14 +279,14 @@ class Operate:
                 self.adjust_pid('kd', self.pid_step)
 
             if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
-                self.base_wheel_speed = [0.35, 0.35]
+                self.base_wheel_speed = [0.6, 0.6]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
-                self.base_wheel_speed = [-0.35, -0.35]
+                self.base_wheel_speed = [-0.6, -0.6]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.base_wheel_speed = [-0.35, 0.35]
+                self.base_wheel_speed = [-0.5, 0.5]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.base_wheel_speed = [0.35, -0.35]
-            if event.type == pygame.KEYDOWN and (event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE):
+                self.base_wheel_speed = [0.5, -0.5]
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                 self.base_wheel_speed = [0.0, 0.0]
             if event.type == pygame.KEYUP and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
                 self.base_wheel_speed = [0.0, 0.0]
@@ -283,7 +320,9 @@ class Operate:
                 elif self.double_reset_comfirm == 1:
                     self.notification = 'SLAM Map is cleared'
                     self.double_reset_comfirm = 0
-                    self.ekf.reset()          
+                    self.ekf.reset()
+                    if os.path.exists(self.slam_state_fname):
+                        os.remove(self.slam_state_fname)       
             # run object/fruit detector
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_p:
                 self.command['run_obj_detector'] = True
@@ -302,6 +341,8 @@ class Operate:
             self.botconnect.move_manual(self.command['wheel_speed'])
 
         if self.quit:
+            if self.ekf.number_landmarks() > 0:
+                self.ekf.save_state(self.slam_state_fname)
             pygame.quit()
             sys.exit()
 
@@ -309,22 +350,60 @@ class Operate:
         left, right = self.botconnect.get_encoder_counts()
         delta_left = left - self.prev_left_count
         delta_right = right - self.prev_right_count
+
+        # Guard against encoder counter reset (Pi resets counts to 0 whenever it
+        # detects the robot has stopped) -- without this, resuming movement after
+        # a stop can produce a huge spurious delta, causing a sudden hard turn.
+        reset_detected = (delta_left < -10 or delta_right < -10)
+        if reset_detected:
+            delta_left, delta_right = 0, 0
+            self.sync_error_integral = 0.0  # also clear integral so windup doesn't carry over
+
         self.prev_left_count, self.prev_right_count = left, right
 
         base_l, base_r = self.base_wheel_speed
+
+        # Detect stop -> move transition, start a ramp (already direction-agnostic)
+        was_stopped = (self.prev_base_wheel_speed == [0.0, 0.0])
+        now_moving = (base_l != 0.0 or base_r != 0.0)
+        if was_stopped and now_moving and not self.ramp_active:
+            self.ramp_active = True
+            self.ramp_start_time = time.time()
+
+        if self.ramp_active:
+            elapsed = time.time() - self.ramp_start_time
+            if elapsed >= self.ramp_duration:
+                self.ramp_active = False
+                ramp_scale = 1.0
+            else:
+                ramp_scale = elapsed / self.ramp_duration
+        else:
+            ramp_scale = 1.0
+
+        ramped_base_l = base_l * ramp_scale
+        ramped_base_r = base_r * ramp_scale
+
         if base_l == base_r and base_l != 0:
             # Only correct when driving straight (turns should curve on purpose)
-            error = delta_left - delta_right  # >0 means left is outrunning right
+            error = delta_left - delta_right
             self.sync_error_integral += error
             correction = self.sync_kp * error + self.sync_ki * self.sync_error_integral
-            adjusted = [base_l - correction, base_r + correction]
+
+            # Encoder ticks are direction-agnostic (magnitude only), but the correction's
+            # EFFECT on wheel magnitude depends on direction: for forward (positive speed),
+            # subtracting correction slows a wheel down; for backward (negative speed),
+            # subtracting correction speeds it up instead. Flip sign to keep the correction
+            # meaning consistent ("slow the faster wheel") in both directions.
+            direction_sign = 1.0 if base_l > 0 else -1.0
+            adjusted = [ramped_base_l - direction_sign * correction,
+                        ramped_base_r + direction_sign * correction]
         else:
             self.sync_error_integral = 0.0
-            adjusted = [base_l, base_r]
+            adjusted = [ramped_base_l, ramped_base_r]
 
         self.command['wheel_speed'] = adjusted
         self.botconnect.move_manual(adjusted)
-        # print(f"L:{left} R:{right}  dL:{delta_left} dR:{delta_right}")
+        self.prev_base_wheel_speed = [base_l, base_r]
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
