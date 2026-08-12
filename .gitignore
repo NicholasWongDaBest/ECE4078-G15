@@ -42,6 +42,8 @@ pip-delete-this-directory.txt
 !distCoeffs.txt
 !scale.txt
 !baseline.txt
+!truemap.txt
+!slam.txt
 
 *.png
 

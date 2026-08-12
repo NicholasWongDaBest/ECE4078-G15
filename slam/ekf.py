@@ -34,6 +34,7 @@ class EKF:
         self.taglist = []
         self.init_lm_cov = 1e3
         self.robot_init_state = None
+        self.freeze_map = False # M2: true once true map is loaded
         self.lm_pics = []
         for i in range(1, 11):
             f_ = f'./ui/8bit/lm_{i}.png'
@@ -49,6 +50,7 @@ class EKF:
         self.taglist = []
         self.init_lm_cov = 1e3
         self.robot_init_state = None
+        self.freeze_map = False # M2 true map
 
     def number_landmarks(self):
         return int(self.markers.shape[1])
@@ -67,8 +69,34 @@ class EKF:
             d = {}
             for i, tag in enumerate(self.taglist):
                 d["aruco" + str(tag) + "_0"] = {"x": self.markers[0,i], "y":self.markers[1,i]}
-        with open(fname, 'w') as map_f:
-            json.dump(d, map_f, indent=4)
+            with open(fname, 'w') as map_f:
+                json.dump(d, map_f, indent=4)
+
+    def load_true_map(self, fname):
+        """Load ground-truth landmark coordinates (M2) into self.markers/self.taglist,
+        and freeze them so SLAM only localises the robot pose without ever moving
+        the landmarks. Ignores non-ArUco entries (e.g. fruit ground-truth) that may
+        share the same true_map.txt file."""
+        with open(fname, 'r') as f:
+            gt_dict = json.load(f)
+
+        aruco_keys = [k for k in gt_dict if k.startswith('aruco')]
+        tags = sorted(int(k.split('aruco')[1].split('_')[0]) for k in aruco_keys)
+        markers = np.zeros((2, len(tags)))
+        for i, tag in enumerate(tags):
+            key = f"aruco{tag}_0"
+            markers[0, i] = gt_dict[key]['x']
+            markers[1, i] = gt_dict[key]['y']
+
+        robot_P = self.P[0:3, 0:3].copy() if self.P.shape[0] >= 3 else np.zeros((3, 3))
+
+        self.taglist = tags
+        self.markers = markers
+        n = len(tags)
+        self.P = np.zeros((3 + 2*n, 3 + 2*n))
+        self.P[0:3, 0:3] = robot_P
+        self.freeze_map = True
+        return n
 
     def save_state(self, fname):
         """Persist markers, covariance, and taglist so they survive a restart."""
@@ -259,13 +287,14 @@ class EKF:
         # Floor landmark covariance so the filter never becomes fully "locked in" --
         # keeps landmarks correctable even after many observations, which matters
         # while camera distortion calibration is still being refined.
-        min_lm_var = 3.75e-4   # tune: larger = more correctable, but noisier steady-state
-        for i in range(self.number_landmarks()):
-            idx = 3 + 2*i
-            if self.P[idx, idx] < min_lm_var:
-                self.P[idx, idx] = min_lm_var
-            if self.P[idx+1, idx+1] < min_lm_var:
-                self.P[idx+1, idx+1] = min_lm_var
+        if not self.freeze_map:
+            min_lm_var = 3.75e-4   # tune: larger = more correctable, but noisier steady-state
+            for i in range(self.number_landmarks()):
+                idx = 3 + 2*i
+                if self.P[idx, idx] < min_lm_var:
+                    self.P[idx, idx] = min_lm_var
+                if self.P[idx+1, idx+1] < min_lm_var:
+                    self.P[idx+1, idx+1] = min_lm_var
 
         # # Compute own measurements
         # z_hat = self.robot.measure(self.markers, idx_list)
@@ -315,6 +344,8 @@ class EKF:
         return Q
     
     def add_landmarks(self, sensor_measurement):
+        if self.freeze_map:
+            return   # true map already has every landmark, never add new ones
         if not sensor_measurement:
             return
 

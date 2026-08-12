@@ -50,8 +50,11 @@ class ObjectDetector:
         return bboxes, img_out
 
     def _get_bounding_boxes(self, img):
+        # img arrives in RGB (per operate.py); Ultralytics predict() on a raw
+        # numpy array assumes BGR (the cv2/training convention), so convert here
         # predict target type and bounding box with your trained YOLO
-        predictions = self.model.predict(img, imgsz=480, verbose=False)
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        predictions = self.model.predict(img_bgr, imgsz=480, verbose=False)
 
         # get bounding box and class label for target(s) detected
         bounding_boxes = []

@@ -28,7 +28,8 @@ class Operate:
                         'save_slam': False,
                         'run_obj_detector': False,                       
                         'save_obj_detector': False,
-                        'save_image': False}
+                        'save_image': False,
+                        'load_true_map': False} # M2
                         
         # TODO: Tune PID parameters here. If you don't want to use PID, set use_pid=0
         # self.botconnect.set_pid(use_pid=1, kp=0, ki=0, kd=0)
@@ -50,6 +51,7 @@ class Operate:
         # Persisted SLAM map: survives program restarts unless 'r','r' is pressed
         self.slam_state_fname = os.path.join(self.lab_output_dir, 'slam_state.json')
         self.ekf.load_state(self.slam_state_fname)  # no-op if the file doesn't exist
+        self.true_map_fname = "truemap.txt" # M2
         
         # Initialise CV detector
         if args.yolo_path == "":
@@ -183,6 +185,15 @@ class Operate:
             self.ekf.save_map(fname=os.path.join(self.lab_output_dir, 'slam.txt'))
             self.notification = 'Map is saved'
             self.command['save_slam'] = False
+
+        # load the true/ground-truth map and freeze it "l" (M2)
+        if self.command['load_true_map']:
+            if os.path.exists(self.true_map_fname):
+                n_lm = self.ekf.load_true_map(self.true_map_fname)
+                self.notification = f'Loaded true map ({n_lm} landmarks), frozen - press ENTER to relocalise'
+            else:
+                self.notification = f'True map file not found: {self.true_map_fname}'
+            self.command['load_true_map'] = False
         
         # save obj_detector result with the matching robot pose and detector labels
         if self.command['save_obj_detector']:
@@ -312,6 +323,9 @@ class Operate:
             # save SLAM map
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_s:
                 self.command['save_slam'] = True
+            # load true map M2 (freezes landmark positions, SLAM only localises)
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_l:
+                self.command['load_true_map'] = True
             # reset SLAM map
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
                 if self.double_reset_comfirm == 0:
@@ -409,7 +423,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.
     parser.add_argument("--calib_dir", type=str, default="calibration/param/") # calibration directory
-    parser.add_argument("--yolo_path", default='cv/model/yolov8_model.pt') # directory for your trained AI model
+    parser.add_argument("--yolo_path", default='cv/model/yolo26n.pt') # directory for your trained AI model
     args, _ = parser.parse_known_args()
     
     pygame.font.init() 
