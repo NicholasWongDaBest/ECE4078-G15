@@ -101,7 +101,7 @@ class Operate:
         # Startup ramp (avoids wheel slip from an instant full-power command)
         self.ramp_active = False
         self.ramp_start_time = 0.0
-        self.ramp_duration = 0.3   # seconds to reach full commanded speed, tune this
+        self.ramp_duration = 0.15      # seconds to reach full commanded speed, tune this
         self.prev_base_wheel_speed = [0.0, 0.0]
 
     # update control parameters for ekf
@@ -350,18 +350,26 @@ class Operate:
         left, right = self.botconnect.get_encoder_counts()
         delta_left = left - self.prev_left_count
         delta_right = right - self.prev_right_count
+
+        # Guard against encoder counter reset (Pi resets counts to 0 whenever it
+        # detects the robot has stopped) -- without this, resuming movement after
+        # a stop can produce a huge spurious delta, causing a sudden hard turn.
+        reset_detected = (delta_left < -10 or delta_right < -10)
+        if reset_detected:
+            delta_left, delta_right = 0, 0
+            self.sync_error_integral = 0.0  # also clear integral so windup doesn't carry over
+
         self.prev_left_count, self.prev_right_count = left, right
 
         base_l, base_r = self.base_wheel_speed
 
-        # Detect stop -> move transition, start a ramp
+        # Detect stop -> move transition, start a ramp (already direction-agnostic)
         was_stopped = (self.prev_base_wheel_speed == [0.0, 0.0])
         now_moving = (base_l != 0.0 or base_r != 0.0)
         if was_stopped and now_moving and not self.ramp_active:
             self.ramp_active = True
             self.ramp_start_time = time.time()
 
-        # Compute ramp scale factor (0 -> 1 over ramp_duration)
         if self.ramp_active:
             elapsed = time.time() - self.ramp_start_time
             if elapsed >= self.ramp_duration:
@@ -380,7 +388,15 @@ class Operate:
             error = delta_left - delta_right
             self.sync_error_integral += error
             correction = self.sync_kp * error + self.sync_ki * self.sync_error_integral
-            adjusted = [ramped_base_l - correction, ramped_base_r + correction]
+
+            # Encoder ticks are direction-agnostic (magnitude only), but the correction's
+            # EFFECT on wheel magnitude depends on direction: for forward (positive speed),
+            # subtracting correction slows a wheel down; for backward (negative speed),
+            # subtracting correction speeds it up instead. Flip sign to keep the correction
+            # meaning consistent ("slow the faster wheel") in both directions.
+            direction_sign = 1.0 if base_l > 0 else -1.0
+            adjusted = [ramped_base_l - direction_sign * correction,
+                        ramped_base_r + direction_sign * correction]
         else:
             self.sync_error_integral = 0.0
             adjusted = [ramped_base_l, ramped_base_r]
@@ -388,7 +404,6 @@ class Operate:
         self.command['wheel_speed'] = adjusted
         self.botconnect.move_manual(adjusted)
         self.prev_base_wheel_speed = [base_l, base_r]
-        # print(f"L:{left} R:{right}  dL:{delta_left} dR:{delta_right}  ramp:{ramp_scale:.2f}")
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

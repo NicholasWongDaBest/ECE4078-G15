@@ -201,7 +201,18 @@ class EKF:
         R = np.zeros((2*len(known_measurement),2*len(known_measurement)))
         for i in range(len(known_measurement)):
             distance = np.linalg.norm(known_measurement[i].position)
-            R[2*i:2*i+2, 2*i:2*i+2] = (0.03 + 0.015 * distance**2) * np.eye(2)  # with distance weight
+            # Build R in the marker's LOCAL frame (robot-relative), then rotate into world
+            depth_var = 0.03 + 0.015 * distance**2
+            lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed; tune this ratio
+
+            # lm.position is [depth, lateral] roughly, in robot frame
+            R_local = np.diag([depth_var, lateral_var])
+
+            # Rotate into world frame to match how z/z_hat are expressed
+            th = self.robot.state[2, 0]
+            Rot = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+            R_world = Rot @ R_local @ Rot.T
+            R[2*i:2*i+2, 2*i:2*i+2] = R_world
 
 
         x_prior = self.get_state_vector()      # x⁽⁰⁾ before any iteration

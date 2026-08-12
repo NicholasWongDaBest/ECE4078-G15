@@ -46,8 +46,12 @@ if __name__ == '__main__':
 
     h,w = img.shape[:2]
 
+    print(f"\n{len(objpoints)} of {len(images)} images had checkerboard corners successfully detected.\n")  # NEW
+
     # Performing camera calibration by passing the value of known 3D points (objpoints) and corresponding pixel coordinates of the detected corners (imgpoints)
     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
+
+    print("RMS reprojection error (pixels):", ret)  # NEW
 
     # save the intrinsic parameters 
     dataDir = "{}/param/".format(os.getcwd())
@@ -56,5 +60,3 @@ if __name__ == '__main__':
     np.savetxt(fileNameI, mtx, delimiter=',')
     fileNameD = "{}distCoeffs.txt".format(dataDir)
     np.savetxt(fileNameD, dist, delimiter=',')
-
-    print(f"\nReprojection error (RMS): {ret:.4f} pixels")
