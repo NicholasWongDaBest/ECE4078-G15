@@ -1,4 +1,5 @@
 import cv2 
+import json
 import time
 import shutil
 import argparse
@@ -107,6 +108,12 @@ class Operate:
         self.prev_correct_time = time.time()
         self.sync_kp_rate = 0.00005   # NEW tunable -- replaces sync_kp, needs retuning (see below)
 
+        with open('distortion_correction.json') as f:
+            dc = json.load(f)
+        self.dist_degree = dc['degree']
+        self.dist_coeffs_x = np.array(dc['coeffs_x'])
+        self.dist_coeffs_y = np.array(dc['coeffs_y'])
+
     # update control parameters for ekf
     def control(self):
         dt = time.time() - self.control_clock
@@ -151,12 +158,26 @@ class Operate:
         scale = np.loadtxt(fileS, delimiter=',')
         fileB = os.path.join(calib_dir, 'baseline.txt')
         baseline = np.loadtxt(fileB, delimiter=',')
-        robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=175) ##change this value  
+        robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=174.5) ##change this value  
         return EKF(robot)
+
+    def apply_distortion_correction(self, x, y):
+        feats = [1, x, y]
+        if self.dist_degree >= 2:
+            feats += [x**2, x*y, y**2]
+        if self.dist_degree >= 3:
+            feats += [x**3, x**2*y, x*y**2, y**3]
+        feats = np.array(feats)
+        return float(feats @ self.dist_coeffs_x), float(feats @ self.dist_coeffs_y)
+
 
     # SLAM with ARUCO markers       
     def perform_slam(self, drive_measurement):
         sensor_measurement, self.aruco_img = self.aruco_sensor.detect_marker_positions(self.img)
+
+        for lm in sensor_measurement:
+            x_c, y_c = self.apply_distortion_correction(lm.position[0,0], lm.position[1,0])
+            lm.position[0,0], lm.position[1,0] = x_c, y_c
 
         # Discard any detected tag outside our known marker set (1-10).
         # DICT_4X4_100 can detect tags 0-99, so a stray/misread marker would
@@ -347,6 +368,7 @@ class Operate:
                 self.ekf.save_state(self.slam_state_fname)
             pygame.quit()
             sys.exit()
+            
     def correct_straight_drive(self):
         base_l, base_r = self.base_wheel_speed
 
@@ -378,6 +400,10 @@ class Operate:
         self.command['wheel_speed'] = adjusted
         self.botconnect.move_manual(adjusted)
         self.prev_base_wheel_speed = [base_l, base_r]
+
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.

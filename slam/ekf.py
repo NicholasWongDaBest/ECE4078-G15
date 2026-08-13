@@ -338,8 +338,8 @@ class EKF:
                 return
         else:
             known_in_view = [lm for lm in sensor_measurement if lm.tag in self.taglist]
-            if len(known_in_view) < 2:
-                return  # need at least 2 already-known landmarks to trust robot pose for new ones
+            # if len(known_in_view) < 2:
+            #     return  # need at least 2 already-known landmarks to trust robot pose for new ones
 
 
         th = self.robot.state[2]
