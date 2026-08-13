@@ -42,7 +42,7 @@ def compute_rmse(points1, points2):
     MSE = 1.0 / num_points * np.sum(residual ** 2)
     return np.sqrt(MSE)
     
-def eval_slam(aruco_est, aruco_gt):
+def eval_slam(aruco_est, aruco_gt, show_plot=True):
     taglist, slam_est_vec, slam_gt_vec = match_dict_key(aruco_est, aruco_gt)
     theta, x = solve_umeyama2d(slam_est_vec, slam_gt_vec)
     slam_est_vec_aligned = apply_transform(theta, x, slam_est_vec)
@@ -50,10 +50,6 @@ def eval_slam(aruco_est, aruco_gt):
     slam_rmse_raw = compute_rmse(slam_est_vec, slam_gt_vec)
     slam_rmse_aligned = compute_rmse(slam_est_vec_aligned, slam_gt_vec)
 
-    # print()
-    # print("The following parameters optimally transform the estimated points to the ground truth.")
-    # print("Rotation Angle: {}".format(theta))
-    # print("Translation Vector: ({}, {})".format(x[0,0], x[1,0]))
     print()
     print("Number of found markers: {}".format(len(taglist)))
     print(f'SLAM RMSE before alignment = {np.round(slam_rmse_raw, 5)}')
@@ -63,21 +59,25 @@ def eval_slam(aruco_est, aruco_gt):
     print('-----------------------------------------------------------------')
     for i in range(len(taglist)):
         print('%3d %9.2f %9.2f %9.2f %9.2f %9.2f %9.2f\n' % (taglist[i], slam_gt_vec[0][i], slam_est_vec_aligned[0][i], diff[0][i], slam_gt_vec[1][i], slam_est_vec_aligned[1][i], diff[1][i]))
-    
-    ax = plt.gca()
-    ax.scatter(slam_gt_vec[0,:], slam_gt_vec[1,:], marker='o', color='C0', s=100)
-    ax.scatter(slam_est_vec_aligned[0,:], slam_est_vec_aligned[1,:], marker='x', color='C1', s=100)
-    for i in range(len(taglist)):
-        ax.text(slam_gt_vec[0,i]+0.05, slam_gt_vec[1,i]+0.05, taglist[i], color='C0', size=12)
-        ax.text(slam_est_vec_aligned[0,i]+0.05, slam_est_vec_aligned[1,i]+0.05, taglist[i], color='C1', size=12)
-    plt.title('Arena')
-    plt.xlabel('X')
-    plt.ylabel('Y')
-    ax.set_xticks([-1.5, -1, -0.5, 0, 0.5, 1.0, 1.5])
-    ax.set_yticks([-1.5, -1, -0.5, 0, 0.5, 1.0, 1.5])
-    plt.axis([-1.6, 1.6, -1.6, 1.6])
-    plt.legend(['Real','Pred'])
-    plt.show()
+
+    if show_plot:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.scatter(slam_gt_vec[0,:], slam_gt_vec[1,:], marker='o', color='C0', s=100)
+        ax.scatter(slam_est_vec_aligned[0,:], slam_est_vec_aligned[1,:], marker='x', color='C1', s=100)
+        for i in range(len(taglist)):
+            ax.text(slam_gt_vec[0,i]+0.05, slam_gt_vec[1,i]+0.05, taglist[i], color='C0', size=12)
+            ax.text(slam_est_vec_aligned[0,i]+0.05, slam_est_vec_aligned[1,i]+0.05, taglist[i], color='C1', size=12)
+        ax.set_title('SLAM: ArUco Markers')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_xticks([-1.5, -1, -0.5, 0, 0.5, 1.0, 1.5])
+        ax.set_yticks([-1.5, -1, -0.5, 0, 0.5, 1.0, 1.5])
+        ax.axis([-1.6, 1.6, -1.6, 1.6])
+        ax.set_aspect('equal')
+        ax.grid(alpha=0.3)
+        ax.legend(['Real', 'Pred'])
+        fig.tight_layout()
+
     return slam_rmse_aligned, (theta, x)
 
 def solve_umeyama2d(points1, points2):
@@ -110,27 +110,31 @@ def apply_transform(theta, x, points):
     R = np.array(((c, -s), (s, c)))
     points_transformed = R @ points + x
     return points_transformed
- 
 
-def eval_object(object_est, object_gt, transform=None):
+
+def eval_object(object_est, object_gt, transform=None, show_plot=True):
     # returns the error (euclidean distance) for each individual object estimation against gt
     # calculate two error versions: before and after alignment, and obtain the smaller of the two
-    
+
     MAX_ERROR = 1
     full_obj_list = list(object_gt.keys())
     errors = {}
     # initialize error dictionary with max error
     for obj_name in full_obj_list:
         errors[obj_name] = MAX_ERROR
-    
+
     # detection result
     obj_list, obj_est_vec, obj_gt_vec = match_dict_key(object_est, object_gt)
+
+    # raw (un-aligned) errors + positions, used unless alignment gives a smaller error
+    plot_est_vec = obj_est_vec
+    used_aligned = False
     for i, obj_name in enumerate(obj_list):
         err = np.linalg.norm(obj_est_vec[:,i] - obj_gt_vec[:,i])
         errors[obj_name] = np.round(err, 5)
     avg_error = sum(errors.values()) / len(errors)
     if transform is None: print('Note: When evaluating object pose only, transform is not applied.')
-    
+
     # if need to apply transform, calculate error after transform
     if transform is not None:
         theta, x = transform
@@ -143,16 +147,42 @@ def eval_object(object_est, object_gt, transform=None):
         if avg_error_after < avg_error:
             avg_error = avg_error_after
             errors = errors_after
-    
+            plot_est_vec = object_est_vec_aligned
+            used_aligned = True
+
+    # RMSE across matched objects, using the same (better) alignment as above
+    obj_rmse = compute_rmse(plot_est_vec, obj_gt_vec) if obj_list else float('nan')
+
     print('Object pose estimation errors:')
     print(json.dumps(errors, indent=4))
-    # print(f'Average object pose estimation error: {sum(errors.values()) / len(errors)}')
-    return errors
+    print(f'Number of found objects: {len(obj_list)} / {len(full_obj_list)}')
+    print(f'Average object pose estimation error: {np.round(avg_error, 5)}')
+    print(f"Object RMSE ({'aligned' if used_aligned else 'raw'}) = {np.round(obj_rmse, 5)}")
 
-def compute_grade(aligned_rmse, num_found_markers, max_rmse, min_rmse, base, total_markers=10):
+    if show_plot and len(obj_list) > 0:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.scatter(obj_gt_vec[0,:], obj_gt_vec[1,:], marker='o', color='C0', s=100)
+        ax.scatter(plot_est_vec[0,:], plot_est_vec[1,:], marker='x', color='C1', s=100)
+        for i, obj_name in enumerate(obj_list):
+            ax.text(obj_gt_vec[0,i]+0.05, obj_gt_vec[1,i]+0.05, obj_name, color='C0', size=12)
+            ax.text(plot_est_vec[0,i]+0.05, plot_est_vec[1,i]+0.05, obj_name, color='C1', size=12)
+        ax.set_title('Object Pose Estimation')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_xticks([-1.5, -1, -0.5, 0, 0.5, 1.0, 1.5])
+        ax.set_yticks([-1.5, -1, -0.5, 0, 0.5, 1.0, 1.5])
+        ax.axis([-1.6, 1.6, -1.6, 1.6])
+        ax.set_aspect('equal')
+        ax.grid(alpha=0.3)
+        ax.legend(['Real', 'Pred'])
+        fig.tight_layout()
+
+    return errors, obj_rmse, len(obj_list)
+
+def compute_grade(aligned_rmse, num_found, max_rmse, min_rmse, base, total_count):
     rating = (max_rmse - aligned_rmse) / (max_rmse - min_rmse)
     rating = np.clip(rating, 0.0, 1.0)
-    grade = (base**rating - 1) / (base - 1) * num_found_markers / total_markers
+    grade = (base**rating - 1) / (base - 1) * num_found / total_count
     return rating, grade*100
 
 if __name__ == '__main__':
@@ -160,11 +190,18 @@ if __name__ == '__main__':
     parser.add_argument('--truemap', type=str, default='truemap.txt')
     parser.add_argument('--slam-est', type=str, default='lab_output/slam.txt')
     parser.add_argument('--object-est', type=str, default='lab_output/objects.txt')
-    parser.add_argument('--max-rmse', type=float, default=0.3, help='Max RMSE for grading scale')
-    parser.add_argument('--min-rmse', type=float, default=0.0, help='Min RMSE for grading scale')
-    parser.add_argument('--base', type=float, default=10.0, help='Base for the grading curve')
+    parser.add_argument('--max-rmse', type=float, default=0.3, help='Max RMSE for SLAM grading scale')
+    parser.add_argument('--min-rmse', type=float, default=0.0, help='Min RMSE for SLAM grading scale')
+    parser.add_argument('--base', type=float, default=10.0, help='Base for the SLAM grading curve')
     parser.add_argument('--total-markers', type=int, default=10, help='Total possible markers')
+    parser.add_argument('--obj-max-rmse', type=float, default=0.5, help='Max RMSE for object grading scale')
+    parser.add_argument('--obj-min-rmse', type=float, default=0.0, help='Min RMSE for object grading scale')
+    parser.add_argument('--obj-base', type=float, default=10.0, help='Base for the object grading curve')
+    parser.add_argument('--total-objects', type=int, default=7, help='Total possible objects')
+    parser.add_argument('--no-plot', action='store_true', help='Disable plotting, just print numbers')
     args, _ = parser.parse_known_args()
+
+    show_plot = not args.no_plot
 
     aruco_gt, object_gt = parse_map(args.truemap)
     
@@ -185,19 +222,30 @@ if __name__ == '__main__':
 
     if slam_only: # only evaluate SLAM
         print('Evaluating SLAM only:')
-        slam_rmse_aligned, _ = eval_slam(aruco_est, aruco_gt)
+        slam_rmse_aligned, _ = eval_slam(aruco_est, aruco_gt, show_plot=show_plot)
         num_found = len(aruco_est)
         rating, grade = compute_grade(slam_rmse_aligned, num_found, args.max_rmse, args.min_rmse, args.base, args.total_markers)
-        print(f'\nRating: {np.round(rating, 5)}')
-        print(f'Grade: {np.round(grade, 5)}')
+        print(f'\nSLAM Rating: {np.round(rating, 5)}')
+        print(f'SLAM Grade: {np.round(grade, 5)}')
     elif object_only: # only evaluate object
         print('Evaluating Object Detection only:')
-        object_est_errors = eval_object(object_est, object_gt, transform=None)
+        object_est_errors, obj_rmse, num_obj_found = eval_object(object_est, object_gt, transform=None, show_plot=show_plot)
+        obj_rating, obj_grade = compute_grade(obj_rmse, num_obj_found, args.obj_max_rmse, args.obj_min_rmse, args.obj_base, args.total_objects)
+        print(f'\nObject Rating: {np.round(obj_rating, 5)}')
+        print(f'Object Grade: {np.round(obj_grade, 5)}')
     else: # evaluate both
         print('Evaluating both SLAM & Object Detection:')
-        slam_rmse_aligned, transform = eval_slam(aruco_est, aruco_gt)
-        object_est_errors = eval_object(object_est, object_gt, transform=transform)
+        slam_rmse_aligned, transform = eval_slam(aruco_gt=aruco_gt, aruco_est=aruco_est, show_plot=show_plot)
+        object_est_errors, obj_rmse, num_obj_found = eval_object(object_est, object_gt, transform=transform, show_plot=show_plot)
+
         num_found = len(aruco_est)
         rating, grade = compute_grade(slam_rmse_aligned, num_found, args.max_rmse, args.min_rmse, args.base, args.total_markers)
-        print(f'\nRating: {np.round(rating, 5)}')
-        print(f'Grade: {np.round(grade, 5)}')
+        obj_rating, obj_grade = compute_grade(obj_rmse, num_obj_found, args.obj_max_rmse, args.obj_min_rmse, args.obj_base, args.total_objects)
+
+        print(f'\nSLAM Rating: {np.round(rating, 5)}')
+        print(f'SLAM Grade: {np.round(grade, 5)}')
+        print(f'\nObject Rating: {np.round(obj_rating, 5)}')
+        print(f'Object Grade: {np.round(obj_grade, 5)}')
+
+    if show_plot:
+        plt.show()
