@@ -19,6 +19,28 @@ from slam.aruco_sensor import ArucoSensor
 sys.path.insert(0,"{}/cv/".format(os.getcwd()))
 from cv.detector import ObjectDetector
 
+def load_true_map(fname):
+    """
+    Load ground-truth ArUco marker positions from a truemap.txt-style JSON
+    file (same format eval.py's --truemap expects).
+    Returns a dict {tag:int -> np.array([[x],[y]])}, or None if the file is
+    missing/unreadable.
+    """
+    if not os.path.exists(fname):
+        return None
+    try:
+        with open(fname, 'r') as f:
+            gt_dict = json.load(f)
+    except Exception as e:
+        print(f"Could not parse true map '{fname}': {e}")
+        return None
+
+    true_map = {}
+    for key in gt_dict:
+        if key.startswith('aruco'):
+            tag = int(key.split('_')[0].replace('aruco', ''))
+            true_map[tag] = np.array([[gt_dict[key]['x']], [gt_dict[key]['y']]])
+    return true_map if true_map else None
 
 class Operate:
     def __init__(self, args):
@@ -51,6 +73,17 @@ class Operate:
         # Persisted SLAM map: survives program restarts unless 'r','r' is pressed
         self.slam_state_fname = os.path.join(self.lab_output_dir, 'slam_state.json')
         self.ekf.load_state(self.slam_state_fname)  # no-op if the file doesn't exist
+        # Persisted SLAM map: survives program restarts unless 'r','r' is pressed
+        self.slam_state_fname = os.path.join(self.lab_output_dir, 'slam_state.json')
+        self.ekf.load_state(self.slam_state_fname)  # no-op if the file doesn't exist
+
+        # Ground-truth map for live RMSE tracking (optional -- practice tool only,
+        # eval.py against the real truemap.txt is still what's graded)
+        self.true_map = load_true_map(args.truemap)
+        if self.true_map is not None:
+            print(f"Loaded true map with {len(self.true_map)} markers for live RMSE tracking.")
+        else:
+            print(f"No true map found at '{args.truemap}' -- live RMSE tracking disabled.")
         
         # Initialise CV detector
         if args.yolo_path == "":
@@ -120,8 +153,13 @@ class Operate:
         left, right = self.botconnect.get_encoder_counts()
         delta_left = left - self.prev_left_count_ekf
         delta_right = right - self.prev_right_count_ekf
-        # Guard against encoder counter reset on reconnect (large negative jump)
-        if delta_left < -10 or delta_right < -10:
+
+        # A real reset snaps the raw count back near zero. Ordinary backward
+        # driving, or the reversing wheel during a turn-in-place, does not --
+        # so check the count itself, not the delta's sign/size.
+        reset_left = abs(left) < 5 and abs(self.prev_left_count_ekf) > 50
+        reset_right = abs(right) < 5 and abs(self.prev_right_count_ekf) > 50
+        if reset_left or reset_right:
             delta_left, delta_right = 0, 0
 
         self.prev_left_count_ekf, self.prev_right_count_ekf = left, right
@@ -194,9 +232,8 @@ class Operate:
                 self.ekf_on = False
             self.request_recover_robot = False
         elif self.ekf_on:
-            v_l = drive_measurement.left_speed
-            v_r = drive_measurement.right_speed
-            if not (abs(v_l) < 1e-3 and abs(v_r) < 1e-3): #prevent predict to run when bot is not moving (prevent uncertainty to be added)
+            moved = drive_measurement.delta_left_ticks != 0 or drive_measurement.delta_right_ticks != 0
+            if moved:
                 self.ekf.predict(drive_measurement)
             self.ekf.add_landmarks(sensor_measurement)
             self.ekf.update(sensor_measurement)
@@ -235,15 +272,19 @@ class Operate:
             self.obj_detector_output = (self.cv_vis, self.ekf.robot.state.tolist(), bboxes) # three things to be saved
             unique_detected = len(set([box[0] for box in bboxes]))
             self.notification = f'{unique_detected} object type(s) detected'
-
+         
     # paint the GUI            
     def draw(self, canvas):    
         canvas.blit(self.bg, (0, 0))
         text_colour = (220, 220, 220)
         v_pad, h_pad = 40, 20
 
+        # compute live RMSE against the true map (if loaded) before drawing the minimap
+        live_rmse_info = self.ekf.compute_live_rmse(self.true_map) if self.true_map is not None else None
+
         # paint SLAM outputs
-        ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause = self.ekf_on)
+        ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause=self.ekf_on,
+                                            true_map=self.true_map, live_rmse_info=live_rmse_info)
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
@@ -257,6 +298,17 @@ class Operate:
         self.put_caption(canvas, caption='Robot Cam', position=(h_pad, v_pad))
         notification = TEXT_FONT.render(self.notification, False, text_colour)
         canvas.blit(notification, (h_pad+10, 596))
+
+        # live RMSE readout in the main window
+        if self.true_map is None:
+            rmse_line = "No true map loaded"
+        elif live_rmse_info is None:
+            rmse_line = f"Live RMSE: need >=2 matched markers (have {len(self.ekf.taglist)})"
+        else:
+            rmse_line = (f"Live RMSE: {live_rmse_info['rmse']:.4f} m "
+                        f"({len(live_rmse_info['matched_tags'])}/{len(self.true_map)} markers)")
+        rmse_surface = TEXT_FONT.render(rmse_line, False, text_colour)
+        canvas.blit(rmse_surface, (h_pad+10, 624))
 
         time_remain = self.count_down - time.time() + self.start_time
         if time_remain > 0:
@@ -409,6 +461,7 @@ if __name__ == "__main__":
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.
     parser.add_argument("--calib_dir", type=str, default="calibration/param/") # calibration directory
     parser.add_argument("--yolo_path", default='cv/model/yolov8_model.pt') # directory for your trained AI model
+    parser.add_argument("--truemap", type=str, default='truemap.txt', help="ground-truth map for live RMSE practice tracking (optional)")
     args, _ = parser.parse_known_args()
     
     pygame.font.init() 
