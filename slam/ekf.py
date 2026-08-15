@@ -240,7 +240,7 @@ class EKF:
         for i in range(len(known_measurement)):
             distance = np.linalg.norm(known_measurement[i].position)
             # Build R in the marker's LOCAL frame (robot-relative), then rotate into world
-            depth_var = 0.05 + 0.015 * distance**2
+            depth_var = 0.5 + 0.15 * distance**2
             lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed; tune this ratio
 
             # lm.position is [depth, lateral] roughly, in robot frame
@@ -363,40 +363,42 @@ class EKF:
         return Q
     
     def add_landmarks(self, sensor_measurement):
-        if not sensor_measurement:
-            return
-
-        if len(self.taglist) == 0:
-            # Bootstrap case: map is empty, there are no "known" landmarks to require.
-            # Fall back to requiring several simultaneous markers instead, so the very
-            # first landmarks are still reasonably well-constrained by multi-marker geometry.
-            if len(sensor_measurement) < 3:
+            if not sensor_measurement:
                 return
-        else:
-            known_in_view = [lm for lm in sensor_measurement if lm.tag in self.taglist]
-            # if len(known_in_view) < 2:
-            #     return  # need at least 2 already-known landmarks to trust robot pose for new ones
 
+            if len(self.taglist) == 0:
+                # Bootstrap case: map is empty, there are no "known" landmarks to require.
+                # Fall back to requiring several simultaneous markers instead, so the very
+                # first landmarks are still reasonably well-constrained by multi-marker geometry.
+                if len(sensor_measurement) < 3:
+                    return
+            else:
+                known_in_view = [lm for lm in sensor_measurement if lm.tag in self.taglist]
 
-        th = self.robot.state[2]
-        robot_xy = self.robot.state[0:2,:]
-        R_theta = np.block([[np.cos(th), -np.sin(th)],[np.sin(th), np.cos(th)]])
+            th = self.robot.state[2]
+            robot_xy = self.robot.state[0:2,:]
+            R_theta = np.block([[np.cos(th), -np.sin(th)],[np.sin(th), np.cos(th)]])
 
-        for lm in sensor_measurement:
-            if lm.tag in self.taglist:
-                continue
+            for lm in sensor_measurement:
+                if lm.tag in self.taglist:
+                    continue
 
-            lm_position = lm.position
-            lm_state = robot_xy + R_theta @ lm_position
+                lm_position = lm.position
+                lm_state = robot_xy + R_theta @ lm_position
 
-            self.taglist.append(int(lm.tag))
-            self.markers = np.concatenate((self.markers, lm_state), axis=1)
-            self.lm_obs_count.append(0)   # newly added, zero updates so far
+                self.taglist.append(int(lm.tag))
+                self.markers = np.concatenate((self.markers, lm_state), axis=1)
+                self.lm_obs_count.append(0)   # newly added, zero updates so far
 
-            self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
-            self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
-            self.P[-2,-2] = self.init_lm_cov**2
-            self.P[-1,-1] = self.init_lm_cov**2
+                self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
+                self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
+
+                # Scale initial covariance with distance at first sighting -- a landmark
+                # first seen far away starts with more uncertainty than one seen close up.
+                distance = np.linalg.norm(lm_position)
+                lm_cov = self.init_lm_cov * (1.0 + 0.3 * distance)  # tune the 0.3 factor
+                self.P[-2,-2] = lm_cov**2
+                self.P[-1,-1] = lm_cov**2
 
 
     @staticmethod
@@ -521,7 +523,14 @@ class EKF:
         e_vecs = e_vecs[:, idx]
         alpha = np.sqrt(4.605)
         axes_len = np.sqrt(np.maximum(0, e_vals)) * 2 * alpha
-        if abs(e_vecs[1, 0]) > 1e-3:
+
+        # Near-isotropic covariance: the ellipse is essentially a circle, and its
+        # "orientation" is numerically meaningless -- tiny noise in P flips which
+        # eigenvector sorts first and swings the angle wildly even though the
+        # actual shape hasn't changed. Skip the noisy angle in that regime.
+        if e_vals[0] - e_vals[1] < 1e-6 * max(e_vals[0], 1e-12):
+            angle = 0.0
+        elif abs(e_vecs[1, 0]) > 1e-3:
             angle = np.arctan(e_vecs[0, 0]/e_vecs[1, 0])
         else:
             angle = 0
