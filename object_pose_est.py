@@ -51,19 +51,7 @@ def estimate_pose(robot_pose, box, object_true_height, focal_length, cx):
     
 
 # merge the estimations of the objects so that there is only 1 final estimate for each object type
-def merge_estimations(object_pose_dict):  
-    """
-    Input object dict format:
-    object_pose_dict = {'obj1': [(x1,y1), (x2,y2), ...], 'obj2': [(x1,y1), (x2,y2), ...], ...}
-    
-    Return:
-    object_pose_dict_final: {'obj1_0': {'x': ??, 'y': ??}, 'obj2_0': {'x': ??, 'y': ??}, ...}
-    The '_0' is added for code compatibility purpose with other scripts.
-    """
-    
-    ######### Replace with your codes #########
-    # TODO: the operation below is the default solution, which simply takes the first estimation for each object type.
-    # Replace it with a better merge solution.
+def merge_estimations(object_pose_dict):
     object_pose_dict_final = {}
     for key in object_pose_dict:
         estimates = object_pose_dict[key]
@@ -71,27 +59,32 @@ def merge_estimations(object_pose_dict):
             object_pose_dict_final[key + '_0'] = {'x': 0.0, 'y': 0.0}
             continue
 
-        pts = np.array(estimates) # shape (N, 2)
+        arr = np.array(estimates)  # shape (N, 3): x, y, dist
+        pts = arr[:, :2]
+        dists = arr[:, 2]
 
         if len(pts) == 1:
             merged = pts[0]
         else:
-            # Robust merge: median is resistant to a few bad detections, then
-            # discard estimates far from it, and average the remaining
-            # "agreeing" estimates for a more precise final pose.
             median = np.median(pts, axis=0)
-            dists = np.linalg.norm(pts - median, axis=1)
-            outlier_thresh = 0.3 # metres
-            inliers = pts[dists <= outlier_thresh]
-            if len(inliers) == 0:
-                inliers = pts
-            merged = inliers.mean(axis=0)
+            outlier_dists = np.linalg.norm(pts - median, axis=1)
+            outlier_thresh = 0.3
+            inlier_mask = outlier_dists <= outlier_thresh
+            if not inlier_mask.any():
+                inlier_mask = np.ones(len(pts), dtype=bool)
+
+            inlier_pts = pts[inlier_mask]
+            inlier_dists = dists[inlier_mask]
+
+            # inverse-distance weights: closer detections count more
+            # small epsilon avoids divide-by-zero for near-zero distance
+            weights = 1.0 / (inlier_dists + 1e-3)
+            weights /= weights.sum()
+
+            merged = np.average(inlier_pts, axis=0, weights=weights)
 
         object_pose_dict_final[key + '_0'] = {'x': float(merged[0]), 'y': float(merged[1])}
-    ###########################################
-    
     return object_pose_dict_final
-
 
 if __name__ == "__main__":
     
@@ -131,11 +124,22 @@ if __name__ == "__main__":
             robotpose, bboxes = entry['robotpose'], entry['bboxes']
             
             # for every bounding box detected
+            # for bbox in bboxes:
+            #     predicted_class = bbox[0]
+            #     box = bbox[1]
+            #     true_height = object_dimensions[predicted_class][2]
+            #     object_pose_dict[predicted_class].append(estimate_pose(robotpose, box, true_height, focal_length, cx))
             for bbox in bboxes:
                 predicted_class = bbox[0]
                 box = bbox[1]
                 true_height = object_dimensions[predicted_class][2]
-                object_pose_dict[predicted_class].append(estimate_pose(robotpose, box, true_height, focal_length, cx))
+                pose_x, pose_y = estimate_pose(robotpose, box, true_height, focal_length, cx)
+                
+                # distance from robot to this estimate, for weighting later
+                robot_x, robot_y = robotpose[0][0], robotpose[1][0]
+                dist = np.hypot(pose_x - robot_x, pose_y - robot_y)
+                
+                object_pose_dict[predicted_class].append((pose_x, pose_y, dist))
 
     # merge the estimations of the objects so that there are only one estimate for each object type
     object_pose_dict = merge_estimations(object_pose_dict)
