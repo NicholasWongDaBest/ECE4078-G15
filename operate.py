@@ -45,6 +45,12 @@ def load_true_map(fname):
 
 
 class Operate:
+    # Number row -> ArUco tag id, for selecting/deleting a marker from the map.
+    MARKER_DELETE_KEYS = {
+        pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3, pygame.K_4: 4, pygame.K_5: 5,
+        pygame.K_6: 6, pygame.K_7: 7, pygame.K_8: 8, pygame.K_9: 9, pygame.K_0: 10,
+    }
+
     def __init__(self, args):
         
         # Initialise robot controller object
@@ -116,6 +122,7 @@ class Operate:
         self.obj_detector_output = None
         self.ekf_on = False
         self.double_reset_comfirm = 0
+        self.pending_delete_tag = None  # marker tag awaiting a second keypress to confirm deletion
         self.image_id = 0
         self.show_live_rmse = True   # toggle with 'L'
         if self.ekf.number_landmarks() > 0:
@@ -296,7 +303,8 @@ class Operate:
 
         # paint SLAM outputs
         ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause=self.ekf_on,
-                                            true_map=active_true_map, live_rmse_info=live_rmse_info)
+                                            true_map=active_true_map, live_rmse_info=live_rmse_info,
+                                            selected_tag=self.pending_delete_tag)
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
@@ -369,9 +377,9 @@ class Operate:
                 self.adjust_pid('kd', self.pid_step)
 
             if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
-                self.base_wheel_speed = [0.6, 0.6]
+                self.base_wheel_speed = [0.5, 0.5]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
-                self.base_wheel_speed = [-0.6, -0.6]
+                self.base_wheel_speed = [-0.5, -0.5]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
                 self.base_wheel_speed = [-0.45, 0.45]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
@@ -427,6 +435,21 @@ class Operate:
                 self.show_live_rmse = not self.show_live_rmse
                 state = 'ON' if self.show_live_rmse else 'OFF'
                 self.notification = f'Live RMSE tracking {state}'
+            # select/delete a marker by its tag number (press once to select, again to delete)
+            elif event.type == pygame.KEYDOWN and event.key in self.MARKER_DELETE_KEYS:
+                tag = self.MARKER_DELETE_KEYS[event.key]
+                if self.pending_delete_tag == tag:
+                    if self.ekf.delete_landmark(tag):
+                        self.notification = f'Marker {tag} deleted'
+                    else:
+                        self.notification = f'Marker {tag} not in map'
+                    self.pending_delete_tag = None
+                else:
+                    self.pending_delete_tag = tag
+                    if tag in self.ekf.taglist:
+                        self.notification = f'Marker {tag} selected - press {tag} again to delete'
+                    else:
+                        self.notification = f'Marker {tag} not in map - press {tag} again to clear selection'
             # quit
             elif event.type == pygame.QUIT:
                 self.quit = True

@@ -34,6 +34,16 @@ class EKF:
         self.taglist = []
         self.init_lm_cov = 1e3
         self.innovation_gate = 9.21  # chi-square gate, 2 DOF, ~99% confidence -- see update()
+
+        # Viewpoint-novelty redundancy penalty: a repeat reading from nearly the same
+        # spot a landmark was last usefully seen from shares the same systematic error
+        # as that earlier reading, so it isn't an independent sample the way the EKF's
+        # math assumes if treated at face value. See viewpoint_novelty().
+        self.viewpoint_pos_threshold = 0.15               # m, full novelty after this much travel
+        self.viewpoint_ang_threshold = np.deg2rad(15.0)   # rad, or this much rotation
+        self.redundancy_penalty = 25.0                    # R multiplier for a repeat view
+        self._last_view_pose = {}                         # tag -> (x, y, theta)
+
         self.robot_init_state = None
         self.lm_pics = []
         for i in range(1, 11):
@@ -50,10 +60,30 @@ class EKF:
         self.taglist = []
         self.init_lm_cov = 1e3
         self.innovation_gate = 9.21
+        self._last_view_pose = {}
         self.robot_init_state = None
 
     def number_landmarks(self):
         return int(self.markers.shape[1])
+
+    def delete_landmark(self, tag):
+        """Remove a landmark (state, covariance, and bookkeeping) by ArUco tag id.
+        Returns True if the tag was found and removed, False otherwise."""
+        if tag not in self.taglist:
+            return False
+        idx = self.taglist.index(tag)
+        self.taglist.pop(idx)
+        self.markers = np.delete(self.markers, idx, axis=1)
+
+        # State layout is [robot(3); lm0(2); lm1(2); ...] (see get/set_state_vector),
+        # so landmark idx occupies P rows/cols [3+2*idx, 3+2*idx+1].
+        row_start = 3 + 2 * idx
+        rows_to_remove = [row_start, row_start + 1]
+        self.P = np.delete(self.P, rows_to_remove, axis=0)
+        self.P = np.delete(self.P, rows_to_remove, axis=1)
+
+        self._last_view_pose.pop(tag, None)
+        return True
 
     def get_state_vector(self):
         state = np.concatenate(
@@ -182,6 +212,22 @@ class EKF:
         # 2. Propagate state uncertainty covariance P
         self.P = F @ self.P @ F.T + Q
 
+    # How much genuinely new information a sighting of this tag carries, 0 to 1.
+    # 0 means "same vantage point as last time, tells us nothing new about geometry";
+    # 1 means "far enough away or turned enough that this is an independent look".
+    def viewpoint_novelty(self, tag):
+        pose = (float(self.robot.state[0, 0]),
+                float(self.robot.state[1, 0]),
+                float(self.robot.state[2, 0]))
+        last = self._last_view_pose.get(tag)
+        if last is None:
+            return 1.0, pose  # never seen before: fully informative
+        d_pos = np.hypot(pose[0] - last[0], pose[1] - last[1])
+        d_ang = abs((pose[2] - last[2] + np.pi) % (2 * np.pi) - np.pi)
+        novelty = max(d_pos / self.viewpoint_pos_threshold,
+                      d_ang / self.viewpoint_ang_threshold)
+        return min(1.0, novelty), pose
+
     # the update/correct step of EKF
     def update(self, sensor_measurement):
         if not sensor_measurement:
@@ -199,10 +245,22 @@ class EKF:
         # Stack measurements and build their covariance
         z_all = np.concatenate([lm.position.reshape(-1, 1) for lm in known_measurement], axis=0)
         R_all = np.zeros((2 * len(known_measurement), 2 * len(known_measurement)))
+        novelties = []
         for i in range(len(known_measurement)):
             distance = np.linalg.norm(known_measurement[i].position)
-            depth_var = 0.005 + 0.2 * distance**2
+            depth_var = 0.0039 * distance**2 - 0.0115 * distance + 0.01064
             lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed; tune this ratio
+
+            # Inflate a redundant sighting's noise: a repeat look from nearly the same
+            # spot this tag was last usefully seen from still nudges the estimate, but
+            # it no longer buys confidence it hasn't earned. Move to a new vantage
+            # point and the next sighting counts at full strength again.
+            tag = known_measurement[i].tag
+            novelty, pose = self.viewpoint_novelty(int(tag))
+            penalty = 1.0 + self.redundancy_penalty * (1.0 - novelty)
+            depth_var *= penalty
+            lateral_var *= penalty
+            novelties.append((int(tag), novelty, pose))
 
             # lm.position is [depth, lateral] in the robot's body frame, and so are
             # z_hat/H below (Robot.measure / derivative_measure) -- R MUST stay in
@@ -267,6 +325,16 @@ class EKF:
         # Force exact numerical symmetry
         self.P = 0.5 * (self.P + self.P.T)
 
+        # Remember where we were standing, for any tag whose reading counted as a
+        # fully novel viewpoint (novelty >= 1.0) -- this only affects future R
+        # inflation above, never today's state directly. A tag gated out earlier
+        # still gets recorded here if it qualified; that's inherited behaviour from
+        # where this came from and is harmless since a rejected reading never
+        # touched the state either way.
+        for tag, novelty, pose in novelties:
+            if novelty >= 1.0:
+                self._last_view_pose[tag] = pose
+
     def state_transition(self, drive_measurement):
         n = self.number_landmarks()*2 + 3
         F = np.eye(n)
@@ -294,29 +362,52 @@ class EKF:
             if len(known_in_view) < 1:
                 return
 
-        th = self.robot.state[2]
-        robot_xy = self.robot.state[0:2,:]
-        R_theta = np.block([[np.cos(th), -np.sin(th)],[np.sin(th), np.cos(th)]])
+
+        th = float(self.robot.state[2, 0])
+        c, sn = np.cos(th), np.sin(th)
+        R_theta = np.array([[c, -sn], [sn, c]])
+        dR_theta = np.array([[-sn, -c], [c, -sn]])  # d(R_theta)/d(theta)
+        robot_xy = self.robot.state[0:2, :]
 
         for lm in sensor_measurement:
             if lm.tag in self.taglist:
                 continue
 
-            lm_position = lm.position
+            lm_position = np.asarray(lm.position, dtype=float).reshape(2, 1)
             lm_state = robot_xy + R_theta @ lm_position
 
             self.taglist.append(int(lm.tag))
             self.markers = np.concatenate((self.markers, lm_state), axis=1)
 
-            self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
-            self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
+            # Proper cross-covariance at birth, instead of a big diagonal placeholder
+            # with zero correlation to the rest of the state. The new landmark is
+            # m = robot_xy + R(theta) @ z, so its uncertainty is built out of BOTH
+            # the robot's current uncertainty and the measurement's -- and the
+            # off-diagonal terms below are what let a later correction on any one
+            # landmark, or the robot pose, propagate to this one too.
+            #   Gx = d(m)/d(robot pose)   = [ I | dR/dtheta @ z ]   (2 x n)
+            #   Gz = d(m)/d(measurement)  = R(theta)                (2 x 2)
+            n = self.P.shape[0]
 
-            # Scale initial covariance with distance at first sighting -- a landmark
-            # first seen far away starts with more uncertainty than one seen close up.
+            Gx = np.zeros((2, n))
+            Gx[:, 0:2] = np.eye(2)
+            Gx[:, 2:3] = dR_theta @ lm_position
+
+            # Same depth/lateral measurement noise update() uses for this marker.
             distance = np.linalg.norm(lm_position)
-            lm_cov = self.init_lm_cov * (1.0 + 0.3 * distance)  # tune the 0.3 factor
-            self.P[-2,-2] = lm_cov**2
-            self.P[-1,-1] = lm_cov**2
+            depth_var = 0.0039 * distance**2 - 0.0115 * distance + 0.01064
+            lateral_var = depth_var * 1.5
+            Rz = np.diag([depth_var, lateral_var])
+
+            P_mx = Gx @ self.P                              # 2 x n: correlation with existing state
+            P_mm = Gx @ self.P @ Gx.T + R_theta @ Rz @ R_theta.T
+
+            P_new = np.zeros((n + 2, n + 2))
+            P_new[:n, :n] = self.P
+            P_new[n:, :n] = P_mx
+            P_new[:n, n:] = P_mx.T
+            P_new[n:, n:] = P_mm
+            self.P = 0.5 * (P_new + P_new.T)
 
     @staticmethod
     def umeyama(from_points, to_points):
@@ -356,7 +447,7 @@ class EKF:
         y_im = int(y*m2pixel+h/2.0)
         return (x_im, y_im)
 
-    def draw_slam_state(self, res = (320, 500), not_pause=True, true_map=None, live_rmse_info=None):
+    def draw_slam_state(self, res = (320, 500), not_pause=True, true_map=None, live_rmse_info=None, selected_tag=None):
         # Draw landmarks
         m2pixel = 100
         if not_pause:
@@ -420,6 +511,11 @@ class EKF:
                     surface.blit(self.lm_pics[self.taglist[i]-1], (coor_[0]-5, coor_[1]-5))
                 except IndexError:
                     surface.blit(self.lm_pics[-1], (coor_[0]-5, coor_[1]-5))
+                # flag the marker selected for deletion with a pointer above it
+                if selected_tag is not None and self.taglist[i] == selected_tag:
+                    tip = (coor_[0], coor_[1] - 10)
+                    pygame.draw.polygon(surface, (255, 215, 0),
+                                         [tip, (tip[0] - 6, tip[1] - 10), (tip[0] + 6, tip[1] - 10)])
         return surface
 
     @staticmethod
