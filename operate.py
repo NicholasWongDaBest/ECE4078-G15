@@ -20,6 +20,30 @@ sys.path.insert(0,"{}/cv/".format(os.getcwd()))
 from cv.detector import ObjectDetector
 
 
+def load_true_map(fname):
+    """
+    Load ground-truth ArUco marker positions from a truemap.txt-style JSON
+    file (same format eval.py's --truemap expects).
+    Returns a dict {tag:int -> np.array([[x],[y]])}, or None if the file is
+    missing/unreadable.
+    """
+    if not os.path.exists(fname):
+        return None
+    try:
+        with open(fname, 'r') as f:
+            gt_dict = json.load(f)
+    except Exception as e:
+        print(f"Could not parse true map '{fname}': {e}")
+        return None
+
+    true_map = {}
+    for key in gt_dict:
+        if key.startswith('aruco'):
+            tag = int(key.split('_')[0].replace('aruco', ''))
+            true_map[tag] = np.array([[gt_dict[key]['x']], [gt_dict[key]['y']]])
+    return true_map if true_map else None
+
+
 class Operate:
     def __init__(self, args):
         
@@ -51,6 +75,14 @@ class Operate:
         # Persisted SLAM map: survives program restarts unless 'r','r' is pressed
         self.slam_state_fname = os.path.join(self.lab_output_dir, 'slam_state.json')
         self.ekf.load_state(self.slam_state_fname)  # no-op if the file doesn't exist
+
+        # Ground-truth map for live RMSE tracking (optional -- practice tool only,
+        # eval.py against the real truemap.txt is still what's graded)
+        self.true_map = load_true_map(args.truemap)
+        if self.true_map is not None:
+            print(f"Loaded true map with {len(self.true_map)} markers for live RMSE tracking.")
+        else:
+            print(f"No true map found at '{args.truemap}' -- live RMSE tracking disabled.")
         
         # Initialise CV detector
         if args.yolo_path == "":
@@ -85,6 +117,7 @@ class Operate:
         self.ekf_on = False
         self.double_reset_comfirm = 0
         self.image_id = 0
+        self.show_live_rmse = True   # toggle with 'L'
         if self.ekf.number_landmarks() > 0:
             self.notification = f'Restored {self.ekf.number_landmarks()} landmark(s) - view markers & press ENTER to relocalise'
         else:
@@ -108,11 +141,24 @@ class Operate:
         self.prev_correct_time = time.time()
         self.sync_kp_rate = 0.00005   # NEW tunable -- replaces sync_kp, needs retuning (see below)
 
-        with open('distortion_correction.json') as f:
-            dc = json.load(f)
-        self.dist_degree = dc['degree']
-        self.dist_coeffs_x = np.array(dc['coeffs_x'])
-        self.dist_coeffs_y = np.array(dc['coeffs_y'])
+        # Distortion correction (optional). Rename/move distortion_correction.json
+        # away to disable it and test whether it's the source of a problem --
+        # if the file is missing, marker positions pass through unchanged.
+        self.dist_correction_enabled = False
+        dist_correction_path = 'distortion_correction.json'
+        if os.path.exists(dist_correction_path):
+            try:
+                with open(dist_correction_path) as f:
+                    dc = json.load(f)
+                self.dist_degree = dc['degree']
+                self.dist_coeffs_x = np.array(dc['coeffs_x'])
+                self.dist_coeffs_y = np.array(dc['coeffs_y'])
+                self.dist_correction_enabled = True
+                print(f"Loaded distortion correction (degree {self.dist_degree}) from {dist_correction_path}")
+            except Exception as e:
+                print(f"Failed to load {dist_correction_path}: {e} -- distortion correction disabled")
+        else:
+            print(f"No {dist_correction_path} found -- distortion correction disabled (raw positions used)")
 
     # update control parameters for ekf
     def control(self):
@@ -160,15 +206,17 @@ class Operate:
         baseline = np.loadtxt(fileB, delimiter=',')
         robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=174.5) ##change this value  
         return EKF(robot)
-
+    
     def apply_distortion_correction(self, x, y):
-        feats = [1, x, y]
-        if self.dist_degree >= 2:
-            feats += [x**2, x*y, y**2]
-        if self.dist_degree >= 3:
-            feats += [x**3, x**2*y, x*y**2, y**3]
-        feats = np.array(feats)
-        return float(feats @ self.dist_coeffs_x), float(feats @ self.dist_coeffs_y)
+            if not self.dist_correction_enabled:
+                return x, y
+            feats = [1, x, y]
+            if self.dist_degree >= 2:
+                feats += [x**2, x*y, y**2]
+            if self.dist_degree >= 3:
+                feats += [x**3, x**2*y, x*y**2, y**3]
+            feats = np.array(feats)
+            return float(feats @ self.dist_coeffs_x), float(feats @ self.dist_coeffs_y)
 
 
     # SLAM with ARUCO markers       
@@ -242,8 +290,13 @@ class Operate:
         text_colour = (220, 220, 220)
         v_pad, h_pad = 40, 20
 
+        # compute live RMSE only if a true map is loaded AND tracking is enabled
+        active_true_map = self.true_map if (self.true_map is not None and self.show_live_rmse) else None
+        live_rmse_info = self.ekf.compute_live_rmse(active_true_map) if active_true_map is not None else None
+
         # paint SLAM outputs
-        ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause = self.ekf_on)
+        ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause=self.ekf_on,
+                                            true_map=active_true_map, live_rmse_info=live_rmse_info)
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
@@ -257,6 +310,19 @@ class Operate:
         self.put_caption(canvas, caption='Robot Cam', position=(h_pad, v_pad))
         notification = TEXT_FONT.render(self.notification, False, text_colour)
         canvas.blit(notification, (h_pad+10, 596))
+
+        # live RMSE readout in the main window
+        if self.true_map is None:
+            rmse_line = "No true map loaded"
+        elif not self.show_live_rmse:
+            rmse_line = "Live RMSE tracking OFF (press L to toggle)"
+        elif live_rmse_info is None:
+            rmse_line = f"Live RMSE: need >=2 matched markers (have {len(self.ekf.taglist)})"
+        else:
+            rmse_line = (f"Live RMSE: {live_rmse_info['rmse']:.4f} m "
+                        f"({len(live_rmse_info['matched_tags'])}/{len(self.true_map)} markers)")
+        rmse_surface = TEXT_FONT.render(rmse_line, False, text_colour)
+        canvas.blit(rmse_surface, (h_pad+10, 624))
 
         time_remain = self.count_down - time.time() + self.start_time
         if time_remain > 0:
@@ -307,9 +373,9 @@ class Operate:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
                 self.base_wheel_speed = [-0.6, -0.6]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.base_wheel_speed = [-0.5, 0.5]
+                self.base_wheel_speed = [-0.35, 0.35]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.base_wheel_speed = [0.5, -0.5]
+                self.base_wheel_speed = [0.35, -0.35]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                 self.base_wheel_speed = [0.0, 0.0]
             if event.type == pygame.KEYUP and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
@@ -356,6 +422,11 @@ class Operate:
             # capture and save raw image
             elif event.type == pygame.KEYDOWN and event.key  == pygame.K_i:
                 self.command['save_image'] = True
+            # toggle live RMSE tracking on/off
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_l:
+                self.show_live_rmse = not self.show_live_rmse
+                state = 'ON' if self.show_live_rmse else 'OFF'
+                self.notification = f'Live RMSE tracking {state}'
             # quit
             elif event.type == pygame.QUIT:
                 self.quit = True
@@ -409,6 +480,7 @@ if __name__ == "__main__":
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.
     parser.add_argument("--calib_dir", type=str, default="calibration/param/") # calibration directory
     parser.add_argument("--yolo_path", default='cv/model/yolov8_model.pt') # directory for your trained AI model
+    parser.add_argument("--truemap", type=str, default='truemap.txt', help="ground-truth map for live RMSE practice tracking (optional)")
     args, _ = parser.parse_known_args()
     
     pygame.font.init() 

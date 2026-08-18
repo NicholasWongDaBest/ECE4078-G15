@@ -128,6 +128,42 @@ class EKF:
                 return True
             else:
                 return False
+
+    def compute_live_rmse(self, true_map):
+        """
+        Live SLAM RMSE against a ground-truth marker map.
+        @param true_map: dict {tag:int -> np.array([[x],[y]])}
+        Aligns the current estimate to the true map with a rotation+translation
+        (Umeyama, no scale -- same convention eval.py uses) using only markers
+        that are in BOTH self.taglist and true_map.
+        Returns a dict {'rmse', 'R', 't', 'matched_tags'}, or None if fewer
+        than 2 markers are matched (not enough to solve for the alignment).
+        """
+        if true_map is None or self.number_landmarks() == 0:
+            return None
+
+        matched_tags = [tag for tag in self.taglist if tag in true_map]
+        if len(matched_tags) < 2:
+            return None
+
+        est_pts = np.zeros((2, len(matched_tags)))
+        true_pts = np.zeros((2, len(matched_tags)))
+        for i, tag in enumerate(matched_tags):
+            idx = self.taglist.index(tag)
+            est_pts[:, i:i+1] = self.markers[:, idx:idx+1]
+            true_pts[:, i:i+1] = true_map[tag]
+
+        try:
+            R, t = self.umeyama(est_pts, true_pts)
+        except ValueError:
+            # matched points are collinear -- rotation isn't uniquely solvable yet
+            return None
+
+        aligned_est = R @ est_pts + t
+        residual = (aligned_est - true_pts).ravel()
+        rmse = float(np.sqrt(1.0 / len(matched_tags) * np.sum(residual ** 2)))  # matches eval.py's compute_rmse exactly
+
+        return {'rmse': rmse, 'R': R, 't': t, 'matched_tags': matched_tags}
         
     ##########################################
     # EKF functions
@@ -401,7 +437,7 @@ class EKF:
         y_im = int(y*m2pixel+h/2.0)
         return (x_im, y_im)
 
-    def draw_slam_state(self, res = (320, 500), not_pause=True):
+    def draw_slam_state(self, res = (320, 500), not_pause=True, true_map=None, live_rmse_info=None):
         # Draw landmarks
         m2pixel = 100
         if not_pause:
@@ -413,6 +449,7 @@ class EKF:
         lms_xy = self.markers[:2, :]
         robot_xy = self.robot.state[:2, 0].reshape((2, 1))
         lms_xy = lms_xy - robot_xy
+        robot_xy_world = robot_xy.copy() 
         robot_xy = robot_xy*0
         robot_theta = self.robot.state[2,0]
         # plot robot
@@ -431,6 +468,24 @@ class EKF:
                 axes_len, angle = self.make_ellipse(Plmi)
                 canvas = cv2.ellipse(canvas, coor_, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, (244, 69, 96), 1)
 
+        # --- overlay ground-truth markers for live RMSE practice ---
+        if true_map is not None and live_rmse_info is not None:
+            R, t = live_rmse_info['R'], live_rmse_info['t']
+            matched_tags = live_rmse_info['matched_tags']
+            for tag, true_xy in true_map.items():
+                true_in_est = R.T @ (true_xy - t) - robot_xy_world
+                coor_true = self.to_im_coor((true_in_est[0,0], true_in_est[1,0]), res, m2pixel)
+                colour = (40, 170, 40) if tag in matched_tags else (140, 140, 40)
+                cv2.drawMarker(canvas, coor_true, colour, markerType=cv2.MARKER_TILTED_CROSS, markerSize=10, thickness=2)
+                cv2.putText(canvas, str(tag), (coor_true[0]+6, coor_true[1]-6), cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA)
+
+                if tag in matched_tags:
+                    idx = self.taglist.index(tag)
+                    coor_est = self.to_im_coor((lms_xy[0,idx], lms_xy[1,idx]), res, m2pixel)
+                    cv2.line(canvas, coor_est, coor_true, (0, 140, 255), 1)
+
+            rmse_text = f"RMSE {live_rmse_info['rmse']:.4f}m ({len(matched_tags)}/{len(true_map)})"
+            cv2.putText(canvas, rmse_text, (5, res[1]-8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,0), 1, cv2.LINE_AA)
         surface = pygame.surfarray.make_surface(np.rot90(canvas))
         surface = pygame.transform.flip(surface, True, False)
         surface.blit(self.rot_center(self.pibot_pic, robot_theta*57.3), (start_point_uv[0]-15, start_point_uv[1]-15))
