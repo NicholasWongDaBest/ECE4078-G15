@@ -235,22 +235,18 @@ class EKF:
         idx_list = [self.taglist.index(tag) for tag in tags]
 
         # Stack measurements and set covariance
-        z = np.concatenate([lm.position.reshape(-1,1) for lm in known_measurement], axis=0)
+        z = np.concatenate([lm.position.reshape (-1,1) for lm in known_measurement], axis=0)
         R = np.zeros((2*len(known_measurement),2*len(known_measurement)))
         for i in range(len(known_measurement)):
             distance = np.linalg.norm(known_measurement[i].position)
             # Build R in the marker's LOCAL frame (robot-relative), then rotate into world
-            depth_var = 0.5 + 0.15 * distance**2
+            depth_var = 1.4 + 0.2 * distance**2
             lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed; tune this ratio
 
             # lm.position is [depth, lateral] roughly, in robot frame
             R_local = np.diag([depth_var, lateral_var])
 
-            # Rotate into world frame to match how z/z_hat are expressed
-            th = self.robot.state[2, 0]
-            Rot = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
-            R_world = Rot @ R_local @ Rot.T
-            R[2*i:2*i+2, 2*i:2*i+2] = R_world
+            R[2*i:2*i+2, 2*i:2*i+2] = R_local
 
 
         x_prior = self.get_state_vector()      # x⁽⁰⁾ before any iteration
@@ -300,9 +296,9 @@ class EKF:
         # typically edge/isolated markers on your route) keep a HIGHER floor so they
         # stay correctable; well-observed interior landmarks get a lower floor and
         # are allowed to converge tightly.
-        min_floor = 5e-4       # tight floor for well-observed landmarks
-        max_floor = 3e-3       # loose floor for freshly-seen landmarks
-        full_convergence_count = 40   # observations after which floor reaches min_floor
+        min_floor = 1e-5       # tight floor for well-observed landmarks
+        max_floor = 1e-4       # loose floor for freshly-seen landmarks
+        full_convergence_count = 120   # observations after which floor reaches min_floor
 
         for i in range(self.number_landmarks()):
             count = self.lm_obs_count[i]
@@ -522,7 +518,7 @@ class EKF:
         e_vals = e_vals[idx]
         e_vecs = e_vecs[:, idx]
         alpha = np.sqrt(4.605)
-        axes_len = np.sqrt(np.maximum(0, e_vals)) * 2 * alpha
+        axes_len = np.sqrt(np.maximum(0, e_vals)) * alpha
 
         # Near-isotropic covariance: the ellipse is essentially a circle, and its
         # "orientation" is numerically meaningless -- tiny noise in P flips which

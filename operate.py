@@ -19,6 +19,7 @@ from slam.aruco_sensor import ArucoSensor
 sys.path.insert(0,"{}/cv/".format(os.getcwd()))
 from cv.detector import ObjectDetector
 
+
 def load_true_map(fname):
     """
     Load ground-truth ArUco marker positions from a truemap.txt-style JSON
@@ -41,6 +42,7 @@ def load_true_map(fname):
             tag = int(key.split('_')[0].replace('aruco', ''))
             true_map[tag] = np.array([[gt_dict[key]['x']], [gt_dict[key]['y']]])
     return true_map if true_map else None
+
 
 class Operate:
     def __init__(self, args):
@@ -70,9 +72,6 @@ class Operate:
         self.ekf = self.init_ekf(args.calib_dir, args.ip)
         self.aruco_sensor = ArucoSensor(self.ekf.robot, marker_length=0.06) # size of the ARUCO markers (6cm)
 
-        # Persisted SLAM map: survives program restarts unless 'r','r' is pressed
-        self.slam_state_fname = os.path.join(self.lab_output_dir, 'slam_state.json')
-        self.ekf.load_state(self.slam_state_fname)  # no-op if the file doesn't exist
         # Persisted SLAM map: survives program restarts unless 'r','r' is pressed
         self.slam_state_fname = os.path.join(self.lab_output_dir, 'slam_state.json')
         self.ekf.load_state(self.slam_state_fname)  # no-op if the file doesn't exist
@@ -118,6 +117,7 @@ class Operate:
         self.ekf_on = False
         self.double_reset_comfirm = 0
         self.image_id = 0
+        self.show_live_rmse = True   # toggle with 'L'
         if self.ekf.number_landmarks() > 0:
             self.notification = f'Restored {self.ekf.number_landmarks()} landmark(s) - view markers & press ENTER to relocalise'
         else:
@@ -141,11 +141,24 @@ class Operate:
         self.prev_correct_time = time.time()
         self.sync_kp_rate = 0.00005   # NEW tunable -- replaces sync_kp, needs retuning (see below)
 
-        with open('distortion_correction.json') as f:
-            dc = json.load(f)
-        self.dist_degree = dc['degree']
-        self.dist_coeffs_x = np.array(dc['coeffs_x'])
-        self.dist_coeffs_y = np.array(dc['coeffs_y'])
+        # Distortion correction (optional). Rename/move distortion_correction.json
+        # away to disable it and test whether it's the source of a problem --
+        # if the file is missing, marker positions pass through unchanged.
+        self.dist_correction_enabled = False
+        dist_correction_path = 'distortion_correction.json'
+        if os.path.exists(dist_correction_path):
+            try:
+                with open(dist_correction_path) as f:
+                    dc = json.load(f)
+                self.dist_degree = dc['degree']
+                self.dist_coeffs_x = np.array(dc['coeffs_x'])
+                self.dist_coeffs_y = np.array(dc['coeffs_y'])
+                self.dist_correction_enabled = True
+                print(f"Loaded distortion correction (degree {self.dist_degree}) from {dist_correction_path}")
+            except Exception as e:
+                print(f"Failed to load {dist_correction_path}: {e} -- distortion correction disabled")
+        else:
+            print(f"No {dist_correction_path} found -- distortion correction disabled (raw positions used)")
 
     # update control parameters for ekf
     def control(self):
@@ -153,13 +166,8 @@ class Operate:
         left, right = self.botconnect.get_encoder_counts()
         delta_left = left - self.prev_left_count_ekf
         delta_right = right - self.prev_right_count_ekf
-
-        # A real reset snaps the raw count back near zero. Ordinary backward
-        # driving, or the reversing wheel during a turn-in-place, does not --
-        # so check the count itself, not the delta's sign/size.
-        reset_left = abs(left) < 5 and abs(self.prev_left_count_ekf) > 50
-        reset_right = abs(right) < 5 and abs(self.prev_right_count_ekf) > 50
-        if reset_left or reset_right:
+        # Guard against encoder counter reset on reconnect (large negative jump)
+        if delta_left < -10 or delta_right < -10:
             delta_left, delta_right = 0, 0
 
         self.prev_left_count_ekf, self.prev_right_count_ekf = left, right
@@ -198,15 +206,17 @@ class Operate:
         baseline = np.loadtxt(fileB, delimiter=',')
         robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=174.5) ##change this value  
         return EKF(robot)
-
+    
     def apply_distortion_correction(self, x, y):
-        feats = [1, x, y]
-        if self.dist_degree >= 2:
-            feats += [x**2, x*y, y**2]
-        if self.dist_degree >= 3:
-            feats += [x**3, x**2*y, x*y**2, y**3]
-        feats = np.array(feats)
-        return float(feats @ self.dist_coeffs_x), float(feats @ self.dist_coeffs_y)
+            if not self.dist_correction_enabled:
+                return x, y
+            feats = [1, x, y]
+            if self.dist_degree >= 2:
+                feats += [x**2, x*y, y**2]
+            if self.dist_degree >= 3:
+                feats += [x**3, x**2*y, x*y**2, y**3]
+            feats = np.array(feats)
+            return float(feats @ self.dist_coeffs_x), float(feats @ self.dist_coeffs_y)
 
 
     # SLAM with ARUCO markers       
@@ -232,8 +242,9 @@ class Operate:
                 self.ekf_on = False
             self.request_recover_robot = False
         elif self.ekf_on:
-            moved = drive_measurement.delta_left_ticks != 0 or drive_measurement.delta_right_ticks != 0
-            if moved:
+            v_l = drive_measurement.left_speed
+            v_r = drive_measurement.right_speed
+            if not (abs(v_l) < 1e-3 and abs(v_r) < 1e-3): #prevent predict to run when bot is not moving (prevent uncertainty to be added)
                 self.ekf.predict(drive_measurement)
             self.ekf.add_landmarks(sensor_measurement)
             self.ekf.update(sensor_measurement)
@@ -272,19 +283,20 @@ class Operate:
             self.obj_detector_output = (self.cv_vis, self.ekf.robot.state.tolist(), bboxes) # three things to be saved
             unique_detected = len(set([box[0] for box in bboxes]))
             self.notification = f'{unique_detected} object type(s) detected'
-         
+
     # paint the GUI            
     def draw(self, canvas):    
         canvas.blit(self.bg, (0, 0))
         text_colour = (220, 220, 220)
         v_pad, h_pad = 40, 20
 
-        # compute live RMSE against the true map (if loaded) before drawing the minimap
-        live_rmse_info = self.ekf.compute_live_rmse(self.true_map) if self.true_map is not None else None
+        # compute live RMSE only if a true map is loaded AND tracking is enabled
+        active_true_map = self.true_map if (self.true_map is not None and self.show_live_rmse) else None
+        live_rmse_info = self.ekf.compute_live_rmse(active_true_map) if active_true_map is not None else None
 
         # paint SLAM outputs
         ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause=self.ekf_on,
-                                            true_map=self.true_map, live_rmse_info=live_rmse_info)
+                                            true_map=active_true_map, live_rmse_info=live_rmse_info)
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
@@ -302,6 +314,8 @@ class Operate:
         # live RMSE readout in the main window
         if self.true_map is None:
             rmse_line = "No true map loaded"
+        elif not self.show_live_rmse:
+            rmse_line = "Live RMSE tracking OFF (press L to toggle)"
         elif live_rmse_info is None:
             rmse_line = f"Live RMSE: need >=2 matched markers (have {len(self.ekf.taglist)})"
         else:
@@ -359,9 +373,9 @@ class Operate:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
                 self.base_wheel_speed = [-0.6, -0.6]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.base_wheel_speed = [-0.5, 0.5]
+                self.base_wheel_speed = [-0.35, 0.35]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.base_wheel_speed = [0.5, -0.5]
+                self.base_wheel_speed = [0.35, -0.35]
             if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                 self.base_wheel_speed = [0.0, 0.0]
             if event.type == pygame.KEYUP and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
@@ -408,6 +422,11 @@ class Operate:
             # capture and save raw image
             elif event.type == pygame.KEYDOWN and event.key  == pygame.K_i:
                 self.command['save_image'] = True
+            # toggle live RMSE tracking on/off
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_l:
+                self.show_live_rmse = not self.show_live_rmse
+                state = 'ON' if self.show_live_rmse else 'OFF'
+                self.notification = f'Live RMSE tracking {state}'
             # quit
             elif event.type == pygame.QUIT:
                 self.quit = True
