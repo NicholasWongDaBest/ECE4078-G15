@@ -248,7 +248,7 @@ class EKF:
         novelties = []
         for i in range(len(known_measurement)):
             distance = np.linalg.norm(known_measurement[i].position)
-            depth_var = 0.0039 * distance**2 - 0.0115 * distance + 0.01064
+            depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
             lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed; tune this ratio
 
             # Inflate a redundant sighting's noise: a repeat look from nearly the same
@@ -351,16 +351,16 @@ class EKF:
         if not sensor_measurement:
             return
 
-        if len(self.taglist) == 0:
-            # Bootstrap case: map is empty, there are no "known" landmarks to require.
-            # Fall back to requiring several simultaneous markers instead, so the very
-            # first landmarks are still reasonably well-constrained by multi-marker geometry.
-            if len(sensor_measurement) < 3:
-                return
-        else:
-            known_in_view = [lm for lm in sensor_measurement if lm.tag in self.taglist]
-            if len(known_in_view) < 1:
-                return
+        # if len(self.taglist) == 0:
+        #     # Bootstrap case: map is empty, there are no "known" landmarks to require.
+        #     # Fall back to requiring several simultaneous markers instead, so the very
+        #     # first landmarks are still reasonably well-constrained by multi-marker geometry.
+        #     if len(sensor_measurement) < 3:
+        #         return
+        # else:
+        #     known_in_view = [lm for lm in sensor_measurement if lm.tag in self.taglist]
+        #     if len(known_in_view) < 1:
+        #         return
 
 
         th = float(self.robot.state[2, 0])
@@ -395,7 +395,7 @@ class EKF:
 
             # Same depth/lateral measurement noise update() uses for this marker.
             distance = np.linalg.norm(lm_position)
-            depth_var = 0.0039 * distance**2 - 0.0115 * distance + 0.01064
+            depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
             lateral_var = depth_var * 1.5
             Rz = np.diag([depth_var, lateral_var])
 
@@ -456,13 +456,17 @@ class EKF:
             bg_rgb = np.array([120, 120, 120]).reshape(1, 1, 3)
         canvas = np.ones((res[1], res[0], 3))*bg_rgb.astype(np.uint8)
         # in meters,
-        lms_xy = self.markers[:2, :]
-        robot_xy_world = self.robot.state[:2, 0].reshape((2, 1))  # position in the SLAM frame, before we recentre on the robot
-        lms_xy = lms_xy - robot_xy_world
-        robot_xy = robot_xy_world*0
+        lms_xy_world = self.markers[:2, :]
+        robot_xy_world = self.robot.state[:2, 0].reshape((2, 1))  # position in the SLAM frame, before we recentre on the markers
+        if self.number_landmarks() > 0:
+            center_xy = lms_xy_world.mean(axis=1).reshape((2, 1))  # recentre the view on the marker centroid
+        else:
+            center_xy = robot_xy_world  # no markers yet, fall back to centering on the robot
+        lms_xy = lms_xy_world - center_xy
+        robot_xy = robot_xy_world - center_xy
         robot_theta = self.robot.state[2,0]
         # plot robot
-        start_point_uv = self.to_im_coor((0, 0), res, m2pixel)
+        start_point_uv = self.to_im_coor((robot_xy[0,0], robot_xy[1,0]), res, m2pixel)
 
         p_robot = self.P[0:2,0:2]
         axes_len,angle = self.make_ellipse(p_robot)
@@ -484,8 +488,8 @@ class EKF:
             for tag, true_xy in true_map.items():
                 # bring the true marker from the ground-truth frame into the
                 # SLAM/estimated frame using the inverse of the alignment
-                # transform, then recentre on the robot like the estimates above
-                true_in_est = R.T @ (true_xy - t) - robot_xy_world
+                # transform, then recentre on the marker centroid like the estimates above
+                true_in_est = R.T @ (true_xy - t) - center_xy
                 coor_true = self.to_im_coor((true_in_est[0,0], true_in_est[1,0]), res, m2pixel)
                 colour = (40, 170, 40) if tag in matched_tags else (140, 140, 40)
                 cv2.drawMarker(canvas, coor_true, colour, markerType=cv2.MARKER_TILTED_CROSS, markerSize=10, thickness=2)
