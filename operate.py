@@ -51,6 +51,16 @@ class Operate:
         pygame.K_6: 6, pygame.K_7: 7, pygame.K_8: 8, pygame.K_9: 9, pygame.K_0: 10,
     }
 
+    # Arrow key -> [left, right] wheel speed for continuous driving. A tap
+    # pulse (see tap_pulse_duration) uses these same magnitudes so a hold
+    # that outlasts the pulse hands off to continuous driving at the same speed.
+    ARROW_KEY_SPEEDS = {
+        pygame.K_UP: [0.5, 0.5],
+        pygame.K_DOWN: [-0.5, -0.5],
+        pygame.K_LEFT: [-0.45, 0.45],
+        pygame.K_RIGHT: [0.45, -0.45],
+    }
+
     def __init__(self, args):
         
         # Initialise robot controller object
@@ -62,11 +72,11 @@ class Operate:
                         'save_image': False}
                         
         # TODO: Tune PID parameters here. If you don't want to use PID, set use_pid=0
-        # self.botconnect.set_pid(use_pid=1, kp=0, ki=0, kd=0)
+        # self.botconnect.set_pid(use_pid=1, k  p=0, ki=0, kd=0)
 
         # PID gains — now adjustable live via keyboard, not fixed at startup
-        self.pid_gains = {'kp': 1.8, 'ki': 0.04, 'kd': 0.29}
-        self.pid_step = 0.01
+        self.pid_gains = {'kp': 2, 'ki': 0.04, 'kd': 0.29}
+        self.pid_step = 0.005
         self.botconnect.set_pid(use_pid=1, **self.pid_gains)
 
         # Create a folder "lab_output" that stores the results of the lab
@@ -147,6 +157,19 @@ class Operate:
 
         self.prev_correct_time = time.time()
         self.sync_kp_rate = 0.00005   # NEW tunable -- replaces sync_kp, needs retuning (see below)
+
+        # Tap-vs-hold arrow key driving. A quick tap fires ONE bounded pulse
+        # (move_auto_time, fixed duration) so a tap always covers the same
+        # small, consistent distance regardless of how long the key was
+        # actually held down -- real hold-duration is too jittery (pygame
+        # event timing, network latency) to size a "small increment" on.
+        # Holding past the pulse's duration hands off to the existing
+        # continuous ramp-drive below, at the same speed, so it feels seamless.
+        self.tap_pulse_duration = 0.01   # s -- tune on hardware: shortest reliable single nudge
+        self.pulse_active_until = 0.0    # monotonic deadline; correct_straight_drive() stays
+                                          # quiet until this passes so it doesn't stomp the pulse
+        self.key_press_time = {}         # arrow key -> time.time() at KEYDOWN
+        self.continuous_keys = set()     # arrow keys promoted to continuous driving
 
         # Distortion correction (optional). Rename/move distortion_correction.json
         # away to disable it and test whether it's the source of a problem --
@@ -376,17 +399,16 @@ class Operate:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_m:
                 self.adjust_pid('kd', self.pid_step)
 
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
-                self.base_wheel_speed = [0.5, 0.5]
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
-                self.base_wheel_speed = [-0.5, -0.5]
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.base_wheel_speed = [-0.45, 0.45]
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.base_wheel_speed = [0.45, -0.45]
+            if event.type == pygame.KEYDOWN and event.key in self.ARROW_KEY_SPEEDS:
+                if event.key not in self.key_press_time:  # ignore OS key-repeat re-fires
+                    self.key_press_time[event.key] = time.time()
+                    self.pulse_active_until = time.time() + self.tap_pulse_duration
+                    self.botconnect.move_auto_time(self.ARROW_KEY_SPEEDS[event.key], self.tap_pulse_duration)
             if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                 self.base_wheel_speed = [0.0, 0.0]
-            if event.type == pygame.KEYUP and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
+            if event.type == pygame.KEYUP and event.key in self.ARROW_KEY_SPEEDS:
+                self.key_press_time.pop(event.key, None)
+                self.continuous_keys.discard(event.key)
                 self.base_wheel_speed = [0.0, 0.0]
             # run SLAM
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
@@ -456,6 +478,14 @@ class Operate:
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self.quit = True
 
+        # A key still held after its tap pulse has run its course gets
+        # promoted to continuous driving, at the same speed the pulse used.
+        pressed = pygame.key.get_pressed()
+        for key, press_time in list(self.key_press_time.items()):
+            if (pressed[key] and key not in self.continuous_keys
+                    and time.time() - press_time >= self.tap_pulse_duration):
+                self.continuous_keys.add(key)
+                self.base_wheel_speed = self.ARROW_KEY_SPEEDS[key]
 
         if self.quit:
             if self.ekf.number_landmarks() > 0:
@@ -465,6 +495,15 @@ class Operate:
             
     def correct_straight_drive(self):
         base_l, base_r = self.base_wheel_speed
+
+        # A tap pulse is a one-shot move_auto_time() call (mode 1) that the Pi
+        # runs to completion on its own. base_wheel_speed stays [0,0] the
+        # whole time (no continuous drive requested), so without this guard
+        # the move_manual([0,0]) call below would immediately flip botconnect
+        # back to mode 0 and cancel the pulse before it's even sent.
+        if base_l == 0.0 and base_r == 0.0 and time.time() < self.pulse_active_until:
+            self.prev_base_wheel_speed = [base_l, base_r]
+            return
 
         # Detect stop -> move transition, start a ramp
         was_stopped = (self.prev_base_wheel_speed == [0.0, 0.0])
