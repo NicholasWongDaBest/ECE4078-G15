@@ -55,10 +55,10 @@ class Operate:
     # pulse (see tap_pulse_duration) uses these same magnitudes so a hold
     # that outlasts the pulse hands off to continuous driving at the same speed.
     ARROW_KEY_SPEEDS = {
-        pygame.K_UP: [0.5, 0.5],
-        pygame.K_DOWN: [-0.5, -0.5],
-        pygame.K_LEFT: [-0.45, 0.45],
-        pygame.K_RIGHT: [0.45, -0.45],
+        pygame.K_UP: [0.4, 0.4],
+        pygame.K_DOWN: [-0.4, -0.4],
+        pygame.K_LEFT: [-0.35, 0.35],
+        pygame.K_RIGHT: [0.35, -0.35],
     }
 
     def __init__(self, args):
