@@ -234,7 +234,7 @@ class Operate:
         scale = np.loadtxt(fileS, delimiter=',')
         fileB = os.path.join(calib_dir, 'baseline.txt')
         baseline = np.loadtxt(fileB, delimiter=',')
-        robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=174.5) ##change this value  
+        robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=172.5) ##change this value  
         return EKF(robot)
     
     def apply_distortion_correction(self, x, y):
