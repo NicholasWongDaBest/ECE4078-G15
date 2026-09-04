@@ -54,7 +54,7 @@ class ObjectDetector:
         # numpy array assumes BGR (the cv2/training convention), so convert here
         # predict target type and bounding box with your trained YOLO
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        predictions = self.model.predict(img_bgr, imgsz=480, verbose=False)
+        predictions = self.model.predict(img_bgr, imgsz=480, verbose=False, conf=0.65, iou=0.5)
 
         # get bounding box and class label for target(s) detected
         bounding_boxes = []
@@ -84,6 +84,13 @@ class ObjectDetector:
         self.pred_pose_fname.flush()
         
         return f'pred_{self.pred_count-1}.png'
+
+    def reset(self):
+        """Close and reopen pred.txt fresh -- used when the SLAM map is cleared,
+        so pred.txt doesn't carry stale detections from before the reset."""
+        self.pred_pose_fname.close()
+        self.pred_pose_fname = open(os.path.join('lab_output', 'pred.txt'), 'w')
+        self.pred_count = 0
 
 
 # FOR TESTING ONLY

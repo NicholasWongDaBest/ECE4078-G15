@@ -51,6 +51,35 @@ def estimate_pose(robot_pose, box, object_true_height, focal_length, cx):
     
 
 # merge the estimations of the objects so that there is only 1 final estimate for each object type
+# Starting noise model for fruit depth estimation (pinhole/bbox-height based).
+# Same quadratic-in-distance shape as the ArUco marker noise model in ekf.py --
+# variance should grow with distance since a fixed pixel error in box_height
+# translates to a growing depth error as objects get smaller/farther. The
+# constants below are NOT calibrated for this sensor (they were fit for aruco
+# corner detection) -- treat DEPTH_NOISE_SCALE as the first thing to tune
+# against object_rmse_log.csv if merged results don't improve.
+DEPTH_NOISE_SCALE = 1.0
+LATERAL_NOISE_RATIO = 1.5   # lateral assumed noisier than depth, same ratio as ekf.py
+
+def object_noise_covariance(dist, theta):
+    """
+    Returns the 2x2 world-frame covariance for a fruit observation at
+    distance `dist`, taken while the robot was facing `theta`.
+    Builds variance in the robot's local (forward, lateral) frame, then
+    rotates into world (x, y) frame using the same R(theta) convention as
+    estimate_pose(): world = robot + R(theta) @ [forward, lateral].
+    """
+    depth_var = DEPTH_NOISE_SCALE * (0.039 * dist**2 - 0.115 * dist + 0.1064)
+    depth_var = max(depth_var, 1e-4)  # guard against negative/near-zero variance at short range
+    lateral_var = depth_var * LATERAL_NOISE_RATIO
+
+    c, s = np.cos(theta), np.sin(theta)
+    R = np.array([[c, -s], [s, c]])
+    Sigma_local = np.diag([depth_var, lateral_var])
+    Sigma_world = R @ Sigma_local @ R.T
+    return Sigma_world
+
+
 def merge_estimations(object_pose_dict):
     object_pose_dict_final = {}
     for key in object_pose_dict:
@@ -59,13 +88,17 @@ def merge_estimations(object_pose_dict):
             object_pose_dict_final[key + '_0'] = {'x': 0.0, 'y': 0.0}
             continue
 
-        arr = np.array(estimates)  # shape (N, 3): x, y, dist
+        arr = np.array(estimates)  # shape (N, 4): x, y, dist, theta
         pts = arr[:, :2]
         dists = arr[:, 2]
+        thetas = arr[:, 3]
 
         if len(pts) == 1:
             merged = pts[0]
         else:
+            # Outlier rejection stays as a coarse first pass -- covariance
+            # weighting alone doesn't protect against a gross misdetection
+            # (wrong class, bad bbox), it just weighs GOOD points correctly.
             median = np.median(pts, axis=0)
             outlier_dists = np.linalg.norm(pts - median, axis=1)
             outlier_thresh = 0.3
@@ -75,13 +108,22 @@ def merge_estimations(object_pose_dict):
 
             inlier_pts = pts[inlier_mask]
             inlier_dists = dists[inlier_mask]
+            inlier_thetas = thetas[inlier_mask]
 
-            # inverse-distance weights: closer detections count more
-            # small epsilon avoids divide-by-zero for near-zero distance
-            weights = 1.0 / (inlier_dists + 1e-3)
-            weights /= weights.sum()
+            # Inverse-covariance weighted merge (2D weighted least squares):
+            #   merged = (Σ Σᵢ⁻¹)⁻¹ (Σ Σᵢ⁻¹ pᵢ)
+            # instead of the old scalar 1/distance weighting -- this lets
+            # depth and lateral error shrink at DIFFERENT rates per
+            # observation rather than discounting a far detection uniformly.
+            Sigma_sum = np.zeros((2, 2))
+            weighted_pt_sum = np.zeros(2)
+            for i in range(len(inlier_pts)):
+                Sigma_i = object_noise_covariance(inlier_dists[i], inlier_thetas[i])
+                Sigma_i_inv = np.linalg.inv(Sigma_i)
+                Sigma_sum += Sigma_i_inv
+                weighted_pt_sum += Sigma_i_inv @ inlier_pts[i]
 
-            merged = np.average(inlier_pts, axis=0, weights=weights)
+            merged = np.linalg.inv(Sigma_sum) @ weighted_pt_sum
 
         object_pose_dict_final[key + '_0'] = {'x': float(merged[0]), 'y': float(merged[1])}
     return object_pose_dict_final
@@ -170,11 +212,6 @@ if __name__ == "__main__":
             robotpose, bboxes = entry['robotpose'], entry['bboxes']
             
             # for every bounding box detected
-            # for bbox in bboxes:
-            #     predicted_class = bbox[0]
-            #     box = bbox[1]
-            #     true_height = object_dimensions[predicted_class][2]
-            #     object_pose_dict[predicted_class].append(estimate_pose(robotpose, box, true_height, focal_length, cx))
             for bbox in bboxes:
                 predicted_class = bbox[0]
                 box = bbox[1]
@@ -183,9 +220,10 @@ if __name__ == "__main__":
                 
                 # distance from robot to this estimate, for weighting later
                 robot_x, robot_y = robotpose[0][0], robotpose[1][0]
+                robot_theta = robotpose[2][0]
                 dist = np.hypot(pose_x - robot_x, pose_y - robot_y)
                 
-                object_pose_dict[predicted_class].append((pose_x, pose_y, dist))
+                object_pose_dict[predicted_class].append((pose_x, pose_y, dist, robot_theta))
 
     # merge the estimations of the objects so that there are only one estimate for each object type
     object_pose_dict = merge_estimations(object_pose_dict)

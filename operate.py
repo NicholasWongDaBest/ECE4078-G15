@@ -496,13 +496,42 @@ class Operate:
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
                 if self.double_reset_comfirm == 0:
                     self.notification = 'Press again to confirm CLEAR MAP'
-                    self.double_reset_comfirm +=1
+                    self.double_reset_comfirm += 1
                 elif self.double_reset_comfirm == 1:
                     self.notification = 'SLAM Map is cleared'
                     self.double_reset_comfirm = 0
                     self.ekf.reset()
-                    if os.path.exists(self.slam_state_fname):
-                        os.remove(self.slam_state_fname)       
+
+                    # clear in-memory fruit/object accumulators
+                    self.object_pose_dict = {obj: [] for obj in self.object_list}
+                    self.detected_objects = set()
+                    self.live_object_rmse_info = None
+                    self.live_object_estimates = None
+                    self.obj_shot_id = 0
+
+                    # pred.txt is held open by ObjectDetector for the whole session, so it
+                    # must be closed/reopened by the class itself rather than deleted here
+                    # -- os.remove() would fail with PermissionError while it's still open
+                    if self.obj_detector is not None:
+                        self.obj_detector.reset()
+
+                    # remove persisted SLAM state + remaining output files so a relaunch
+                    # or reload doesn't pick up stale data from before this reset
+                    for fname in [
+                        self.slam_state_fname,
+                        os.path.join(self.lab_output_dir, 'slam.txt'),
+                        os.path.join(self.lab_output_dir, 'objects.txt'),
+                        self.obj_rmse_log_fname,
+                    ]:
+                        if os.path.exists(fname):
+                            os.remove(fname)
+
+                    # re-create a fresh (empty, headered) rmse log so process_object_estimates
+                    # can keep appending to it right away
+                    with open(self.obj_rmse_log_fname, 'w', newline='') as f:
+                        csv.writer(f).writerow(
+                            ['shot_id', 'object', 'robot_x', 'robot_y', 'robot_theta_deg', 'est_x', 'est_y', 'raw_error_m']
+                        )
             # run object/fruit detector
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_p:
                 self.command['run_obj_detector'] = True
@@ -607,7 +636,8 @@ class Operate:
             true_height = self.object_dimensions[predicted_class][2]
             pose_x, pose_y = estimate_pose(robot_pose, box, true_height, self.obj_focal_length, self.obj_cx)
             dist = float(np.hypot(pose_x - robot_x, pose_y - robot_y))
-            self.object_pose_dict.setdefault(predicted_class, []).append((pose_x, pose_y, dist))
+            robot_theta = robot_pose[2][0]
+            self.object_pose_dict.setdefault(predicted_class, []).append((pose_x, pose_y, dist, robot_theta))
             self.detected_objects.add(predicted_class)
 
             raw_error = ''
@@ -625,14 +655,13 @@ class Operate:
 
         if self.true_map_objects is not None:
             merged = merge_estimations(self.object_pose_dict)
-            self.live_object_rmse_info = compute_object_rmse(merged, self.true_map_objects)
             self.live_object_estimates = {k: v for k, v in merged.items()
                                    if k.rsplit('_', 1)[0] in self.detected_objects}
+            self.live_object_rmse_info = compute_object_rmse(self.live_object_estimates, self.true_map_objects)
             if self.live_object_rmse_info:
                 info = self.live_object_rmse_info
                 print(f"[Live] Object RMSE: {info['rmse']:.4f} m "
                     f"({len(info['matched'])}/{len(self.true_map_objects)} objects)")
-
 
 
 
