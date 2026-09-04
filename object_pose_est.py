@@ -86,6 +86,52 @@ def merge_estimations(object_pose_dict):
         object_pose_dict_final[key + '_0'] = {'x': float(merged[0]), 'y': float(merged[1])}
     return object_pose_dict_final
 
+def load_object_ground_truth(fname):
+    """Load only the fruit/object entries from a truemap.txt-style file.
+    Returns {object_type: np.array([[x],[y]])}, or None if unavailable.
+    """
+    if not os.path.exists(fname):
+        return None
+    try:
+        with open(fname, 'r') as f:
+            gt_dict = json.load(f)
+    except Exception as e:
+        print(f"Could not parse true map '{fname}': {e}")
+        return None
+    object_gt = {}
+    for key in gt_dict:
+        if not key.startswith('aruco'):
+            object_type = key.split('_')[0]
+            object_gt[object_type] = np.array([[gt_dict[key]['x']], [gt_dict[key]['y']]])
+    return object_gt if object_gt else None
+
+
+def compute_object_rmse(object_est_dict, object_gt_dict):
+    """
+    object_est_dict: output of merge_estimations, e.g. {'redapple_0': {'x':..,'y':..}}
+    object_gt_dict: output of load_object_ground_truth
+    Returns {'rmse':.., 'errors':{obj_type: err}, 'matched':[obj_types]} or None if no matches.
+    """
+    matched, errors, est_pts, gt_pts = [], {}, [], []
+    for key_0 in object_est_dict:
+        obj_type = key_0.rsplit('_', 1)[0]
+        if obj_type not in object_gt_dict:
+            continue
+        est = object_est_dict[key_0]
+        est_xy = np.array([[est['x']], [est['y']]])
+        gt_xy = object_gt_dict[obj_type]
+        errors[obj_type] = round(float(np.linalg.norm(est_xy - gt_xy)), 5)
+        matched.append(obj_type)
+        est_pts.append(est_xy)
+        gt_pts.append(gt_xy)
+
+    if not matched:
+        return None
+
+    residual = (np.hstack(est_pts) - np.hstack(gt_pts)).ravel()
+    rmse = float(np.sqrt(np.mean(residual ** 2)))
+    return {'rmse': rmse, 'errors': errors, 'matched': matched}
+
 if __name__ == "__main__":
     
     '''

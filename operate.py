@@ -19,6 +19,9 @@ from slam.aruco_sensor import ArucoSensor
 sys.path.insert(0,"{}/cv/".format(os.getcwd()))
 from cv.detector import ObjectDetector
 
+import csv
+from object_pose_est import estimate_pose, merge_estimations, load_object_ground_truth, compute_object_rmse
+
 
 def load_true_map(fname):
     """
@@ -101,6 +104,36 @@ class Operate:
         else:
             print(f"No true map found at '{args.truemap}' -- live RMSE tracking disabled.")
         self.true_map_fname = "truemap.txt" # M2
+
+        # Object ground truth + accumulators for live object RMSE tracking
+        self.detected_objects = set()   # object types with >=1 real detection so far
+        self.true_map_objects = load_object_ground_truth(args.truemap)
+        if self.true_map_objects is not None:
+            print(f"Loaded {len(self.true_map_objects)} ground-truth object positions for live RMSE tracking.")
+
+        self.object_dimensions = {}
+        self.object_list = []
+        obj_csv = 'object_list.csv'   # <-- CONFIRM THIS PATH, see note below
+        if os.path.exists(obj_csv):
+            with open(obj_csv, 'r') as f:
+                for row in csv.DictReader(f):
+                    self.object_list.append(row['object'])
+                    self.object_dimensions[row['object']] = [
+                        float(row['length(m)']), float(row['width(m)']), float(row['height(m)'])
+                    ]
+        else:
+            print(f"Object list not found at '{obj_csv}' -- live object RMSE disabled.")
+
+        self.object_pose_dict = {obj: [] for obj in self.object_list}
+        self.live_object_rmse_info = None
+        self.live_object_estimates = None
+
+        self.obj_rmse_log_fname = os.path.join(self.lab_output_dir, 'object_rmse_log.csv')
+        with open(self.obj_rmse_log_fname, 'w', newline='') as f:
+            csv.writer(f).writerow(
+                ['shot_id', 'object', 'robot_x', 'robot_y', 'robot_theta_deg', 'est_x', 'est_y', 'raw_error_m']
+            )
+        self.obj_shot_id = 0
         
         # Initialise CV detector
         if args.yolo_path == "":
@@ -230,6 +263,8 @@ class Operate:
     def init_ekf(self, calib_dir, ip):
         fileK = os.path.join(calib_dir, 'intrinsic.txt')
         camera_matrix = np.loadtxt(fileK, delimiter=',')
+        self.obj_focal_length = camera_matrix[0][0]
+        self.obj_cx = camera_matrix[0][2]
         fileD = os.path.join(calib_dir, 'distCoeffs.txt')
         dist_coeffs = np.loadtxt(fileD, delimiter=',')
         fileS = os.path.join(calib_dir, 'scale.txt')
@@ -301,7 +336,8 @@ class Operate:
         if self.command['save_obj_detector']:
             if self.obj_detector_output is not None:   
                 self.pred_fname = self.obj_detector.write_output(*self.obj_detector_output, self.lab_output_dir)
-                self.notification = f'Prediction is saved to {operate.pred_fname}'
+                self.notification = f'Prediction is saved to {self.pred_fname}'
+                self.process_object_estimates()
             else:
                 self.notification = f'No prediction in buffer, save ignored'
             self.command['save_obj_detector'] = False
@@ -327,6 +363,7 @@ class Operate:
 
     # paint the GUI            
     def draw(self, canvas):    
+        canvas.fill((0, 0, 0))
         canvas.blit(self.bg, (0, 0))
         text_colour = (220, 220, 220)
         v_pad, h_pad = 40, 20
@@ -337,8 +374,11 @@ class Operate:
 
         # paint SLAM outputs
         ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause=self.ekf_on,
-                                            true_map=active_true_map, live_rmse_info=live_rmse_info,
-                                            selected_tag=self.pending_delete_tag)
+                                    true_map=active_true_map, live_rmse_info=live_rmse_info,
+                                    selected_tag=self.pending_delete_tag,
+                                    object_gt=self.true_map_objects if self.show_live_rmse else None,
+                                    object_estimates=self.live_object_estimates,
+                                    object_rmse_info=self.live_object_rmse_info)
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
@@ -350,21 +390,22 @@ class Operate:
         self.put_caption(canvas, caption='SLAM', position=(2*h_pad+320, v_pad))
         self.put_caption(canvas, caption='Detector', position=(h_pad, 240+2*v_pad))
         self.put_caption(canvas, caption='Robot Cam', position=(h_pad, v_pad))
-        notification = TEXT_FONT.render(self.notification, False, text_colour)
+        notification = TEXT_FONT.render(self.notification[:55], False, text_colour)
         canvas.blit(notification, (h_pad+10, 596))
 
         # live RMSE readout in the main window
-        if self.true_map is None:
-            rmse_line = "No true map loaded"
+        if self.true_map_objects is None:
+            obj_rmse_line = "No object ground truth loaded"
         elif not self.show_live_rmse:
-            rmse_line = "Live RMSE tracking OFF (press L to toggle)"
-        elif live_rmse_info is None:
-            rmse_line = f"Live RMSE: need >=2 matched markers (have {len(self.ekf.taglist)})"
+            obj_rmse_line = ""
+        elif self.live_object_rmse_info is None:
+            obj_rmse_line = "Object RMSE: no matched estimates yet"
         else:
-            rmse_line = (f"Live RMSE: {live_rmse_info['rmse']:.4f} m "
-                        f"({len(live_rmse_info['matched_tags'])}/{len(self.true_map)} markers)")
-        rmse_surface = TEXT_FONT.render(rmse_line, False, text_colour)
-        canvas.blit(rmse_surface, (h_pad+10, 624))
+            info = self.live_object_rmse_info
+            obj_rmse_line = (f"Object RMSE: {info['rmse']:.4f} m "
+                            f"({len(info['matched'])}/{len(self.true_map_objects)} objects)")
+        obj_rmse_surface = TEXT_FONT.render(obj_rmse_line, False, text_colour)
+        canvas.blit(obj_rmse_surface, (h_pad+10, 652))
 
         time_remain = self.count_down - time.time() + self.start_time
         if time_remain > 0:
@@ -374,7 +415,7 @@ class Operate:
         else:
             time_remain = ""
         count_down_surface = TEXT_FONT.render(time_remain, False, (50, 50, 50))
-        canvas.blit(count_down_surface, (2*h_pad+320+5, 530))
+        canvas.blit(count_down_surface, (h_pad+10, 680))
         return canvas
 
     @staticmethod
@@ -446,6 +487,11 @@ class Operate:
             # load true map M2 (freezes landmark positions, SLAM only localises)
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_l:
                 self.command['load_true_map'] = True
+            # show live rmse
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_k:
+                self.show_live_rmse = not self.show_live_rmse
+                state = 'ON' if self.show_live_rmse else 'OFF'
+                self.notification = f'Live RMSE tracking {state}'
             # reset SLAM map
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
                 if self.double_reset_comfirm == 0:
@@ -466,11 +512,6 @@ class Operate:
             # capture and save raw image
             elif event.type == pygame.KEYDOWN and event.key  == pygame.K_i:
                 self.command['save_image'] = True
-            # toggle live RMSE tracking on/off
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_l:
-                self.show_live_rmse = not self.show_live_rmse
-                state = 'ON' if self.show_live_rmse else 'OFF'
-                self.notification = f'Live RMSE tracking {state}'
             # select/delete a marker by its tag number (press once to select, again to delete)
             elif event.type == pygame.KEYDOWN and event.key in self.MARKER_DELETE_KEYS:
                 tag = self.MARKER_DELETE_KEYS[event.key]
@@ -548,6 +589,50 @@ class Operate:
         self.botconnect.move_manual(adjusted)
         self.prev_base_wheel_speed = [base_l, base_r]
 
+    def process_object_estimates(self):
+        """Runs after every 'n' (save prediction). Logs the raw per-shot pose
+        estimate (for angle analysis later) and updates the running cumulative
+        merged-estimate RMSE against truemap.txt, if loaded."""
+        if not self.object_dimensions:
+            return
+
+        _, robot_pose, bboxes = self.obj_detector_output
+        robot_theta_deg = np.degrees(robot_pose[2][0])
+        robot_x, robot_y = robot_pose[0][0], robot_pose[1][0]
+
+        shot_rows = []
+        for predicted_class, box in bboxes:
+            if predicted_class not in self.object_dimensions:
+                continue
+            true_height = self.object_dimensions[predicted_class][2]
+            pose_x, pose_y = estimate_pose(robot_pose, box, true_height, self.obj_focal_length, self.obj_cx)
+            dist = float(np.hypot(pose_x - robot_x, pose_y - robot_y))
+            self.object_pose_dict.setdefault(predicted_class, []).append((pose_x, pose_y, dist))
+            self.detected_objects.add(predicted_class)
+
+            raw_error = ''
+            if self.true_map_objects is not None and predicted_class in self.true_map_objects:
+                gt = self.true_map_objects[predicted_class]
+                raw_error = float(np.hypot(pose_x - gt[0][0], pose_y - gt[1][0]))
+
+            self.obj_shot_id += 1
+            shot_rows.append([self.obj_shot_id, predicted_class, robot_x, robot_y,
+                            robot_theta_deg, pose_x, pose_y, raw_error])
+
+        if shot_rows:
+            with open(self.obj_rmse_log_fname, 'a', newline='') as f:
+                csv.writer(f).writerows(shot_rows)
+
+        if self.true_map_objects is not None:
+            merged = merge_estimations(self.object_pose_dict)
+            self.live_object_rmse_info = compute_object_rmse(merged, self.true_map_objects)
+            self.live_object_estimates = {k: v for k, v in merged.items()
+                                   if k.rsplit('_', 1)[0] in self.detected_objects}
+            if self.live_object_rmse_info:
+                info = self.live_object_rmse_info
+                print(f"[Live] Object RMSE: {info['rmse']:.4f} m "
+                    f"({len(info['matched'])}/{len(self.true_map_objects)} objects)")
+
 
 
 
@@ -556,7 +641,6 @@ if __name__ == "__main__":
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.
     parser.add_argument("--calib_dir", type=str, default="calibration/param/") # calibration directory
     parser.add_argument("--yolo_path", default='cv/model/yolo26n.pt') # directory for your trained AI model
-    parser.add_argument("--yolo_path", default='cv/model/yolov8_model.pt') # directory for your trained AI model
     parser.add_argument("--truemap", type=str, default='truemap.txt', help="ground-truth map for live RMSE practice tracking (optional)")
     args, _ = parser.parse_known_args()
     
@@ -564,7 +648,7 @@ if __name__ == "__main__":
     TITLE_FONT = pygame.font.Font('ui/8-BitMadness.ttf', 35)
     TEXT_FONT = pygame.font.Font('ui/8-BitMadness.ttf', 40)
     
-    width, height = 700, 660
+    width, height = 900, 760
     canvas = pygame.display.set_mode((width, height))
     pygame.display.set_caption('ECE4078 Lab')
     pygame.display.set_icon(pygame.image.load('ui/8bit/pibot5.png'))
@@ -590,7 +674,7 @@ if __name__ == "__main__":
             pygame.display.update()
             counter += 2
     
-    width, height = 900, 660
+    width, height = 900, 760
     canvas = pygame.display.set_mode((width, height))
     operate = Operate(args)
     while start:
