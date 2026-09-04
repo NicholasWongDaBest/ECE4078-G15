@@ -3,7 +3,7 @@
 # ===============================================
 # Main params to modify
 # ===============================================
-input_image: testmap1.JPEG
+input_image: testmap1.JPG
 output_map_name: truemap.txt
 
 # a reference map to display objects on the map

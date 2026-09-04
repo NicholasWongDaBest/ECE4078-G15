@@ -27,12 +27,23 @@ class EKF:
         # State components
         self.robot = robot
         self.markers = np.zeros((2,0))
-        
+
         # Covariance matrix
         self.P = np.zeros((3,3)) # shape of this matrix changes as more landmarks are discovered
-        
+
         self.taglist = []
         self.init_lm_cov = 1e3
+        self.innovation_gate = 9.21  # chi-square gate, 2 DOF, ~99% confidence -- see update()
+
+        # Viewpoint-novelty redundancy penalty: a repeat reading from nearly the same
+        # spot a landmark was last usefully seen from shares the same systematic error
+        # as that earlier reading, so it isn't an independent sample the way the EKF's
+        # math assumes if treated at face value. See viewpoint_novelty().
+        self.viewpoint_pos_threshold = 0.15               # m, full novelty after this much travel
+        self.viewpoint_ang_threshold = np.deg2rad(15.0)   # rad, or this much rotation
+        self.redundancy_penalty = 25.0                    # R multiplier for a repeat view
+        self._last_view_pose = {}                         # tag -> (x, y, theta)
+
         self.robot_init_state = None
         self.freeze_map = False # M2: true once true map is loaded
         self.lm_pics = []
@@ -42,31 +53,52 @@ class EKF:
         f_ = f'./ui/8bit/lm_unknown.png'
         self.lm_pics.append(pygame.image.load(f_))
         self.pibot_pic = pygame.image.load(f'./ui/8bit/pibot_top.png')
-        
+
     def reset(self):
         self.robot.state = np.zeros((3, 1))
         self.markers = np.zeros((2,0))
         self.P = np.zeros((3,3))
         self.taglist = []
         self.init_lm_cov = 1e3
+        self.innovation_gate = 9.21
+        self._last_view_pose = {}
         self.robot_init_state = None
         self.freeze_map = False # M2 true map
 
     def number_landmarks(self):
         return int(self.markers.shape[1])
 
+    def delete_landmark(self, tag):
+        """Remove a landmark (state, covariance, and bookkeeping) by ArUco tag id.
+        Returns True if the tag was found and removed, False otherwise."""
+        if tag not in self.taglist:
+            return False
+        idx = self.taglist.index(tag)
+        self.taglist.pop(idx)
+        self.markers = np.delete(self.markers, idx, axis=1)
+
+        # State layout is [robot(3); lm0(2); lm1(2); ...] (see get/set_state_vector),
+        # so landmark idx occupies P rows/cols [3+2*idx, 3+2*idx+1].
+        row_start = 3 + 2 * idx
+        rows_to_remove = [row_start, row_start + 1]
+        self.P = np.delete(self.P, rows_to_remove, axis=0)
+        self.P = np.delete(self.P, rows_to_remove, axis=1)
+
+        self._last_view_pose.pop(tag, None)
+        return True
+
     def get_state_vector(self):
         state = np.concatenate(
             (self.robot.state, np.reshape(self.markers, (-1,1), order='F')), axis=0)
         return state
-    
+
     def set_state_vector(self, state):
         self.robot.state = state[0:3,:]
         self.markers = np.reshape(state[3:,:], (2,-1), order='F')
-    
+
     def save_map(self, fname="slam.txt"):
+        d = {}
         if self.number_landmarks() > 0:
-            d = {}
             for i, tag in enumerate(self.taglist):
                 d["aruco" + str(tag) + "_0"] = {"x": self.markers[0,i], "y":self.markers[1,i]}
             with open(fname, 'w') as map_f:
@@ -154,7 +186,43 @@ class EKF:
                 return True
             else:
                 return False
-        
+
+    def compute_live_rmse(self, true_map):
+        """
+        Live SLAM RMSE against a ground-truth marker map.
+        @param true_map: dict {tag:int -> np.array([[x],[y]])}
+        Aligns the current estimate to the true map with a rotation+translation
+        (Umeyama, no scale -- same convention eval.py uses) using only markers
+        that are in BOTH self.taglist and true_map.
+        Returns a dict {'rmse', 'R', 't', 'matched_tags'}, or None if fewer
+        than 2 markers are matched (not enough to solve for the alignment).
+        """
+        if true_map is None or self.number_landmarks() == 0:
+            return None
+
+        matched_tags = [tag for tag in self.taglist if tag in true_map]
+        if len(matched_tags) < 2:
+            return None
+
+        est_pts = np.zeros((2, len(matched_tags)))
+        true_pts = np.zeros((2, len(matched_tags)))
+        for i, tag in enumerate(matched_tags):
+            idx = self.taglist.index(tag)
+            est_pts[:, i:i+1] = self.markers[:, idx:idx+1]
+            true_pts[:, i:i+1] = true_map[tag]
+
+        try:
+            R, t = self.umeyama(est_pts, true_pts)
+        except ValueError:
+            # matched points are collinear -- rotation isn't uniquely solvable yet
+            return None
+
+        aligned_est = R @ est_pts + t
+        residual = (aligned_est - true_pts).ravel()
+        rmse = float(np.sqrt(1.0 / len(matched_tags) * np.sum(residual ** 2)))  # matches eval.py's compute_rmse exactly
+
+        return {'rmse': rmse, 'R': R, 't': t, 'matched_tags': matched_tags}
+
     ##########################################
     # EKF functions
     # Tune your SLAM algorithm here
@@ -162,53 +230,31 @@ class EKF:
 
     # the prediction step of EKF
     def predict(self, drive_measurement):
-        # # OLD CODE, ADD FLAT UNCERTAINTY (0.01) TO PURE ROTATION AND TRANSLATION
-        # F = self.state_transition(drive_measurement)
-        # x = self.get_state_vector()
-        # Q = self.predict_covariance(drive_measurement)
-        # Q[0:3,0:3] += 0.01*np.eye(3)
-
-        # # TODO: add your codes here to compute the predicted x
-        # # 1. Drive the robot forward to propagate state
-        # self.robot.drive(drive_measurement)
-        
-        # # 2. Propagate state uncertainty covariance P
-        # self.P = F @ self.P @ F.T + Q
-        # # TODO end
-
-        ## NOW DO DIFFERENT NOISE DEPENDING ON TRANSLATION OR ROTATION + SCALE Q WITH TIME
         F = self.state_transition(drive_measurement)
-        x = self.get_state_vector()
         Q = self.predict_covariance(drive_measurement)
+        Q[0:3, 0:3] += 0.01 * np.eye(3)
 
-        dt = drive_measurement.dt
-
-        # Calculate linear and angular components
-        v_left = abs(drive_measurement.left_speed)
-        v_right = abs(drive_measurement.right_speed)
-        v_avg = abs(v_left + v_right) / 2.0  # Forward speed
-
-
-        if v_avg < 0.05:  # Pure rotation / Turning on the spot
-            # Only add process noise to theta (heading), lock x and y!
-            Q_boost = np.diag([0.0, 0.0, 0.005 * v_avg * dt + 1e-4,])
-        else:  # Moving forward
-            # Add normal process noise to x, y, and theta
-            Q_boost = np.diag(
-                        [
-                            0.001 * v_avg * dt + 1e-5,  # x noise
-                            0.001 * v_avg * dt + 1e-5,  # y noise
-                            0.005 * v_avg * dt + 1e-4,  # theta noise
-                        ]
-                )
-
-        Q[0:3, 0:3] += Q_boost
-
-        # Propagate state and covariance
+        # 1. Drive the robot forward to propagate state
         self.robot.drive(drive_measurement)
 
-        # 2. Propagate the covariance forward: P = F P F^T + Q
+        # 2. Propagate state uncertainty covariance P
         self.P = F @ self.P @ F.T + Q
+
+    # How much genuinely new information a sighting of this tag carries, 0 to 1.
+    # 0 means "same vantage point as last time, tells us nothing new about geometry";
+    # 1 means "far enough away or turned enough that this is an independent look".
+    def viewpoint_novelty(self, tag):
+        pose = (float(self.robot.state[0, 0]),
+                float(self.robot.state[1, 0]),
+                float(self.robot.state[2, 0]))
+        last = self._last_view_pose.get(tag)
+        if last is None:
+            return 1.0, pose  # never seen before: fully informative
+        d_pos = np.hypot(pose[0] - last[0], pose[1] - last[1])
+        d_ang = abs((pose[2] - last[2] + np.pi) % (2 * np.pi) - np.pi)
+        novelty = max(d_pos / self.viewpoint_pos_threshold,
+                      d_ang / self.viewpoint_ang_threshold)
+        return min(1.0, novelty), pose
 
     # the update/correct step of EKF
     def update(self, sensor_measurement):
@@ -224,162 +270,174 @@ class EKF:
         tags = [lm.tag for lm in known_measurement]
         idx_list = [self.taglist.index(tag) for tag in tags]
 
-        # Stack measurements and set covariance
-        z = np.concatenate([lm.position.reshape(-1,1) for lm in known_measurement], axis=0)
-        R = np.zeros((2*len(known_measurement),2*len(known_measurement)))
+        # Stack measurements and build their covariance
+        z_all = np.concatenate([lm.position.reshape(-1, 1) for lm in known_measurement], axis=0)
+        R_all = np.zeros((2 * len(known_measurement), 2 * len(known_measurement)))
+        novelties = []
         for i in range(len(known_measurement)):
             distance = np.linalg.norm(known_measurement[i].position)
-            # Build R in the marker's LOCAL frame (robot-relative), then rotate into world
-            depth_var = 0.03 + 0.015 * distance**2
+            depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
             lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed; tune this ratio
 
-            # lm.position is [depth, lateral] roughly, in robot frame
-            R_local = np.diag([depth_var, lateral_var])
+            # Inflate a redundant sighting's noise: a repeat look from nearly the same
+            # spot this tag was last usefully seen from still nudges the estimate, but
+            # it no longer buys confidence it hasn't earned. Move to a new vantage
+            # point and the next sighting counts at full strength again.
+            tag = known_measurement[i].tag
+            novelty, pose = self.viewpoint_novelty(int(tag))
+            penalty = 1.0 + self.redundancy_penalty * (1.0 - novelty)
+            depth_var *= penalty
+            lateral_var *= penalty
+            novelties.append((int(tag), novelty, pose))
 
-            # Rotate into world frame to match how z/z_hat are expressed
-            th = self.robot.state[2, 0]
-            Rot = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
-            R_world = Rot @ R_local @ Rot.T
-            R[2*i:2*i+2, 2*i:2*i+2] = R_world
+            # lm.position is [depth, lateral] in the robot's body frame, and so are
+            # z_hat/H below (Robot.measure / derivative_measure) -- R MUST stay in
+            # that same local frame. Do not rotate it by theta: z, z_hat, and H are
+            # never expressed in world frame, so rotating R mixes frames and silently
+            # swaps how much depth vs. lateral is trusted as theta changes.
+            R_all[2*i:2*i+2, 2*i:2*i+2] = np.diag([depth_var, lateral_var])
 
+        # Compute own measurements
+        z_hat_all = self.robot.measure(self.markers, idx_list)
+        z_hat_all = z_hat_all.reshape((-1, 1), order="F")
+        H_all = self.robot.derivative_measure(self.markers, idx_list)
 
-        x_prior = self.get_state_vector()      # x⁽⁰⁾ before any iteration
-        P_prior = self.P.copy()                # P before this update, held fixed across iterations
+        # --- Innovation (Mahalanobis) gating ---
+        # Check each marker's reading against what the filter currently expects
+        # BEFORE accepting it, rather than blending every reading in blindly.
+        # A marker glimpsed at a bad/foreshortened angle -- or any other one-off
+        # bad reading -- tends to show up as a statistical outlier here, and gets
+        # skipped for this frame instead of dragging the robot pose and every
+        # other landmark along with it. d2 is the squared Mahalanobis distance;
+        # under normal noise it follows a chi-square distribution with 2 DOF, so
+        # innovation_gate=9.21 rejects only the ~1% most inconsistent readings.
+        keep = []
+        for i in range(len(known_measurement)):
+            y_i = z_all[2*i:2*i+2] - z_hat_all[2*i:2*i+2]
+            H_i = H_all[2*i:2*i+2, :]
+            R_i = R_all[2*i:2*i+2, 2*i:2*i+2]
+            S_i = H_i @ self.P @ H_i.T + R_i
+            d2 = (y_i.T @ np.linalg.inv(S_i) @ y_i).item()
+            if d2 <= self.innovation_gate:
+                keep.append(i)
 
+        if not keep:
+            return
 
-    # --- IEKF ITERATION LOOP ---
-        x_iter = x_prior.copy()
-        max_iters = 3
+        rows = [r for i in keep for r in (2*i, 2*i+1)]
+        z = z_all[rows, :]
+        z_hat = z_hat_all[rows, :]
+        H = H_all[rows, :]
+        R = R_all[np.ix_(rows, rows)]
 
-        for iteration in range(max_iters):
-            # 1. Update robot/markers state temporarily to re-evaluate z_hat and H
-            self.set_state_vector(x_iter)
+        x = self.get_state_vector()
 
-            z_hat = self.robot.measure(self.markers, idx_list).reshape(
-                (-1, 1), order="F"
-            )
-            H = self.robot.derivative_measure(self.markers, idx_list)
+        # 1. Measurement residual (innovation)
+        y = z - z_hat
 
-            # 2. Recompute Innovation with prior offset constraint
-            # y = (z - z_hat) - H @ (x_prior - x_iter)
-            y = (z - z_hat) + H @ (x_iter - x_prior)
+        # 2. Innovation covariance
+        S = H @ self.P @ H.T + R
 
-            # 3. Kalman Gain
-            S = H @ P_prior @ H.T + R
-            K = P_prior @ H.T @ np.linalg.inv(S)
+        # 3. Kalman Gain
+        K = self.P @ H.T @ np.linalg.inv(S)
 
-            # 4. Next state iterate
-            x_next = x_prior + K @ y
+        # 4. Update state vector x and set it back in robot/markers
+        x_updated = x + K @ y
+        self.set_state_vector(x_updated)
 
-            # Convergence check (stop early if change is negligible)
-            if np.linalg.norm(x_next - x_iter) < 1e-4:
-                x_iter = x_next
-                break
-            x_iter = x_next
-
-        # Apply final converged state and Joseph-form covariance
-        self.set_state_vector(x_iter)
-        I = np.eye(len(x_prior))
+        # 5. Update state covariance P -- Joseph form (symmetric & numerically stable)
+        I = np.eye(len(x))
         I_KH = I - K @ H
-        self.P = I_KH @ P_prior @ I_KH.T + K @ R @ K.T
+        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+
+        # Force exact numerical symmetry
         self.P = 0.5 * (self.P + self.P.T)
 
-        # Floor landmark covariance so the filter never becomes fully "locked in" --
-        # keeps landmarks correctable even after many observations, which matters
-        # while camera distortion calibration is still being refined.
-        if not self.freeze_map:
-            min_lm_var = 3.75e-4   # tune: larger = more correctable, but noisier steady-state
-            for i in range(self.number_landmarks()):
-                idx = 3 + 2*i
-                if self.P[idx, idx] < min_lm_var:
-                    self.P[idx, idx] = min_lm_var
-                if self.P[idx+1, idx+1] < min_lm_var:
-                    self.P[idx+1, idx+1] = min_lm_var
-
-        # # Compute own measurements
-        # z_hat = self.robot.measure(self.markers, idx_list)
-        # z_hat = z_hat.reshape((-1,1), order="F")
-        # H = self.robot.derivative_measure(self.markers, idx_list)
-
-        # x = self.get_state_vector()
-        
-        # # TODO: add your codes here to compute the updated x
-        # # 1. Measurement residual (innovation)
-        # y = z - z_hat
-        
-        # # 2. Innovation covariance
-        # S = H @ self.P @ H.T + R
-        
-        # # 3. Kalman Gain
-        # K = self.P @ H.T @ np.linalg.inv(S)
-        
-        # # 4. Update state vector x and set it back in robot/markers
-        # x_updated = x + K @ y
-        # self.set_state_vector(x_updated)
-        
-        # # 5. Update state covariance P
-        # # I = np.eye(len(x))
-        # # self.P = (I - K @ H) @ self.P
-
-        # # Joseph Form (Symmetric & Numerically Stable):
-        # I = np.eye(len(x))
-        # I_KH = I - K @ H
-        # self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
-
-        # # Force exact numerical symmetry
-        # self.P = 0.5 * (self.P + self.P.T)
-        # # TODO ends
-
+        # Remember where we were standing, for any tag whose reading counted as a
+        # fully novel viewpoint (novelty >= 1.0) -- this only affects future R
+        # inflation above, never today's state directly. A tag gated out earlier
+        # still gets recorded here if it qualified; that's inherited behaviour from
+        # where this came from and is harmless since a rejected reading never
+        # touched the state either way.
+        for tag, novelty, pose in novelties:
+            if novelty >= 1.0:
+                self._last_view_pose[tag] = pose
 
     def state_transition(self, drive_measurement):
         n = self.number_landmarks()*2 + 3
         F = np.eye(n)
         F[0:3,0:3] = self.robot.derivative_drive(drive_measurement)
         return F
-    
+
     def predict_covariance(self, drive_measurement):
         n = self.number_landmarks()*2 + 3
         Q = np.zeros((n,n))
         Q[0:3,0:3] = self.robot.covariance_drive(drive_measurement)
         return Q
-    
+
     def add_landmarks(self, sensor_measurement):
         if self.freeze_map:
             return   # true map already has every landmark, never add new ones
         if not sensor_measurement:
             return
 
-        if len(self.taglist) == 0:
-            # Bootstrap case: map is empty, there are no "known" landmarks to require.
-            # Fall back to requiring several simultaneous markers instead, so the very
-            # first landmarks are still reasonably well-constrained by multi-marker geometry.
-            if len(sensor_measurement) < 3:
-                return
-        else:
-            known_in_view = [lm for lm in sensor_measurement if lm.tag in self.taglist]
-            if len(known_in_view) < 2:
-                return  # need at least 2 already-known landmarks to trust robot pose for new ones
+        # if len(self.taglist) == 0:
+        #     # Bootstrap case: map is empty, there are no "known" landmarks to require.
+        #     # Fall back to requiring several simultaneous markers instead, so the very
+        #     # first landmarks are still reasonably well-constrained by multi-marker geometry.
+        #     if len(sensor_measurement) < 3:
+        #         return
+        # else:
+        #     known_in_view = [lm for lm in sensor_measurement if lm.tag in self.taglist]
+        #     if len(known_in_view) < 1:
+        #         return
 
 
-        th = self.robot.state[2]
-        robot_xy = self.robot.state[0:2,:]
-        R_theta = np.block([[np.cos(th), -np.sin(th)],[np.sin(th), np.cos(th)]])
+        th = float(self.robot.state[2, 0])
+        c, sn = np.cos(th), np.sin(th)
+        R_theta = np.array([[c, -sn], [sn, c]])
+        dR_theta = np.array([[-sn, -c], [c, -sn]])  # d(R_theta)/d(theta)
+        robot_xy = self.robot.state[0:2, :]
 
         for lm in sensor_measurement:
             if lm.tag in self.taglist:
                 continue
 
-            lm_position = lm.position
+            lm_position = np.asarray(lm.position, dtype=float).reshape(2, 1)
             lm_state = robot_xy + R_theta @ lm_position
 
             self.taglist.append(int(lm.tag))
             self.markers = np.concatenate((self.markers, lm_state), axis=1)
 
-            self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
-            self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
-            self.P[-2,-2] = self.init_lm_cov**2
-            self.P[-1,-1] = self.init_lm_cov**2
+            # Proper cross-covariance at birth, instead of a big diagonal placeholder
+            # with zero correlation to the rest of the state. The new landmark is
+            # m = robot_xy + R(theta) @ z, so its uncertainty is built out of BOTH
+            # the robot's current uncertainty and the measurement's -- and the
+            # off-diagonal terms below are what let a later correction on any one
+            # landmark, or the robot pose, propagate to this one too.
+            #   Gx = d(m)/d(robot pose)   = [ I | dR/dtheta @ z ]   (2 x n)
+            #   Gz = d(m)/d(measurement)  = R(theta)                (2 x 2)
+            n = self.P.shape[0]
 
+            Gx = np.zeros((2, n))
+            Gx[:, 0:2] = np.eye(2)
+            Gx[:, 2:3] = dR_theta @ lm_position
+
+            # Same depth/lateral measurement noise update() uses for this marker.
+            distance = np.linalg.norm(lm_position)
+            depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
+            lateral_var = depth_var * 1.5
+            Rz = np.diag([depth_var, lateral_var])
+
+            P_mx = Gx @ self.P                              # 2 x n: correlation with existing state
+            P_mm = Gx @ self.P @ Gx.T + R_theta @ Rz @ R_theta.T
+
+            P_new = np.zeros((n + 2, n + 2))
+            P_new[:n, :n] = self.P
+            P_new[n:, :n] = P_mx
+            P_new[:n, n:] = P_mx.T
+            P_new[n:, n:] = P_mm
+            self.P = 0.5 * (P_new + P_new.T)
 
     @staticmethod
     def umeyama(from_points, to_points):
@@ -387,25 +445,25 @@ class EKF:
             "from_points must be a m x n array"
         assert from_points.shape == to_points.shape, \
             "from_points and to_points must have the same shape"
-        
+
         N = from_points.shape[1]
         m = 2
-        
+
         mean_from = from_points.mean(axis = 1).reshape((2,1))
         mean_to = to_points.mean(axis = 1).reshape((2,1))
         delta_from = from_points - mean_from # N x m
         delta_to = to_points - mean_to       # N x m
         cov_matrix = delta_to @ delta_from.T / N
-        
+
         U, d, V_t = np.linalg.svd(cov_matrix, full_matrices = True)
         cov_rank = np.linalg.matrix_rank(cov_matrix)
         S = np.eye(m)
-        
+
         if cov_rank >= m - 1 and np.linalg.det(cov_matrix) < 0:
             S[m-1, m-1] = -1
         elif cov_rank < m-1:
             raise ValueError("colinearility detected in covariance matrix:\n{}".format(cov_matrix))
-        
+
         R = U.dot(S).dot(V_t)
         t = mean_to - R.dot(mean_from)
         return R, t
@@ -419,7 +477,7 @@ class EKF:
         y_im = int(y*m2pixel+h/2.0)
         return (x_im, y_im)
 
-    def draw_slam_state(self, res = (320, 500), not_pause=True):
+    def draw_slam_state(self, res = (320, 500), not_pause=True, true_map=None, live_rmse_info=None, selected_tag=None):
         # Draw landmarks
         m2pixel = 100
         if not_pause:
@@ -427,15 +485,19 @@ class EKF:
         else:
             bg_rgb = np.array([120, 120, 120]).reshape(1, 1, 3)
         canvas = np.ones((res[1], res[0], 3))*bg_rgb.astype(np.uint8)
-        # in meters, 
-        lms_xy = self.markers[:2, :]
-        robot_xy = self.robot.state[:2, 0].reshape((2, 1))
-        lms_xy = lms_xy - robot_xy
-        robot_xy = robot_xy*0
+        # in meters,
+        lms_xy_world = self.markers[:2, :]
+        robot_xy_world = self.robot.state[:2, 0].reshape((2, 1))  # position in the SLAM frame, before we recentre on the markers
+        if self.number_landmarks() > 0:
+            center_xy = lms_xy_world.mean(axis=1).reshape((2, 1))  # recentre the view on the marker centroid
+        else:
+            center_xy = robot_xy_world  # no markers yet, fall back to centering on the robot
+        lms_xy = lms_xy_world - center_xy
+        robot_xy = robot_xy_world - center_xy
         robot_theta = self.robot.state[2,0]
         # plot robot
-        start_point_uv = self.to_im_coor((0, 0), res, m2pixel)
-        
+        start_point_uv = self.to_im_coor((robot_xy[0,0], robot_xy[1,0]), res, m2pixel)
+
         p_robot = self.P[0:2,0:2]
         axes_len,angle = self.make_ellipse(p_robot)
         canvas = cv2.ellipse(canvas, start_point_uv, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, (0, 30, 56), 1)
@@ -449,6 +511,29 @@ class EKF:
                 axes_len, angle = self.make_ellipse(Plmi)
                 canvas = cv2.ellipse(canvas, coor_, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, (244, 69, 96), 1)
 
+        # --- overlay ground-truth markers for live RMSE practice ---
+        if true_map is not None and live_rmse_info is not None:
+            R, t = live_rmse_info['R'], live_rmse_info['t']
+            matched_tags = live_rmse_info['matched_tags']
+            for tag, true_xy in true_map.items():
+                # bring the true marker from the ground-truth frame into the
+                # SLAM/estimated frame using the inverse of the alignment
+                # transform, then recentre on the marker centroid like the estimates above
+                true_in_est = R.T @ (true_xy - t) - center_xy
+                coor_true = self.to_im_coor((true_in_est[0,0], true_in_est[1,0]), res, m2pixel)
+                colour = (40, 170, 40) if tag in matched_tags else (140, 140, 40)
+                cv2.drawMarker(canvas, coor_true, colour, markerType=cv2.MARKER_TILTED_CROSS, markerSize=10, thickness=2)
+                cv2.putText(canvas, str(tag), (coor_true[0]+6, coor_true[1]-6), cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA)
+
+                # error line: your current estimate -> where it should be
+                if tag in matched_tags:
+                    idx = self.taglist.index(tag)
+                    coor_est = self.to_im_coor((lms_xy[0,idx], lms_xy[1,idx]), res, m2pixel)
+                    cv2.line(canvas, coor_est, coor_true, (0, 140, 255), 1)
+
+            rmse_text = f"RMSE {live_rmse_info['rmse']:.4f}m ({len(matched_tags)}/{len(true_map)})"
+            cv2.putText(canvas, rmse_text, (5, res[1]-8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,0), 1, cv2.LINE_AA)
+
         surface = pygame.surfarray.make_surface(np.rot90(canvas))
         surface = pygame.transform.flip(surface, True, False)
         surface.blit(self.rot_center(self.pibot_pic, robot_theta*57.3), (start_point_uv[0]-15, start_point_uv[1]-15))
@@ -460,6 +545,11 @@ class EKF:
                     surface.blit(self.lm_pics[self.taglist[i]-1], (coor_[0]-5, coor_[1]-5))
                 except IndexError:
                     surface.blit(self.lm_pics[-1], (coor_[0]-5, coor_[1]-5))
+                # flag the marker selected for deletion with a pointer above it
+                if selected_tag is not None and self.taglist[i] == selected_tag:
+                    tip = (coor_[0], coor_[1] - 10)
+                    pygame.draw.polygon(surface, (255, 215, 0),
+                                         [tip, (tip[0] - 6, tip[1] - 10), (tip[0] + 6, tip[1] - 10)])
         return surface
 
     @staticmethod
@@ -470,17 +560,24 @@ class EKF:
         rot_rect = orig_rect.copy()
         rot_rect.center = rot_image.get_rect().center
         rot_image = rot_image.subsurface(rot_rect).copy()
-        return rot_image       
+        return rot_image
 
     @staticmethod
     def make_ellipse(P):
         e_vals, e_vecs = np.linalg.eig(P)
-        idx = e_vals.argsort()[::-1]   
+        idx = e_vals.argsort()[::-1]
         e_vals = e_vals[idx]
         e_vecs = e_vecs[:, idx]
         alpha = np.sqrt(4.605)
-        axes_len = np.sqrt(np.maximum(0, e_vals)) * 2 * alpha
-        if abs(e_vecs[1, 0]) > 1e-3:
+        axes_len = np.sqrt(np.maximum(0, e_vals)) * alpha
+
+        # Near-isotropic covariance: the ellipse is essentially a circle, and its
+        # "orientation" is numerically meaningless -- tiny noise in P flips which
+        # eigenvector sorts first and swings the angle wildly even though the
+        # actual shape hasn't changed. Skip the noisy angle in that regime.
+        if e_vals[0] - e_vals[1] < 1e-6 * max(e_vals[0], 1e-12):
+            angle = 0.0
+        elif abs(e_vecs[1, 0]) > 1e-3:
             angle = np.arctan(e_vecs[0, 0]/e_vecs[1, 0])
         else:
             angle = 0

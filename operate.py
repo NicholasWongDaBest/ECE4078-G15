@@ -1,4 +1,5 @@
 import cv2 
+import json
 import time
 import shutil
 import argparse
@@ -19,7 +20,47 @@ sys.path.insert(0,"{}/cv/".format(os.getcwd()))
 from cv.detector import ObjectDetector
 
 
+def load_true_map(fname):
+    """
+    Load ground-truth ArUco marker positions from a truemap.txt-style JSON
+    file (same format eval.py's --truemap expects).
+    Returns a dict {tag:int -> np.array([[x],[y]])}, or None if the file is
+    missing/unreadable.
+    """
+    if not os.path.exists(fname):
+        return None
+    try:
+        with open(fname, 'r') as f:
+            gt_dict = json.load(f)
+    except Exception as e:
+        print(f"Could not parse true map '{fname}': {e}")
+        return None
+
+    true_map = {}
+    for key in gt_dict:
+        if key.startswith('aruco'):
+            tag = int(key.split('_')[0].replace('aruco', ''))
+            true_map[tag] = np.array([[gt_dict[key]['x']], [gt_dict[key]['y']]])
+    return true_map if true_map else None
+
+
 class Operate:
+    # Number row -> ArUco tag id, for selecting/deleting a marker from the map.
+    MARKER_DELETE_KEYS = {
+        pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3, pygame.K_4: 4, pygame.K_5: 5,
+        pygame.K_6: 6, pygame.K_7: 7, pygame.K_8: 8, pygame.K_9: 9, pygame.K_0: 10,
+    }
+
+    # Arrow key -> [left, right] wheel speed for continuous driving. A tap
+    # pulse (see tap_pulse_duration) uses these same magnitudes so a hold
+    # that outlasts the pulse hands off to continuous driving at the same speed.
+    ARROW_KEY_SPEEDS = {
+        pygame.K_UP: [0.4, 0.4],
+        pygame.K_DOWN: [-0.4, -0.4],
+        pygame.K_LEFT: [-0.35, 0.35],
+        pygame.K_RIGHT: [0.35, -0.35],
+    }
+
     def __init__(self, args):
         
         # Initialise robot controller object
@@ -32,11 +73,11 @@ class Operate:
                         'load_true_map': False} # M2
                         
         # TODO: Tune PID parameters here. If you don't want to use PID, set use_pid=0
-        # self.botconnect.set_pid(use_pid=1, kp=0, ki=0, kd=0)
+        # self.botconnect.set_pid(use_pid=1, k  p=0, ki=0, kd=0)
 
         # PID gains — now adjustable live via keyboard, not fixed at startup
-        self.pid_gains = {'kp': 0.8, 'ki': 0.02, 'kd': 0.25}
-        self.pid_step = 0.01
+        self.pid_gains = {'kp': 2, 'ki': 0.04, 'kd': 0.29}
+        self.pid_step = 0.005
         self.botconnect.set_pid(use_pid=1, **self.pid_gains)
 
         # Create a folder "lab_output" that stores the results of the lab
@@ -51,6 +92,14 @@ class Operate:
         # Persisted SLAM map: survives program restarts unless 'r','r' is pressed
         self.slam_state_fname = os.path.join(self.lab_output_dir, 'slam_state.json')
         self.ekf.load_state(self.slam_state_fname)  # no-op if the file doesn't exist
+
+        # Ground-truth map for live RMSE tracking (optional -- practice tool only,
+        # eval.py against the real truemap.txt is still what's graded)
+        self.true_map = load_true_map(args.truemap)
+        if self.true_map is not None:
+            print(f"Loaded true map with {len(self.true_map)} markers for live RMSE tracking.")
+        else:
+            print(f"No true map found at '{args.truemap}' -- live RMSE tracking disabled.")
         self.true_map_fname = "truemap.txt" # M2
         
         # Initialise CV detector
@@ -85,7 +134,9 @@ class Operate:
         self.obj_detector_output = None
         self.ekf_on = False
         self.double_reset_comfirm = 0
+        self.pending_delete_tag = None  # marker tag awaiting a second keypress to confirm deletion
         self.image_id = 0
+        self.show_live_rmse = True   # toggle with 'L'
         if self.ekf.number_landmarks() > 0:
             self.notification = f'Restored {self.ekf.number_landmarks()} landmark(s) - view markers & press ENTER to relocalise'
         else:
@@ -105,6 +156,41 @@ class Operate:
         self.ramp_start_time = 0.0
         self.ramp_duration = 0.15      # seconds to reach full commanded speed, tune this
         self.prev_base_wheel_speed = [0.0, 0.0]
+
+        self.prev_correct_time = time.time()
+        self.sync_kp_rate = 0.00005   # NEW tunable -- replaces sync_kp, needs retuning (see below)
+
+        # Tap-vs-hold arrow key driving. A quick tap fires ONE bounded pulse
+        # (move_auto_time, fixed duration) so a tap always covers the same
+        # small, consistent distance regardless of how long the key was
+        # actually held down -- real hold-duration is too jittery (pygame
+        # event timing, network latency) to size a "small increment" on.
+        # Holding past the pulse's duration hands off to the existing
+        # continuous ramp-drive below, at the same speed, so it feels seamless.
+        self.tap_pulse_duration = 0.01   # s -- tune on hardware: shortest reliable single nudge
+        self.pulse_active_until = 0.0    # monotonic deadline; correct_straight_drive() stays
+                                          # quiet until this passes so it doesn't stomp the pulse
+        self.key_press_time = {}         # arrow key -> time.time() at KEYDOWN
+        self.continuous_keys = set()     # arrow keys promoted to continuous driving
+
+        # Distortion correction (optional). Rename/move distortion_correction.json
+        # away to disable it and test whether it's the source of a problem --
+        # if the file is missing, marker positions pass through unchanged.
+        self.dist_correction_enabled = False
+        dist_correction_path = 'distortion_correction.json'
+        if os.path.exists(dist_correction_path):
+            try:
+                with open(dist_correction_path) as f:
+                    dc = json.load(f)
+                self.dist_degree = dc['degree']
+                self.dist_coeffs_x = np.array(dc['coeffs_x'])
+                self.dist_coeffs_y = np.array(dc['coeffs_y'])
+                self.dist_correction_enabled = True
+                print(f"Loaded distortion correction (degree {self.dist_degree}) from {dist_correction_path}")
+            except Exception as e:
+                print(f"Failed to load {dist_correction_path}: {e} -- distortion correction disabled")
+        else:
+            print(f"No {dist_correction_path} found -- distortion correction disabled (raw positions used)")
 
     # update control parameters for ekf
     def control(self):
@@ -150,12 +236,28 @@ class Operate:
         scale = np.loadtxt(fileS, delimiter=',')
         fileB = os.path.join(calib_dir, 'baseline.txt')
         baseline = np.loadtxt(fileB, delimiter=',')
-        robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=175) ##change this value  
+        robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=172.5) ##change this value  
         return EKF(robot)
+    
+    def apply_distortion_correction(self, x, y):
+            if not self.dist_correction_enabled:
+                return x, y
+            feats = [1, x, y]
+            if self.dist_degree >= 2:
+                feats += [x**2, x*y, y**2]
+            if self.dist_degree >= 3:
+                feats += [x**3, x**2*y, x*y**2, y**3]
+            feats = np.array(feats)
+            return float(feats @ self.dist_coeffs_x), float(feats @ self.dist_coeffs_y)
+
 
     # SLAM with ARUCO markers       
     def perform_slam(self, drive_measurement):
         sensor_measurement, self.aruco_img = self.aruco_sensor.detect_marker_positions(self.img)
+
+        for lm in sensor_measurement:
+            x_c, y_c = self.apply_distortion_correction(lm.position[0,0], lm.position[1,0])
+            lm.position[0,0], lm.position[1,0] = x_c, y_c
 
         # Discard any detected tag outside our known marker set (1-10).
         # DICT_4X4_100 can detect tags 0-99, so a stray/misread marker would
@@ -229,8 +331,14 @@ class Operate:
         text_colour = (220, 220, 220)
         v_pad, h_pad = 40, 20
 
+        # compute live RMSE only if a true map is loaded AND tracking is enabled
+        active_true_map = self.true_map if (self.true_map is not None and self.show_live_rmse) else None
+        live_rmse_info = self.ekf.compute_live_rmse(active_true_map) if active_true_map is not None else None
+
         # paint SLAM outputs
-        ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause = self.ekf_on)
+        ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause=self.ekf_on,
+                                            true_map=active_true_map, live_rmse_info=live_rmse_info,
+                                            selected_tag=self.pending_delete_tag)
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
@@ -244,6 +352,19 @@ class Operate:
         self.put_caption(canvas, caption='Robot Cam', position=(h_pad, v_pad))
         notification = TEXT_FONT.render(self.notification, False, text_colour)
         canvas.blit(notification, (h_pad+10, 596))
+
+        # live RMSE readout in the main window
+        if self.true_map is None:
+            rmse_line = "No true map loaded"
+        elif not self.show_live_rmse:
+            rmse_line = "Live RMSE tracking OFF (press L to toggle)"
+        elif live_rmse_info is None:
+            rmse_line = f"Live RMSE: need >=2 matched markers (have {len(self.ekf.taglist)})"
+        else:
+            rmse_line = (f"Live RMSE: {live_rmse_info['rmse']:.4f} m "
+                        f"({len(live_rmse_info['matched_tags'])}/{len(self.true_map)} markers)")
+        rmse_surface = TEXT_FONT.render(rmse_line, False, text_colour)
+        canvas.blit(rmse_surface, (h_pad+10, 624))
 
         time_remain = self.count_down - time.time() + self.start_time
         if time_remain > 0:
@@ -289,17 +410,16 @@ class Operate:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_m:
                 self.adjust_pid('kd', self.pid_step)
 
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
-                self.base_wheel_speed = [0.6, 0.6]
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
-                self.base_wheel_speed = [-0.6, -0.6]
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.base_wheel_speed = [-0.5, 0.5]
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.base_wheel_speed = [0.5, -0.5]
+            if event.type == pygame.KEYDOWN and event.key in self.ARROW_KEY_SPEEDS:
+                if event.key not in self.key_press_time:  # ignore OS key-repeat re-fires
+                    self.key_press_time[event.key] = time.time()
+                    self.pulse_active_until = time.time() + self.tap_pulse_duration
+                    self.botconnect.move_auto_time(self.ARROW_KEY_SPEEDS[event.key], self.tap_pulse_duration)
             if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                 self.base_wheel_speed = [0.0, 0.0]
-            if event.type == pygame.KEYUP and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
+            if event.type == pygame.KEYUP and event.key in self.ARROW_KEY_SPEEDS:
+                self.key_press_time.pop(event.key, None)
+                self.continuous_keys.discard(event.key)
                 self.base_wheel_speed = [0.0, 0.0]
             # run SLAM
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
@@ -346,38 +466,60 @@ class Operate:
             # capture and save raw image
             elif event.type == pygame.KEYDOWN and event.key  == pygame.K_i:
                 self.command['save_image'] = True
+            # toggle live RMSE tracking on/off
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_l:
+                self.show_live_rmse = not self.show_live_rmse
+                state = 'ON' if self.show_live_rmse else 'OFF'
+                self.notification = f'Live RMSE tracking {state}'
+            # select/delete a marker by its tag number (press once to select, again to delete)
+            elif event.type == pygame.KEYDOWN and event.key in self.MARKER_DELETE_KEYS:
+                tag = self.MARKER_DELETE_KEYS[event.key]
+                if self.pending_delete_tag == tag:
+                    if self.ekf.delete_landmark(tag):
+                        self.notification = f'Marker {tag} deleted'
+                    else:
+                        self.notification = f'Marker {tag} not in map'
+                    self.pending_delete_tag = None
+                else:
+                    self.pending_delete_tag = tag
+                    if tag in self.ekf.taglist:
+                        self.notification = f'Marker {tag} selected - press {tag} again to delete'
+                    else:
+                        self.notification = f'Marker {tag} not in map - press {tag} again to clear selection'
             # quit
             elif event.type == pygame.QUIT:
                 self.quit = True
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self.quit = True
 
-            self.botconnect.move_manual(self.command['wheel_speed'])
+        # A key still held after its tap pulse has run its course gets
+        # promoted to continuous driving, at the same speed the pulse used.
+        pressed = pygame.key.get_pressed()
+        for key, press_time in list(self.key_press_time.items()):
+            if (pressed[key] and key not in self.continuous_keys
+                    and time.time() - press_time >= self.tap_pulse_duration):
+                self.continuous_keys.add(key)
+                self.base_wheel_speed = self.ARROW_KEY_SPEEDS[key]
 
         if self.quit:
             if self.ekf.number_landmarks() > 0:
                 self.ekf.save_state(self.slam_state_fname)
             pygame.quit()
             sys.exit()
-
+            
     def correct_straight_drive(self):
-        left, right = self.botconnect.get_encoder_counts()
-        delta_left = left - self.prev_left_count
-        delta_right = right - self.prev_right_count
-
-        # Guard against encoder counter reset (Pi resets counts to 0 whenever it
-        # detects the robot has stopped) -- without this, resuming movement after
-        # a stop can produce a huge spurious delta, causing a sudden hard turn.
-        reset_detected = (delta_left < -10 or delta_right < -10)
-        if reset_detected:
-            delta_left, delta_right = 0, 0
-            self.sync_error_integral = 0.0  # also clear integral so windup doesn't carry over
-
-        self.prev_left_count, self.prev_right_count = left, right
-
         base_l, base_r = self.base_wheel_speed
 
-        # Detect stop -> move transition, start a ramp (already direction-agnostic)
+        # A tap pulse is a one-shot move_auto_time() call (mode 1) that the Pi
+        # runs to completion on its own. base_wheel_speed stays [0,0] the
+        # whole time (no continuous drive requested), so without this guard
+        # the move_manual([0,0]) call below would immediately flip botconnect
+        # back to mode 0 and cancel the pulse before it's even sent.
+        if base_l == 0.0 and base_r == 0.0 and time.time() < self.pulse_active_until:
+            self.prev_base_wheel_speed = [base_l, base_r]
+            return
+
+        # Detect stop -> move transition, start a ramp
         was_stopped = (self.prev_base_wheel_speed == [0.0, 0.0])
         now_moving = (base_l != 0.0 or base_r != 0.0)
         if was_stopped and now_moving and not self.ramp_active:
@@ -394,36 +536,28 @@ class Operate:
         else:
             ramp_scale = 1.0
 
-        ramped_base_l = base_l * ramp_scale
-        ramped_base_r = base_r * ramp_scale
-
-        if base_l == base_r and base_l != 0:
-            # Only correct when driving straight (turns should curve on purpose)
-            error = delta_left - delta_right
-            self.sync_error_integral += error
-            correction = self.sync_kp * error + self.sync_ki * self.sync_error_integral
-
-            # Encoder ticks are direction-agnostic (magnitude only), but the correction's
-            # EFFECT on wheel magnitude depends on direction: for forward (positive speed),
-            # subtracting correction slows a wheel down; for backward (negative speed),
-            # subtracting correction speeds it up instead. Flip sign to keep the correction
-            # meaning consistent ("slow the faster wheel") in both directions.
-            direction_sign = 1.0 if base_l > 0 else -1.0
-            adjusted = [ramped_base_l - direction_sign * correction,
-                        ramped_base_r + direction_sign * correction]
-        else:
-            self.sync_error_integral = 0.0
-            adjusted = [ramped_base_l, ramped_base_r]
+        # Left/right sync correction is intentionally NOT done here anymore --
+        # it's already handled by the Pi's own PID loop (pid_control() in the
+        # server script), which runs at a fixed rate on a separate machine and
+        # is immune to this PC's variable SLAM/ArUco processing cost. Trying to
+        # replicate that correction here, coupled to this loop's timing, was the
+        # source of the intermittent swerving.
+        adjusted = [base_l * ramp_scale, base_r * ramp_scale]
 
         self.command['wheel_speed'] = adjusted
         self.botconnect.move_manual(adjusted)
         self.prev_base_wheel_speed = [base_l, base_r]
-        
+
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.
     parser.add_argument("--calib_dir", type=str, default="calibration/param/") # calibration directory
     parser.add_argument("--yolo_path", default='cv/model/yolo26n.pt') # directory for your trained AI model
+    parser.add_argument("--yolo_path", default='cv/model/yolov8_model.pt') # directory for your trained AI model
+    parser.add_argument("--truemap", type=str, default='truemap.txt', help="ground-truth map for live RMSE practice tracking (optional)")
     args, _ = parser.parse_known_args()
     
     pygame.font.init() 
