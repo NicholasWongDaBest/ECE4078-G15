@@ -7,7 +7,42 @@ import numpy as np
 
 # Camera frame resolution used by the detector (matches operate.py's self.img/self.cv_vis
 # shape, and the imgsz=480 passed to model.predict in detector.py).
-IMG_WIDTH = 480
+IMG_WIDTH = 640
+IMG_HEIGHT = 480
+
+# determine if fruit is fully in frame
+def is_box_clipped(box, margin=25, img_width=None, img_height=None):
+    """True if the detected bbox touches/exceeds the frame edge, meaning
+    box_height doesn't reflect the object's true extent."""
+    if img_width is None or img_height is None:
+        raise ValueError("img_width and img_height must be passed explicitly")
+    x_center, y_center, box_width, box_height = box
+    x_min = x_center - box_width / 2
+    x_max = x_center + box_width / 2
+    y_min = y_center - box_height / 2
+    y_max = y_center + box_height / 2
+    return (x_min <= margin or y_min <= margin or
+            x_max >= img_width - margin or y_max >= img_height - margin)
+
+EXPECTED_ASPECT_RANGE = {
+    'orange':     (0.461, 1.869),
+    'capsicum':   (0.205, 1.067),
+    'greenapple': (0.410, 1.112),
+    'lemon':      (0.523, 1.033),
+    'mango':      (0.341, 3.230),
+    'lime':       (0.435, 2.016),
+    'redapple':   (0.250, 0.905),
+}
+
+def is_box_malformed(box, predicted_class):
+    """True if the box's aspect ratio falls outside the range seen in
+    training data for this class."""
+    _, _, box_width, box_height = box
+    if box_height <= 0 or predicted_class not in EXPECTED_ASPECT_RANGE:
+        return False
+    observed_ratio = box_width / box_height
+    lo, hi = EXPECTED_ASPECT_RANGE[predicted_class]
+    return observed_ratio < lo or observed_ratio > hi
     
 # estimate the pose (x,y) of a detected object given its bbox and the robot's pose
 def estimate_pose(robot_pose, box, object_true_height, focal_length, cx):
@@ -215,6 +250,9 @@ if __name__ == "__main__":
             for bbox in bboxes:
                 predicted_class = bbox[0]
                 box = bbox[1]
+                if is_box_clipped(box, img_width=IMG_WIDTH, img_height=IMG_HEIGHT):
+                    print(f"[FILTERED] {predicted_class} clipped: box={box}") # debug
+                    continue
                 true_height = object_dimensions[predicted_class][2]
                 pose_x, pose_y = estimate_pose(robotpose, box, true_height, focal_length, cx)
                 
