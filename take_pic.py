@@ -61,11 +61,11 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
 
     currentDir = os.getcwd()
-    dataDir = os.path.join(currentDir,'raw_images')
+    dataDir = os.path.join(currentDir,'calib_pics')
     if not os.path.exists(dataDir):
         os.makedirs(dataDir)
     
-    images_to_collect = 20 # feel free to change this
+    images_to_collect = 80 # feel free to change this
 
     calib = calibration(args)
 

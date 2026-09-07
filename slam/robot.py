@@ -91,15 +91,16 @@ class Robot:
 
         dt = drive_measurement.dt
         th = self.state[2,0]
-        
-        # TODO: add your codes here to compute DFx using lin_vel, ang_vel, dt, and th(the robots current heading angle referenced from origin)
+
         if ang_vel == 0:
-            DFx[0,2] = -lin_vel*np.sin(th)*dt
-            DFx[1,2] = lin_vel*np.cos(th)*dt
+            # x += cos(th)*v*dt, y += sin(th)*v*dt
+            DFx[0, 2] = -np.sin(th) * lin_vel * dt   # dx/dtheta
+            DFx[1, 2] =  np.cos(th) * lin_vel * dt   # dy/dtheta
         else:
-            DFx[0, 2] = (lin_vel / ang_vel) * (np.cos(th + dt * ang_vel) - np.cos(th))
-            DFx[1, 2] = (lin_vel / ang_vel) * (np.sin(th + dt * ang_vel) - np.sin(th))
-        ##### TODO end
+            th2 = th + dt * ang_vel
+            # x += (v/w)*(sin(th2)-sin(th)), y += -(v/w)*(cos(th2)-cos(th))
+            DFx[0, 2] = (lin_vel / ang_vel) * (np.cos(th2) - np.cos(th))   # dx/dtheta
+            DFx[1, 2] = (lin_vel / ang_vel) * (np.sin(th2) - np.sin(th))   # dy/dtheta
 
         return DFx
 
@@ -169,16 +170,15 @@ class Robot:
 
         # Derivative of x,y,theta w.r.t. lin_vel, ang_vel
         Jac2 = np.zeros((3,2))
-        
-        # TODO: add your codes here to compute Jac2 using lin_vel, ang_vel, dt, th, and th2
+
         if ang_vel == 0:
-            Jac2[0, 0] = np.cos(th) * dt
-            Jac2[1, 0] = np.sin(th) * dt
-            Jac2[2, 0] = 0
-            
-            Jac2[0, 1] = 0
-            Jac2[1, 1] = 0
-            Jac2[2, 1] = dt
+            # Straight-line case: x += cos(th)*v*dt, y += sin(th)*v*dt, theta += 0
+            Jac2[0, 0] = np.cos(th) * dt      # dx/dv
+            Jac2[1, 0] = np.sin(th) * dt      # dy/dv
+            Jac2[0, 1] = 0.0                  # dx/dw
+            Jac2[1, 1] = 0.0                  # dy/dw
+            Jac2[2, 0] = 0.0                  # dtheta/dv
+            Jac2[2, 1] = dt                   # dtheta/dw
         else:
             # Derivatives with respect to linear velocity v
             Jac2[0, 0] = (np.sin(th2) - np.sin(th)) / ang_vel
