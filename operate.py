@@ -20,7 +20,7 @@ sys.path.insert(0,"{}/cv/".format(os.getcwd()))
 from cv.detector import ObjectDetector
 
 import csv
-from object_pose_est import estimate_pose, merge_estimations, load_object_ground_truth, compute_object_rmse, is_box_clipped, is_box_malformed
+from object_pose_est import object_measurement, ObjectEKF, load_object_ground_truth, compute_object_rmse, is_box_clipped, is_box_malformed
 
 
 def load_true_map(fname):
@@ -124,7 +124,7 @@ class Operate:
         else:
             print(f"Object list not found at '{obj_csv}' -- live object RMSE disabled.")
 
-        self.object_pose_dict = {obj: [] for obj in self.object_list}
+        self.object_ekf = ObjectEKF()
         self.live_object_rmse_info = None
         self.live_object_estimates = None
 
@@ -378,7 +378,8 @@ class Operate:
                                     selected_tag=self.pending_delete_tag,
                                     object_gt=self.true_map_objects if self.show_live_rmse else None,
                                     object_estimates=self.live_object_estimates,
-                                    object_rmse_info=self.live_object_rmse_info)
+                                    object_rmse_info=self.live_object_rmse_info,
+                                    object_ekf=self.object_ekf)
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
@@ -503,7 +504,7 @@ class Operate:
                     self.ekf.reset()
 
                     # clear in-memory fruit/object accumulators
-                    self.object_pose_dict = {obj: [] for obj in self.object_list}
+                    self.object_ekf.reset()
                     self.detected_objects = set()
                     self.live_object_rmse_info = None
                     self.live_object_estimates = None
@@ -619,35 +620,37 @@ class Operate:
         self.prev_base_wheel_speed = [base_l, base_r]
 
     def process_object_estimates(self):
-        """Runs after every 'n' (save prediction). Logs the raw per-shot pose
-        estimate (for angle analysis later) and updates the running cumulative
-        merged-estimate RMSE against truemap.txt, if loaded."""
+        """Runs after every 'n' (save prediction). Feeds each detection into
+        self.object_ekf -- a per-class Kalman filter (see ObjectEKF in
+        object_pose_est.py) that narrows down a fruit's position over
+        repeated sightings exactly the way self.ekf narrows down ArUco
+        landmarks, just fed by the detector instead of the ArUco sensor.
+        Also logs the raw per-shot pose estimate (for angle analysis later)
+        and updates the running RMSE against truemap.txt, if loaded."""
         if not self.object_dimensions:
             return
 
         _, robot_pose, bboxes = self.obj_detector_output
         robot_theta_deg = np.degrees(robot_pose[2][0])
         robot_x, robot_y = robot_pose[0][0], robot_pose[1][0]
+        # Live SLAM pose uncertainty at this shot -- folded into each
+        # measurement's noise so a sighting taken while poorly localised is
+        # trusted less (see object_measurement()'s docstring).
+        robot_pose_cov = self.ekf.P[0:3, 0:3]
 
         shot_rows = []
         for predicted_class, box in bboxes:
             if predicted_class not in self.object_dimensions:
                 continue
-            img_height, img_width = self.img.shape[:2]
-            # clipped = is_box_clipped(box, img_width=img_width, img_height=img_height)
-            # print(f"[DEBUG] {predicted_class} box={box} img=({img_width}x{img_height}) clipped={clipped}")
-            # if clipped:
-            #     continue
-            # malformed = is_box_malformed(box, predicted_class)
-            # print(f"[DEBUG] {predicted_class} box={box} img=({img_width}x{img_height}) malformed={malformed}")
-            # if malformed:
-            #     continue
             true_height = self.object_dimensions[predicted_class][2]
-            pose_x, pose_y = estimate_pose(robot_pose, box, true_height, self.obj_focal_length, self.obj_cx)
-            dist = float(np.hypot(pose_x - robot_x, pose_y - robot_y))
-            robot_theta = robot_pose[2][0]
-            self.object_pose_dict.setdefault(predicted_class, []).append((pose_x, pose_y, dist, robot_theta))
-            self.detected_objects.add(predicted_class)
+            z_world, R_world, dist = object_measurement(
+                robot_pose, box, true_height, self.obj_focal_length, self.obj_cx,
+                robot_pose_cov=robot_pose_cov)
+            pose_x, pose_y = float(z_world[0, 0]), float(z_world[1, 0])
+
+            accepted = self.object_ekf.update(predicted_class, z_world, R_world)
+            if accepted:
+                self.detected_objects.add(predicted_class)
 
             raw_error = ''
             if self.true_map_objects is not None and predicted_class in self.true_map_objects:
@@ -663,7 +666,7 @@ class Operate:
                 csv.writer(f).writerows(shot_rows)
 
         if self.true_map_objects is not None:
-            merged = merge_estimations(self.object_pose_dict)
+            merged = self.object_ekf.to_object_pose_dict()
             self.live_object_estimates = {k: v for k, v in merged.items()
                                    if k.rsplit('_', 1)[0] in self.detected_objects}
             self.live_object_rmse_info = compute_object_rmse(self.live_object_estimates, self.true_map_objects)

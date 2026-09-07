@@ -115,53 +115,98 @@ def object_noise_covariance(dist, theta):
     return Sigma_world
 
 
-def merge_estimations(object_pose_dict):
-    object_pose_dict_final = {}
-    for key in object_pose_dict:
-        estimates = object_pose_dict[key]
-        if not estimates:
-            object_pose_dict_final[key + '_0'] = {'x': 0.0, 'y': 0.0}
-            continue
+def object_measurement(robot_pose, box, object_true_height, focal_length, cx, robot_pose_cov=None):
+    """
+    Turn one detector bounding box into an EKF-style measurement of an
+    object's WORLD position: (z_world, R_world, dist) -- the same shape of
+    thing ArUco corner detection produces for SLAM landmarks (see
+    slam/aruco_sensor.py), but built from the YOLO bbox via estimate_pose()
+    instead of solvePnP on ArUco corners.
 
-        arr = np.array(estimates)  # shape (N, 4): x, y, dist, theta
-        pts = arr[:, :2]
-        dists = arr[:, 2]
-        thetas = arr[:, 3]
+    robot_pose_cov: optional 3x3 covariance of robot_pose (e.g. ekf.P[0:3,0:3]).
+    When given, the robot's own SLAM localisation uncertainty is folded into
+    R_world -- a sighting taken while the robot is poorly localised is
+    (correctly) trusted less. This mirrors how slam/ekf.py's add_landmarks()
+    combines robot-pose uncertainty with sensor noise when a landmark is
+    born. Robot xy uncertainty translates ~1:1 into world-frame landmark
+    uncertainty (pose_world = robot_xy + fixed local offset); heading
+    uncertainty's contribution is smaller at typical arena ranges and is
+    left out to keep this a cheap, defensible approximation.
+    """
+    pose_x, pose_y = estimate_pose(robot_pose, box, object_true_height, focal_length, cx)
+    robot_x, robot_y, theta = robot_pose[0][0], robot_pose[1][0], robot_pose[2][0]
+    dist = float(np.hypot(pose_x - robot_x, pose_y - robot_y))
 
-        if len(pts) == 1:
-            merged = pts[0]
-        else:
-            # Outlier rejection stays as a coarse first pass -- covariance
-            # weighting alone doesn't protect against a gross misdetection
-            # (wrong class, bad bbox), it just weighs GOOD points correctly.
-            median = np.median(pts, axis=0)
-            outlier_dists = np.linalg.norm(pts - median, axis=1)
-            outlier_thresh = 0.3
-            inlier_mask = outlier_dists <= outlier_thresh
-            if not inlier_mask.any():
-                inlier_mask = np.ones(len(pts), dtype=bool)
+    R_world = object_noise_covariance(dist, theta)
+    if robot_pose_cov is not None:
+        R_world = R_world + np.asarray(robot_pose_cov)[0:2, 0:2]
 
-            inlier_pts = pts[inlier_mask]
-            inlier_dists = dists[inlier_mask]
-            inlier_thetas = thetas[inlier_mask]
+    z_world = np.array([[pose_x], [pose_y]])
+    return z_world, R_world, dist
 
-            # Inverse-covariance weighted merge (2D weighted least squares):
-            #   merged = (Σ Σᵢ⁻¹)⁻¹ (Σ Σᵢ⁻¹ pᵢ)
-            # instead of the old scalar 1/distance weighting -- this lets
-            # depth and lateral error shrink at DIFFERENT rates per
-            # observation rather than discounting a far detection uniformly.
-            Sigma_sum = np.zeros((2, 2))
-            weighted_pt_sum = np.zeros(2)
-            for i in range(len(inlier_pts)):
-                Sigma_i = object_noise_covariance(inlier_dists[i], inlier_thetas[i])
-                Sigma_i_inv = np.linalg.inv(Sigma_i)
-                Sigma_sum += Sigma_i_inv
-                weighted_pt_sum += Sigma_i_inv @ inlier_pts[i]
 
-            merged = np.linalg.inv(Sigma_sum) @ weighted_pt_sum
+class ObjectEKF:
+    """
+    Incremental EKF for fruit/object positions -- the same Kalman-gain +
+    Joseph-form covariance update + chi-square gating recipe slam/ekf.py
+    uses to narrow down ArUco landmarks (see EKF.update), but fed by the
+    detector instead of the ArUco sensor, and with measurement model H = I:
+    each reading is already a world-frame (x, y) point (from
+    object_measurement()/estimate_pose()), not a robot-frame bearing that
+    needs a Jacobian to relate to the landmark state.
 
-        object_pose_dict_final[key + '_0'] = {'x': float(merged[0]), 'y': float(merged[1])}
-    return object_pose_dict_final
+    One landmark per object CLASS, not per instance: object_list.csv /
+    truemap.txt guarantee at most one instance of each fruit type, so unlike
+    ArUco tags there's no multi-instance data-association problem to solve.
+    """
+    innovation_gate = 9.21  # chi-square, 2 DOF, ~99% confidence -- same gate as slam/ekf.py
+
+    def __init__(self):
+        self.estimates = {}  # class_name -> 2x1 np.array world position
+        self.P = {}          # class_name -> 2x2 covariance
+
+    def reset(self):
+        self.estimates = {}
+        self.P = {}
+
+    def update(self, class_name, z_world, R_world):
+        """Fold one measurement into the running estimate for `class_name`.
+        Returns True if it was accepted (used), False if gated out as
+        statistically inconsistent with the current estimate."""
+        z_world = np.asarray(z_world, dtype=float).reshape(2, 1)
+        R_world = np.asarray(R_world, dtype=float)
+
+        if class_name not in self.estimates:
+            # Birth: exactly like EKF.add_landmarks(), the first sighting of
+            # a class becomes its initial estimate, seeded with the
+            # measurement's own noise as P (nothing to compare it against yet).
+            self.estimates[class_name] = z_world.copy()
+            self.P[class_name] = R_world.copy()
+            return True
+
+        x = self.estimates[class_name]
+        P = self.P[class_name]
+
+        y = z_world - x   # innovation (H = I)
+        S = P + R_world    # innovation covariance (H = I)
+        d2 = float((y.T @ np.linalg.inv(S) @ y).item())
+        if d2 > self.innovation_gate:
+            return False  # inconsistent with the current estimate -- likely a bad detection, skip it
+
+        K = P @ np.linalg.inv(S)  # Kalman gain
+        x_new = x + K @ y
+
+        I_K = np.eye(2) - K
+        P_new = I_K @ P @ I_K.T + K @ R_world @ K.T  # Joseph form, same as EKF.update()
+
+        self.estimates[class_name] = x_new
+        self.P[class_name] = 0.5 * (P_new + P_new.T)
+        return True
+
+    def to_object_pose_dict(self):
+        """Returns {'class_0': {'x':..,'y':..}}, one entry per class currently tracked."""
+        return {name + '_0': {'x': float(pos[0, 0]), 'y': float(pos[1, 0])}
+                for name, pos in self.estimates.items()}
 
 def load_object_ground_truth(fname):
     """Load only the fruit/object entries from a truemap.txt-style file.
@@ -185,7 +230,7 @@ def load_object_ground_truth(fname):
 
 def compute_object_rmse(object_est_dict, object_gt_dict):
     """
-    object_est_dict: output of merge_estimations, e.g. {'redapple_0': {'x':..,'y':..}}
+    object_est_dict: output of ObjectEKF.to_object_pose_dict(), e.g. {'redapple_0': {'x':..,'y':..}}
     object_gt_dict: output of load_object_ground_truth
     Returns {'rmse':.., 'errors':{obj_type: err}, 'matched':[obj_types]} or None if no matches.
     """
@@ -233,41 +278,47 @@ if __name__ == "__main__":
     for row in data:  
         object_dimensions[str(row['object'])] = [float(row['length(m)']), float(row['width(m)']), float(row['height(m)'])]
     
-    # Initialize the object pose prediction as a dictionary (object name as key, list of estimate poses as value)
-    object_pose_dict = {}
-    for object_name in object_list:
-        object_pose_dict[object_name] = []
-    
+    # Run every shot's detections through an incremental EKF, one landmark
+    # per object class -- narrows down each fruit's position the same way
+    # slam/ekf.py narrows down ArUco landmarks over repeated sightings, but
+    # fed by the detector instead of the ArUco sensor. Order matters here
+    # (unlike the old batch merge): pred.txt's shots are folded in one at a
+    # time, in the order they were taken.
+    object_ekf = ObjectEKF()
+
     # Compute estimates
     with open('lab_output/pred.txt') as fp:
-        
+
         # for every line in pred.txt (every image taken)
         for line in fp.readlines():
             entry = ast.literal_eval(line)
             robotpose, bboxes = entry['robotpose'], entry['bboxes']
-            
+
             # for every bounding box detected
             for bbox in bboxes:
                 predicted_class = bbox[0]
                 box = bbox[1]
+                if predicted_class not in object_dimensions:
+                    continue
                 if is_box_clipped(box, img_width=IMG_WIDTH, img_height=IMG_HEIGHT):
                     print(f"[FILTERED] {predicted_class} clipped: box={box}") # debug
                     continue
                 true_height = object_dimensions[predicted_class][2]
-                pose_x, pose_y = estimate_pose(robotpose, box, true_height, focal_length, cx)
-                
-                # distance from robot to this estimate, for weighting later
-                robot_x, robot_y = robotpose[0][0], robotpose[1][0]
-                robot_theta = robotpose[2][0]
-                dist = np.hypot(pose_x - robot_x, pose_y - robot_y)
-                
-                object_pose_dict[predicted_class].append((pose_x, pose_y, dist, robot_theta))
+                z_world, R_world, dist = object_measurement(robotpose, box, true_height, focal_length, cx)
 
-    # merge the estimations of the objects so that there are only one estimate for each object type
-    object_pose_dict = merge_estimations(object_pose_dict)
-                     
+                accepted = object_ekf.update(predicted_class, z_world, R_world)
+                if not accepted:
+                    print(f"[GATED] {predicted_class} inconsistent with current estimate: "
+                          f"z={z_world.ravel()}, dist={dist:.2f}")
+
+    # every object gets exactly one final estimate (its EKF state); default
+    # to (0,0) for any object in object_list.csv that was never sighted
+    object_pose_dict = object_ekf.to_object_pose_dict()
+    for object_name in object_list:
+        object_pose_dict.setdefault(object_name + '_0', {'x': 0.0, 'y': 0.0})
+
     # save object pose estimations
     with open('lab_output/objects.txt', 'w') as fo:
         json.dump(object_pose_dict, fo, indent=4)
-    
+
     print('Estimations saved!')

@@ -23,6 +23,19 @@ class EKF:
     # The EKF state is composed of the robot position (x, y, theta) and the landmark position (x_lm1, y_lm1, x_lm2, y_lm2, ....)
     # lm stands for landmark, ie the aruco markers.
 
+    # Per-fruit colours (BGR, for cv2) for the object_ekf ring + predicted-location
+    # marker in draw_slam_state -- chosen to match each fruit's real-world colour.
+    FRUIT_COLORS = {
+        'lemon':      (0, 230, 230),   # yellow
+        'capsicum':   (0, 100, 0),     # dark green
+        'lime':       (60, 180, 75),   # green
+        'greenapple': (0, 255, 0),     # bright green
+        'orange':     (0, 140, 255),   # dark orange
+        'mango':      (100, 190, 255), # light orange
+        'redapple':   (0, 0, 139),     # dark red
+    }
+    DEFAULT_FRUIT_COLOR = (0, 200, 255)  # fallback for any class not in FRUIT_COLORS
+
     def __init__(self, robot):
         # State components
         self.robot = robot
@@ -477,7 +490,7 @@ class EKF:
         y_im = int(y*m2pixel+h/2.0)
         return (x_im, y_im)
 
-    def draw_slam_state(self, res = (320, 500), not_pause=True, true_map=None, live_rmse_info=None, selected_tag=None,object_gt=None, object_estimates=None, object_rmse_info=None):
+    def draw_slam_state(self, res = (320, 500), not_pause=True, true_map=None, live_rmse_info=None, selected_tag=None,object_gt=None, object_estimates=None, object_rmse_info=None, object_ekf=None):
         # Draw landmarks
         m2pixel = 100
         if not_pause:
@@ -510,6 +523,20 @@ class EKF:
                 Plmi = self.P[3+2*i:3+2*(i+1),3+2*i:3+2*(i+1)]
                 axes_len, angle = self.make_ellipse(Plmi)
                 canvas = cv2.ellipse(canvas, coor_, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, (244, 69, 96), 1)
+
+        # draw fruit/object landmarks tracked by object_ekf, same ellipse
+        # convention as the ArUco landmarks above: it shrinks as the EKF
+        # narrows down each fruit's position over repeated sightings.
+        if object_ekf is not None:
+            for obj_type, pos in object_ekf.estimates.items():
+                obj_xy = pos - center_xy
+                coor_obj = self.to_im_coor((obj_xy[0, 0], obj_xy[1, 0]), res, m2pixel)
+                colour = self.FRUIT_COLORS.get(obj_type, self.DEFAULT_FRUIT_COLOR)
+                cv2.drawMarker(canvas, coor_obj, colour, markerType=cv2.MARKER_DIAMOND, markerSize=8, thickness=2)
+                cv2.putText(canvas, obj_type[:3], (coor_obj[0]+6, coor_obj[1]-6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA)
+                axes_len, angle = self.make_ellipse(object_ekf.P[obj_type])
+                canvas = cv2.ellipse(canvas, coor_obj, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, colour, 1)
 
         # --- overlay ground-truth markers for live RMSE practice ---
         if true_map is not None and live_rmse_info is not None:
@@ -546,15 +573,15 @@ class EKF:
                 cv2.putText(canvas, obj_type[:3], (coor_gt[0]+6, coor_gt[1]-6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA)
 
-                # current merged estimate (already in the estimated/SLAM frame -- no R,t needed)
-                # + an error line from estimate -> where it should be
+                # error line from the current estimate (drawn above, from
+                # object_ekf) -> where it should be. Estimate is already in
+                # the estimated/SLAM frame -- no R,t needed.
                 if object_estimates is not None:
                     key_0 = obj_type + '_0'
                     if key_0 in object_estimates:
                         est = object_estimates[key_0]
                         est_xy_local = np.array([[est['x']], [est['y']]]) - center_xy
                         coor_est = self.to_im_coor((est_xy_local[0,0], est_xy_local[1,0]), res, m2pixel)
-                        cv2.drawMarker(canvas, coor_est, (0, 200, 255), markerType=cv2.MARKER_DIAMOND, markerSize=8, thickness=2)
                         cv2.line(canvas, coor_est, coor_gt, (255, 120, 0), 1)
 
         surface = pygame.surfarray.make_surface(np.rot90(canvas))
