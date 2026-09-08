@@ -48,8 +48,10 @@ def load_true_map(fname):
 
 
 class Operate:
-    # Number row -> ArUco tag id, for selecting/deleting a marker from the map.
-    MARKER_DELETE_KEYS = {
+    # Number row -> index into object_list.csv (matching its "pixel label value"
+    # column), for toggling whether a fruit type's detections count toward its
+    # position estimate.
+    FRUIT_SUPPRESS_KEYS = {
         pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3, pygame.K_4: 4, pygame.K_5: 5,
         pygame.K_6: 6, pygame.K_7: 7, pygame.K_8: 8, pygame.K_9: 9, pygame.K_0: 10,
     }
@@ -167,7 +169,7 @@ class Operate:
         self.obj_detector_output = None
         self.ekf_on = False
         self.double_reset_comfirm = 0
-        self.pending_delete_tag = None  # marker tag awaiting a second keypress to confirm deletion
+        self.suppressed_objects = set()  # fruit types toggled off -- their detections are ignored, same as a failed quality gate
         self.image_id = 0
         self.show_live_rmse = True   # toggle with 'L'
         self.demo_mode = False       # toggle with 'D' -- hides ground truth/RMSE, keeps predictions visible
@@ -377,11 +379,12 @@ class Operate:
         # stay visible in demo mode; ground truth/RMSE are suppressed instead
         ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause=self.ekf_on,
                                     true_map=active_true_map, live_rmse_info=live_rmse_info,
-                                    selected_tag=self.pending_delete_tag,
                                     object_gt=None if self.demo_mode else (self.true_map_objects if self.show_live_rmse else None),
                                     object_estimates=self.live_object_estimates,
-                                    object_rmse_info=None if self.demo_mode else self.live_object_rmse_info)
+                                    object_rmse_info=None if self.demo_mode else self.live_object_rmse_info,
+                                    suppressed_objects=self.suppressed_objects)
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
+        self.draw_fruit_suppression_panel(canvas, position=(2*h_pad+320+520+10, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
 
@@ -421,6 +424,27 @@ class Operate:
         count_down_surface = TEXT_FONT.render(time_remain, False, (50, 50, 50))
         canvas.blit(count_down_surface, (h_pad+10, 680))
         return canvas
+
+    # legend next to the SLAM map: which fruit types (number key) are
+    # currently suppressed (their detections excluded from position estimation)
+    def draw_fruit_suppression_panel(self, canvas, position):
+        x, y = position
+        active_colour = (120, 220, 140)
+        suppressed_colour = (220, 90, 90)
+        header_colour = (200, 200, 200)
+
+        header = SMALL_FONT.render('Fruit keys', False, header_colour)
+        canvas.blit(header, (x, y))
+
+        line_h = 24
+        for i, obj_name in enumerate(self.object_list):
+            key_num = i + 1
+            is_suppressed = obj_name in self.suppressed_objects
+            colour = suppressed_colour if is_suppressed else active_colour
+            status = 'OFF' if is_suppressed else 'ON'
+            label = f'{key_num}:{obj_name[:9]} {status}'
+            line_surface = SMALL_FONT.render(label, False, colour)
+            canvas.blit(line_surface, (x, y + 28 + i * line_h))
 
     @staticmethod
     def draw_pygame_window(canvas, cv2_img, position):
@@ -514,6 +538,7 @@ class Operate:
                     # clear in-memory fruit/object accumulators
                     self.object_pose_dict = {obj: [] for obj in self.object_list}
                     self.detected_objects = set()
+                    self.suppressed_objects = set()
                     self.live_object_rmse_info = None
                     self.live_object_estimates = None
                     self.obj_shot_id = 0
@@ -550,21 +575,22 @@ class Operate:
             # capture and save raw image
             elif event.type == pygame.KEYDOWN and event.key  == pygame.K_i:
                 self.command['save_image'] = True
-            # select/delete a marker by its tag number (press once to select, again to delete)
-            elif event.type == pygame.KEYDOWN and event.key in self.MARKER_DELETE_KEYS:
-                tag = self.MARKER_DELETE_KEYS[event.key]
-                if self.pending_delete_tag == tag:
-                    if self.ekf.delete_landmark(tag):
-                        self.notification = f'Marker {tag} deleted'
+            # toggle whether a fruit type's detections contribute to its position estimate
+            # (press to suppress, press again to re-enable) -- a suppressed fruit is still
+            # detected/shown, it just has the same effect as failing the clipped/malformed
+            # quality gates: its boxes are skipped and never merged into its position.
+            elif event.type == pygame.KEYDOWN and event.key in self.FRUIT_SUPPRESS_KEYS:
+                idx = self.FRUIT_SUPPRESS_KEYS[event.key] - 1
+                if 0 <= idx < len(self.object_list):
+                    obj_name = self.object_list[idx]
+                    if obj_name in self.suppressed_objects:
+                        self.suppressed_objects.discard(obj_name)
+                        self.notification = f'{obj_name} un-suppressed - detections will contribute to its position again'
                     else:
-                        self.notification = f'Marker {tag} not in map'
-                    self.pending_delete_tag = None
+                        self.suppressed_objects.add(obj_name)
+                        self.notification = f'{obj_name} suppressed - detections will no longer contribute to its position'
                 else:
-                    self.pending_delete_tag = tag
-                    if tag in self.ekf.taglist:
-                        self.notification = f'Marker {tag} selected - press {tag} again to delete'
-                    else:
-                        self.notification = f'Marker {tag} not in map - press {tag} again to clear selection'
+                    self.notification = f'No object mapped to key {self.FRUIT_SUPPRESS_KEYS[event.key]}'
             # quit
             elif event.type == pygame.QUIT:
                 self.quit = True
@@ -642,6 +668,8 @@ class Operate:
         for predicted_class, box in bboxes:
             if predicted_class not in self.object_dimensions:
                 continue
+            if predicted_class in self.suppressed_objects:
+                continue
             img_height, img_width = self.img.shape[:2]
 
             if is_box_clipped(box, img_width=img_width, img_height=img_height):
@@ -696,8 +724,9 @@ if __name__ == "__main__":
     pygame.font.init() 
     TITLE_FONT = pygame.font.Font('ui/8-BitMadness.ttf', 35)
     TEXT_FONT = pygame.font.Font('ui/8-BitMadness.ttf', 40)
+    SMALL_FONT = pygame.font.Font('ui/8-BitMadness.ttf', 20)
     
-    width, height = 900, 760
+    width, height = 1080, 760
     canvas = pygame.display.set_mode((width, height))
     pygame.display.set_caption('ECE4078 Lab')
     pygame.display.set_icon(pygame.image.load('ui/8bit/pibot5.png'))
@@ -723,7 +752,7 @@ if __name__ == "__main__":
             pygame.display.update()
             counter += 2
     
-    width, height = 900, 760
+    width, height = 1080, 760
     canvas = pygame.display.set_mode((width, height))
     operate = Operate(args)
     while start:
