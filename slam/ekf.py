@@ -23,6 +23,19 @@ class EKF:
     # The EKF state is composed of the robot position (x, y, theta) and the landmark position (x_lm1, y_lm1, x_lm2, y_lm2, ....)
     # lm stands for landmark, ie the aruco markers.
 
+    # Per-fruit colours (BGR, for cv2) for the object_ekf ring + predicted-location
+    # marker in draw_slam_state -- chosen to match each fruit's real-world colour.
+    FRUIT_COLORS = {
+        'lemon':      (0, 230, 230),   # yellow
+        'capsicum':   (0, 100, 0),     # dark green
+        'lime':       (60, 180, 75),   # green
+        'greenapple': (0, 255, 0),     # bright green
+        'orange':     (0, 140, 255),   # dark orange
+        'mango':      (100, 190, 255), # light orange
+        'redapple':   (0, 0, 139),     # dark red
+    }
+    DEFAULT_FRUIT_COLOR = (0, 200, 255)  # fallback for any class not in FRUIT_COLORS
+
     def __init__(self, robot):
         # State components
         self.robot = robot
@@ -34,19 +47,7 @@ class EKF:
         self.taglist = []
         self.init_lm_cov = 1e3
         self.innovation_gate = 9.21  # chi-square gate, 2 DOF, ~99% confidence -- see update()
-        # Landmark covariance floor. ArUco landmarks no longer use this directly --
-        # they're protected from overconfidence by innovation_gate (rejects bad
-        # readings outright, see update()) and the viewpoint-novelty redundancy
-        # penalty below (discounts repeat readings from nearly the same vantage
-        # point) instead. Kept here as the floor for the independent fruit-position
-        # tracker in operate.py (_fuse_fruit_observation), which has neither of
-        # those two protections and still benefits from a floor so it never
-        # becomes fully "locked in".
-        self.min_lm_var = 3.75e-4
-        # M2: True once the ground-truth ArUco map has been loaded via
-        # load_true_map(). SLAM keeps localising the robot pose, but never
-        # adds a new landmark or moves an existing one while this is set.
-        self.freeze_map = False
+
         # Viewpoint-novelty redundancy penalty: a repeat reading from nearly the same
         # spot a landmark was last usefully seen from shares the same systematic error
         # as that earlier reading, so it isn't an independent sample the way the EKF's
@@ -55,7 +56,9 @@ class EKF:
         self.viewpoint_ang_threshold = np.deg2rad(15.0)   # rad, or this much rotation
         self.redundancy_penalty = 25.0                    # R multiplier for a repeat view
         self._last_view_pose = {}                         # tag -> (x, y, theta)
+
         self.robot_init_state = None
+        self.freeze_map = False # M2: true once true map is loaded
         self.lm_pics = []
         for i in range(1, 11):
             f_ = f'./ui/8bit/lm_{i}.png'
@@ -71,33 +74,54 @@ class EKF:
         self.taglist = []
         self.init_lm_cov = 1e3
         self.innovation_gate = 9.21
-        self.min_lm_var = 3.75e-4
-        self.freeze_map = False
         self._last_view_pose = {}
         self.robot_init_state = None
+        self.freeze_map = False # M2 true map
 
     def number_landmarks(self):
         return int(self.markers.shape[1])
 
-    def load_true_map(self, fname):
-        """M2: load ground-truth ArUco marker positions from a truemap.txt-style
-        JSON file into self.markers/self.taglist, and freeze them so SLAM only
-        localises the robot pose without ever adding or moving landmarks --
-        "you are allowed to use the true map during demonstration" for M2, and
-        this is what the spec means by loading truemap.txt's coordinates into
-        self.markers. Ignores non-ArUco entries (e.g. fruit ground-truth) that
-        may share the same file. Robot pose/uncertainty is left as-is; only
-        the landmark portion of the state is (re)initialised.
+    def delete_landmark(self, tag):
+        """Remove a landmark (state, covariance, and bookkeeping) by ArUco tag id.
+        Returns True if the tag was found and removed, False otherwise."""
+        if tag not in self.taglist:
+            return False
+        idx = self.taglist.index(tag)
+        self.taglist.pop(idx)
+        self.markers = np.delete(self.markers, idx, axis=1)
 
-        Freezing works by giving the landmark block of P exactly zero variance,
-        not by special-casing update(): with H containing both robot and
-        landmark partials, a zero-variance landmark block makes the Kalman
-        gain's landmark rows come out exactly zero (same reasoning as "a
-        deterministically-known state is never correlated with anything, so
-        it's never corrected"), so update()'s ordinary math corrects the robot
-        pose against these known-correct positions but never nudges the
-        positions themselves.
-        """
+        # State layout is [robot(3); lm0(2); lm1(2); ...] (see get/set_state_vector),
+        # so landmark idx occupies P rows/cols [3+2*idx, 3+2*idx+1].
+        row_start = 3 + 2 * idx
+        rows_to_remove = [row_start, row_start + 1]
+        self.P = np.delete(self.P, rows_to_remove, axis=0)
+        self.P = np.delete(self.P, rows_to_remove, axis=1)
+
+        self._last_view_pose.pop(tag, None)
+        return True
+
+    def get_state_vector(self):
+        state = np.concatenate(
+            (self.robot.state, np.reshape(self.markers, (-1,1), order='F')), axis=0)
+        return state
+
+    def set_state_vector(self, state):
+        self.robot.state = state[0:3,:]
+        self.markers = np.reshape(state[3:,:], (2,-1), order='F')
+
+    def save_map(self, fname="slam.txt"):
+        d = {}
+        if self.number_landmarks() > 0:
+            for i, tag in enumerate(self.taglist):
+                d["aruco" + str(tag) + "_0"] = {"x": self.markers[0,i], "y":self.markers[1,i]}
+            with open(fname, 'w') as map_f:
+                json.dump(d, map_f, indent=4)
+
+    def load_true_map(self, fname):
+        """Load ground-truth landmark coordinates (M2) into self.markers/self.taglist,
+        and freeze them so SLAM only localises the robot pose without ever moving
+        the landmarks. Ignores non-ArUco entries (e.g. fruit ground-truth) that may
+        share the same true_map.txt file."""
         with open(fname, 'r') as f:
             gt_dict = json.load(f)
 
@@ -117,65 +141,7 @@ class EKF:
         self.P = np.zeros((3 + 2*n, 3 + 2*n))
         self.P[0:3, 0:3] = robot_P
         self.freeze_map = True
-        self._last_view_pose = {}   # old per-tag "last seen from" records no longer apply
         return n
-
-    def unload_true_map(self):
-        """Undo load_true_map(): drop the loaded true markers and un-freeze the
-        map so SLAM goes back to building its own from scratch (M1-style).
-        Only the landmark portion of the state is touched -- the robot's
-        current pose belief and its uncertainty (self.P's robot block) are
-        left exactly as they are, since unloading the true map doesn't itself
-        make the robot's current pose estimate wrong. No-op (returns 0) if no
-        true map is currently loaded."""
-        if not self.freeze_map:
-            return 0
-        n = self.number_landmarks()
-        self.taglist = []
-        self.markers = np.zeros((2, 0))
-        self.P = self.P[0:3, 0:3].copy()
-        self.freeze_map = False
-        self._last_view_pose = {}
-        return n
-
-    def delete_landmark(self, tag):
-        """Remove a landmark (state, covariance, and bookkeeping) by ArUco tag id.
-        Returns True if the tag was found and removed, False otherwise.
-        No-op while freeze_map is set (M2 true map loaded) -- deleting a
-        ground-truth marker would corrupt the reference fruit pose estimates
-        are being anchored to."""
-        if self.freeze_map:
-            return False
-        if tag not in self.taglist:
-            return False
-        idx = self.taglist.index(tag)
-        self.taglist.pop(idx)
-        self.markers = np.delete(self.markers, idx, axis=1)
-        # State layout is [robot(3); lm0(2); lm1(2); ...] (see get/set_state_vector),
-        # so landmark idx occupies P rows/cols [3+2*idx, 3+2*idx+1].
-        row_start = 3 + 2 * idx
-        rows_to_remove = [row_start, row_start + 1]
-        self.P = np.delete(self.P, rows_to_remove, axis=0)
-        self.P = np.delete(self.P, rows_to_remove, axis=1)
-        self._last_view_pose.pop(tag, None)
-        return True
-
-    def get_state_vector(self):
-        state = np.concatenate(
-            (self.robot.state, np.reshape(self.markers, (-1,1), order='F')), axis=0)
-        return state
-
-    def set_state_vector(self, state):
-        self.robot.state = state[0:3,:]
-        self.markers = np.reshape(state[3:,:], (2,-1), order='F')
-
-    def save_map(self, fname="slam.txt"):
-        d = {}
-        if self.number_landmarks() > 0:
-            for i, tag in enumerate(self.taglist):
-                d["aruco" + str(tag) + "_0"] = {"x": self.markers[0,i], "y":self.markers[1,i]}
-        with open(fname, 'w') as map_f:
-            json.dump(d, map_f, indent=4)
 
     def save_state(self, fname):
         """Persist markers, covariance, and taglist so they survive a restart."""
@@ -246,23 +212,28 @@ class EKF:
         """
         if true_map is None or self.number_landmarks() == 0:
             return None
+
         matched_tags = [tag for tag in self.taglist if tag in true_map]
         if len(matched_tags) < 2:
             return None
+
         est_pts = np.zeros((2, len(matched_tags)))
         true_pts = np.zeros((2, len(matched_tags)))
         for i, tag in enumerate(matched_tags):
             idx = self.taglist.index(tag)
             est_pts[:, i:i+1] = self.markers[:, idx:idx+1]
             true_pts[:, i:i+1] = true_map[tag]
+
         try:
             R, t = self.umeyama(est_pts, true_pts)
         except ValueError:
             # matched points are collinear -- rotation isn't uniquely solvable yet
             return None
+
         aligned_est = R @ est_pts + t
         residual = (aligned_est - true_pts).ravel()
         rmse = float(np.sqrt(1.0 / len(matched_tags) * np.sum(residual ** 2)))  # matches eval.py's compute_rmse exactly
+
         return {'rmse': rmse, 'R': R, 't': t, 'matched_tags': matched_tags}
 
     ##########################################
@@ -281,22 +252,6 @@ class EKF:
 
         # 2. Propagate state uncertainty covariance P
         self.P = F @ self.P @ F.T + Q
-
-    @staticmethod
-    def measurement_noise(distance):
-        """Local-frame (depth, lateral) measurement noise variances for a
-        landmark observed at this distance, in the marker's own [depth,
-        lateral] axes. These stay in the robot's body frame throughout --
-        update() never rotates R by theta, since z, z_hat, and H are all
-        expressed in that same local frame (see update()'s comment). Shared
-        by ArUco landmark updates/births here (update(), add_landmarks()) and
-        the independent fruit-position tracker in operate.py, so a fruit's
-        uncertainty is computed with the exact same fitted noise model an
-        ArUco marker's is.
-        """
-        depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
-        lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed; tune this ratio
-        return depth_var, lateral_var
 
     # How much genuinely new information a sighting of this tag carries, 0 to 1.
     # 0 means "same vantage point as last time, tells us nothing new about geometry";
@@ -334,7 +289,8 @@ class EKF:
         novelties = []
         for i in range(len(known_measurement)):
             distance = np.linalg.norm(known_measurement[i].position)
-            depth_var, lateral_var = self.measurement_noise(distance)
+            depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
+            lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed; tune this ratio
 
             # Inflate a redundant sighting's noise: a repeat look from nearly the same
             # spot this tag was last usefully seen from still nudges the estimate, but
@@ -449,6 +405,7 @@ class EKF:
         #     if len(known_in_view) < 1:
         #         return
 
+
         th = float(self.robot.state[2, 0])
         c, sn = np.cos(th), np.sin(th)
         R_theta = np.array([[c, -sn], [sn, c]])
@@ -474,13 +431,15 @@ class EKF:
             #   Gx = d(m)/d(robot pose)   = [ I | dR/dtheta @ z ]   (2 x n)
             #   Gz = d(m)/d(measurement)  = R(theta)                (2 x 2)
             n = self.P.shape[0]
+
             Gx = np.zeros((2, n))
             Gx[:, 0:2] = np.eye(2)
             Gx[:, 2:3] = dR_theta @ lm_position
 
             # Same depth/lateral measurement noise update() uses for this marker.
             distance = np.linalg.norm(lm_position)
-            depth_var, lateral_var = self.measurement_noise(distance)
+            depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
+            lateral_var = depth_var * 1.5
             Rz = np.diag([depth_var, lateral_var])
 
             P_mx = Gx @ self.P                              # 2 x n: correlation with existing state
@@ -531,8 +490,7 @@ class EKF:
         y_im = int(y*m2pixel+h/2.0)
         return (x_im, y_im)
 
-    def draw_slam_state(self, res = (320, 500), not_pause=True, true_map=None, live_rmse_info=None,
-                         selected_tag=None, fruit_map=None, fruit_colours=None):
+    def draw_slam_state(self, res = (320, 500), not_pause=True, true_map=None, live_rmse_info=None, selected_tag=None,object_gt=None, object_estimates=None, object_rmse_info=None, object_ekf=None):
         # Draw landmarks
         m2pixel = 100
         if not_pause:
@@ -556,7 +514,6 @@ class EKF:
         p_robot = self.P[0:2,0:2]
         axes_len,angle = self.make_ellipse(p_robot)
         canvas = cv2.ellipse(canvas, start_point_uv, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, (0, 30, 56), 1)
-
         # draw landmards
         if self.number_landmarks() > 0:
             for i in range(len(self.markers[0,:])):
@@ -567,21 +524,19 @@ class EKF:
                 axes_len, angle = self.make_ellipse(Plmi)
                 canvas = cv2.ellipse(canvas, coor_, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, (244, 69, 96), 1)
 
-        # Practice-only: draw live fruit position estimates (operate.py's
-        # independent per-label Kalman tracker, see _fuse_fruit_observation)
-        # as filled circles, colour-matched to that fruit's bounding-box
-        # colour in the Detector view, with an uncertainty ellipse when a
-        # covariance is available. Fruits are in world frame like self.markers,
-        # so they use the same centroid recentring as the estimates above.
-        if fruit_map:
-            for name, pos in fruit_map.items():
-                fruit_xy = np.array([[pos['x']], [pos['y']]]) - center_xy
-                coor_fruit = self.to_im_coor((fruit_xy[0, 0], fruit_xy[1, 0]), res, m2pixel)
-                colour = tuple(int(c) for c in fruit_colours[name]) if fruit_colours and name in fruit_colours else (255, 165, 0)
-                if 'P' in pos:
-                    axes_len, angle = self.make_ellipse(np.asarray(pos['P']))
-                    canvas = cv2.ellipse(canvas, coor_fruit, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, colour, 1)
-                canvas = cv2.circle(canvas, coor_fruit, 5, colour, -1)
+        # draw fruit/object landmarks tracked by object_ekf, same ellipse
+        # convention as the ArUco landmarks above: it shrinks as the EKF
+        # narrows down each fruit's position over repeated sightings.
+        if object_ekf is not None:
+            for obj_type, pos in object_ekf.estimates.items():
+                obj_xy = pos - center_xy
+                coor_obj = self.to_im_coor((obj_xy[0, 0], obj_xy[1, 0]), res, m2pixel)
+                colour = self.FRUIT_COLORS.get(obj_type, self.DEFAULT_FRUIT_COLOR)
+                cv2.drawMarker(canvas, coor_obj, colour, markerType=cv2.MARKER_DIAMOND, markerSize=8, thickness=2)
+                cv2.putText(canvas, obj_type[:3], (coor_obj[0]+6, coor_obj[1]-6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA)
+                axes_len, angle = self.make_ellipse(object_ekf.P[obj_type])
+                canvas = cv2.ellipse(canvas, coor_obj, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, colour, 1)
 
         # --- overlay ground-truth markers for live RMSE practice ---
         if true_map is not None and live_rmse_info is not None:
@@ -596,13 +551,38 @@ class EKF:
                 colour = (40, 170, 40) if tag in matched_tags else (140, 140, 40)
                 cv2.drawMarker(canvas, coor_true, colour, markerType=cv2.MARKER_TILTED_CROSS, markerSize=10, thickness=2)
                 cv2.putText(canvas, str(tag), (coor_true[0]+6, coor_true[1]-6), cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA)
+
                 # error line: your current estimate -> where it should be
                 if tag in matched_tags:
                     idx = self.taglist.index(tag)
                     coor_est = self.to_im_coor((lms_xy[0,idx], lms_xy[1,idx]), res, m2pixel)
                     cv2.line(canvas, coor_est, coor_true, (0, 140, 255), 1)
+
             rmse_text = f"RMSE {live_rmse_info['rmse']:.4f}m ({len(matched_tags)}/{len(true_map)})"
             cv2.putText(canvas, rmse_text, (5, res[1]-8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,0), 1, cv2.LINE_AA)
+
+            # --- overlay fruit/object ground truth + live merged estimates ---
+        if object_gt is not None and live_rmse_info is not None:
+            R, t = live_rmse_info['R'], live_rmse_info['t']
+            matched_objs = set(object_rmse_info['matched']) if object_rmse_info else set()
+            for obj_type, gt_xy in object_gt.items():
+                gt_in_est = R.T @ (gt_xy - t) - center_xy
+                coor_gt = self.to_im_coor((gt_in_est[0,0], gt_in_est[1,0]), res, m2pixel)
+                colour = (0, 140, 220) if obj_type in matched_objs else (150, 100, 40)
+                cv2.drawMarker(canvas, coor_gt, colour, markerType=cv2.MARKER_SQUARE, markerSize=8, thickness=2)
+                cv2.putText(canvas, obj_type[:3], (coor_gt[0]+6, coor_gt[1]-6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA)
+
+                # error line from the current estimate (drawn above, from
+                # object_ekf) -> where it should be. Estimate is already in
+                # the estimated/SLAM frame -- no R,t needed.
+                if object_estimates is not None:
+                    key_0 = obj_type + '_0'
+                    if key_0 in object_estimates:
+                        est = object_estimates[key_0]
+                        est_xy_local = np.array([[est['x']], [est['y']]]) - center_xy
+                        coor_est = self.to_im_coor((est_xy_local[0,0], est_xy_local[1,0]), res, m2pixel)
+                        cv2.line(canvas, coor_est, coor_gt, (255, 120, 0), 1)
 
         surface = pygame.surfarray.make_surface(np.rot90(canvas))
         surface = pygame.transform.flip(surface, True, False)
@@ -640,6 +620,7 @@ class EKF:
         e_vecs = e_vecs[:, idx]
         alpha = np.sqrt(4.605)
         axes_len = np.sqrt(np.maximum(0, e_vals)) * alpha
+
         # Near-isotropic covariance: the ellipse is essentially a circle, and its
         # "orientation" is numerically meaningless -- tiny noise in P flips which
         # eigenvector sorts first and swings the angle wildly even though the
@@ -651,8 +632,6 @@ class EKF:
         else:
             angle = 0
         return (axes_len[0], axes_len[1]), angle
-<<<<<<< Updated upstream
-=======
 
 
 # =============================================================================
@@ -918,7 +897,7 @@ class FruitEKF:
     """
 
     def __init__(self, measurement_noise_fn=fruit_measurement_noise, init_cov=1e3,
-                 min_var=0.0012, innovation_gate=9.21, reject_radius_multiplier=2.0):
+                 min_var=0.012, innovation_gate=9.21, reject_radius_multiplier=2.0):
         """
         measurement_noise_fn(distance) -> (depth_var, lateral_var), in the
             observation's own local [depth, lateral] frame. Defaults to
@@ -1105,4 +1084,3 @@ def compute_object_rmse(object_est_dict, object_gt_dict):
     residual = (np.hstack(est_pts) - np.hstack(gt_pts)).ravel()
     rmse = float(np.sqrt(np.mean(residual ** 2)))
     return {'rmse': rmse, 'errors': errors, 'matched': matched}
->>>>>>> Stashed changes
