@@ -1,8 +1,4 @@
 import cv2
-<<<<<<< Updated upstream
-import csv
-=======
->>>>>>> Stashed changes
 import json
 import time
 import shutil
@@ -24,14 +20,7 @@ from slam.aruco_sensor import ArucoSensor
 # import CV components (M2)
 sys.path.insert(0,"{}/cv/".format(os.getcwd()))
 from cv.detector import ObjectDetector
-from object_pose_est import estimate_pose
 
-<<<<<<< Updated upstream
-# Camera frame size, matches self.img's shape (see Operate.__init__) and the
-# imgsz=480 passed to model.predict in cv/detector.py.
-FRAME_WIDTH = 480
-FRAME_HEIGHT = 360
-=======
 import csv
 from object_pose_est import estimate_pose
 
@@ -52,7 +41,6 @@ from object_pose_est import estimate_pose
 # they were farther right/down than the wrong assumed boundary.
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
->>>>>>> Stashed changes
 
 
 def load_true_map(fname):
@@ -70,6 +58,7 @@ def load_true_map(fname):
     except Exception as e:
         print(f"Could not parse true map '{fname}': {e}")
         return None
+
     true_map = {}
     for key in gt_dict:
         if key.startswith('aruco'):
@@ -84,6 +73,7 @@ class Operate:
         pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3, pygame.K_4: 4, pygame.K_5: 5,
         pygame.K_6: 6, pygame.K_7: 7, pygame.K_8: 8, pygame.K_9: 9, pygame.K_0: 10,
     }
+
     # Arrow key -> [left, right] wheel speed for continuous driving. A tap
     # pulse (see tap_pulse_duration) uses these same magnitudes so a hold
     # that outlasts the pulse hands off to continuous driving at the same speed.
@@ -102,18 +92,14 @@ class Operate:
                         'save_slam': False,
                         'run_obj_detector': False,
                         'save_obj_detector': False,
-<<<<<<< Updated upstream
-                        'save_image': False}
-=======
                         'save_image': False,
                         'load_true_map': False} # M2
->>>>>>> Stashed changes
 
         # TODO: Tune PID parameters here. If you don't want to use PID, set use_pid=0
         # self.botconnect.set_pid(use_pid=1, k  p=0, ki=0, kd=0)
 
         # PID gains — now adjustable live via keyboard, not fixed at startup
-        self.pid_gains = {'kp': 2.3, 'ki': 0.04, 'kd': 0.29}
+        self.pid_gains = {'kp': 2, 'ki': 0.04, 'kd': 0.29}
         self.pid_step = 0.005
         self.botconnect.set_pid(use_pid=1, **self.pid_gains)
 
@@ -131,35 +117,14 @@ class Operate:
         self.ekf.load_state(self.slam_state_fname)  # no-op if the file doesn't exist
 
         # Ground-truth map for live RMSE tracking (optional -- practice tool only,
-        # eval.py against the real truemap.txt is still what's graded), and for
-        # M2's "load the true map into self.markers and freeze it" mode (press
-        # 't', see update_keyboard()). Same file, two different consumers.
-        self.truemap_path = args.truemap
+        # eval.py against the real truemap.txt is still what's graded)
         self.true_map = load_true_map(args.truemap)
         if self.true_map is not None:
             print(f"Loaded true map with {len(self.true_map)} markers for live RMSE tracking.")
         else:
             print(f"No true map found at '{args.truemap}' -- live RMSE tracking disabled.")
+        self.true_map_fname = "truemap.txt" # M2
 
-<<<<<<< Updated upstream
-        # M2: for now, auto-load + freeze the true ArUco map into self.ekf.markers
-        # at startup instead of waiting for a manual 't' press. M2 only grades
-        # fruit position (lab_output/objects.txt) -- self.ekf's own marker
-        # estimates aren't graded this milestone -- so there's no reason to make
-        # the robot rediscover marker positions it's already allowed to know.
-        # SLAM still runs and localises the robot pose against these markers
-        # (recover_from_pause does a landmark resection, then update() keeps
-        # refining the pose every frame -- see ekf.py) -- it just never edits
-        # the markers themselves. This intentionally overrides whatever
-        # load_state() above just restored from a previous session, since the
-        # true map is what M2 wants the robot anchored to. 't' toggles this off
-        # (unload) and back on (reload) any time -- see K_t below. While the
-        # true map is loaded, 'r' no longer touches it at all (self.ekf is left
-        # completely alone) and only clears fruit tracking -- see K_r below.
-        if os.path.exists(self.truemap_path):
-            n = self.ekf.load_true_map(self.truemap_path)
-            print(f"Auto-loaded and froze {n} true markers into self.ekf.markers (M2 mode).")
-=======
         # Object ground truth + accumulators for live object RMSE tracking
         self.true_map_objects = load_object_ground_truth(args.truemap)
         if self.true_map_objects is not None:
@@ -175,12 +140,9 @@ class Operate:
                     self.object_dimensions[row['object']] = [
                         float(row['length(m)']), float(row['width(m)']), float(row['height(m)'])
                     ]
->>>>>>> Stashed changes
         else:
-            print(f"No true map at '{self.truemap_path}' to auto-load -- SLAM will build its own map (press 't' once one exists).")
+            print(f"Object list not found at '{obj_csv}' -- live object RMSE disabled.")
 
-<<<<<<< Updated upstream
-=======
         # M2: FruitEKF -- per-class incremental Kalman filter with chi-square
         # outlier rejection (adapted from Brandon's ObjectEKF) using our own
         # noise model (see the FruitEKF comment block in slam/ekf.py for why).
@@ -206,39 +168,13 @@ class Operate:
         self.auto_capture_interval = 1.0 / 3.0   # s between auto-captures while stationary (~3/sec) -- tune this
         self.last_auto_capture_time = 0.0        # time.time() of the last auto-capture
 
->>>>>>> Stashed changes
         # Initialise CV detector
         if args.yolo_path == "":
             self.obj_detector = None
             self.cv_vis = cv2.imread('ui/8bit/detector_splash.png')
         else:
             self.obj_detector = ObjectDetector(args.yolo_path)
-<<<<<<< Updated upstream
-            self.cv_vis = np.ones((360,480,3))* 100
-
-        # Live fruit-position estimates, for the SLAM GUI only (practice visual --
-        # lab_output/objects.txt from object_pose_est.py, saved separately with
-        # "n", is still what's graded). Each detection is fused into a running
-        # per-label Kalman estimate (self.fruit_state: label -> {'pos','P'}) via
-        # _fuse_fruit_observation(), using EKF.measurement_noise() and the same
-        # [depth,lateral]->world rotation, initial uncertainty prior, Joseph-form
-        # update and covariance floor self.ekf uses for ArUco landmark births --
-        # so a fruit's position AND uncertainty are computed the way a marker's
-        # are. This is intentionally independent of self.ekf.markers/taglist/P:
-        # fruits are never added to the actual SLAM state, so M1's ArUco-only
-        # RMSE grading is unaffected either way. self.fruit_map_display is the
-        # drawable/saveable snapshot of self.fruit_state, rebuilt after each
-        # detection pass.
-        self.object_dimensions = {}
-        self.fruit_state = {}        # label -> {'pos': 2x1 np.array, 'P': 2x2 np.array}
-        self.fruit_map_display = {}  # label -> {'x': float, 'y': float, 'P': 2x2 np.array}
-        if self.obj_detector is not None:
-            with open('object_list.csv', 'r') as f:
-                for row in csv.DictReader(f):
-                    self.object_dimensions[row['object']] = float(row['height(m)'])
-=======
             self.cv_vis = np.ones((480,640,3))* 100
->>>>>>> Stashed changes
 
         # Create a folder to save raw camera images after pressing "i"
         self.raw_img_dir = 'raw_images/'
@@ -267,21 +203,7 @@ class Operate:
         self.pending_delete_tag = None  # marker tag awaiting a second keypress to confirm deletion
         self.image_id = 0
         self.show_live_rmse = True   # toggle with 'L'
-        # Auto-run the fruit detector in the background, like ArUco runs every
-        # frame -- instead of only on "p". YOLO inference is far more expensive
-        # than ArUco corner detection, so this is throttled to once every
-        # auto_detect_interval seconds rather than every loop iteration; raise
-        # the interval if the control loop feels sluggish, lower it if your
-        # machine keeps up fine. Manual "p" still always works too, and "n"
-        # always saves whichever result (auto or manual) is most recent.
-        self.auto_detect_enabled = True   # toggle with 'A'
-        self.auto_detect_interval = 0.75  # seconds between automatic YOLO runs -- lower
-                                           # further if your machine keeps up, raise it
-                                           # (or press 'A') if driving starts feeling laggy
-        self.last_auto_detect_time = time.time()
-        if self.ekf.freeze_map:
-            self.notification = f'True map loaded ({self.ekf.number_landmarks()} markers) - view markers & press ENTER to localise'
-        elif self.ekf.number_landmarks() > 0:
+        if self.ekf.number_landmarks() > 0:
             self.notification = f'Restored {self.ekf.number_landmarks()} landmark(s) - view markers & press ENTER to relocalise'
         else:
             self.notification = 'Press ENTER to start SLAM'
@@ -316,18 +238,6 @@ class Operate:
                                           # quiet until this passes so it doesn't stomp the pulse
         self.key_press_time = {}         # arrow key -> time.time() at KEYDOWN
         self.continuous_keys = set()     # arrow keys promoted to continuous driving
-
-        # Only run the fruit detector once the robot's been still for a bit,
-        # so a captured frame isn't blurred by motion. Checking the commanded
-        # wheel speed alone isn't enough -- the chassis/camera still has
-        # physical momentum and vibration for a moment right after a command
-        # of [0,0] is sent, so last_moving_time is refreshed every tick the
-        # robot is actually being driven (see correct_straight_drive()) and
-        # detect_object() waits until it's been stationary_settle_duration
-        # since the last such tick. Tune the duration up if frames still come
-        # out blurry, down if the wait feels sluggish.
-        self.stationary_settle_duration = 0.3   # s
-        self.last_moving_time = time.time()
 
         # Distortion correction (optional). Rename/move distortion_correction.json
         # away to disable it and test whether it's the source of a problem --
@@ -386,17 +296,15 @@ class Operate:
     def init_ekf(self, calib_dir, ip):
         fileK = os.path.join(calib_dir, 'intrinsic.txt')
         camera_matrix = np.loadtxt(fileK, delimiter=',')
+        self.obj_focal_length = camera_matrix[0][0]
+        self.obj_cx = camera_matrix[0][2]
         fileD = os.path.join(calib_dir, 'distCoeffs.txt')
         dist_coeffs = np.loadtxt(fileD, delimiter=',')
         fileS = os.path.join(calib_dir, 'scale.txt')
         scale = np.loadtxt(fileS, delimiter=',')
         fileB = os.path.join(calib_dir, 'baseline.txt')
         baseline = np.loadtxt(fileB, delimiter=',')
-<<<<<<< Updated upstream
-        robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=174.5) ##change this value
-=======
         robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=172.5) ##change this value
->>>>>>> Stashed changes
         return EKF(robot)
 
     def apply_distortion_correction(self, x, y):
@@ -410,10 +318,7 @@ class Operate:
             feats = np.array(feats)
             return float(feats @ self.dist_coeffs_x), float(feats @ self.dist_coeffs_y)
 
-<<<<<<< Updated upstream
-=======
 
->>>>>>> Stashed changes
     # SLAM with ARUCO markers
     def perform_slam(self, drive_measurement):
         sensor_measurement, self.aruco_img = self.aruco_sensor.detect_marker_positions(self.img)
@@ -449,63 +354,13 @@ class Operate:
             self.ekf.add_landmarks(sensor_measurement)
             self.ekf.update(sensor_measurement)
 
-<<<<<<< Updated upstream
-    def save_full_map(self, fname):
-        """Combine the current SLAM ArUco estimates with the live fruit estimates
-        into one truemap.txt-style file (aruco*_0 + fruitname_0 keys, same shape
-        as the ground-truth map). Convenience only -- a combined snapshot of
-        everything mapped so far, e.g. to try your own M3 navigation code
-        against. Not what eval.py reads for grading -- see save_objects_txt()
-        for that."""
-        d = {}
-        for i, tag in enumerate(self.ekf.taglist):
-            d[f"aruco{tag}_0"] = {"x": float(self.ekf.markers[0, i]), "y": float(self.ekf.markers[1, i])}
-        for name, pos in self.fruit_map_display.items():
-            d[f"{name}_0"] = {"x": pos['x'], "y": pos['y']}
-        with open(fname, 'w') as f:
-            json.dump(d, f, indent=4)
-
-    def save_objects_txt(self, fname):
-        """M2 graded output: write self.fruit_map_display (the live per-fruit
-        Kalman estimate, continuously updated by _fuse_fruit_observation as
-        detections stream in -- see detect_object()) as lab_output/objects.txt,
-        in the exact {"<label>_0": {"x":.., "y":..}} shape eval.py's
-        parse_map()/eval_object() read. This is what closes the M2 loop: press
-        't' (load + freeze the true map into self.ekf.markers), ENTER (SLAM
-        localises the robot pose against those known markers via
-        recover_from_pause's landmark resection, then keeps refining it),
-        drive around with auto-detect on, then 's' -- objects.txt is ready for
-        `python eval.py`, no separate step needed.
-
-        The spec's own p/n -> lab_output/pred.txt -> `python object_pose_est.py`
-        pipeline (estimate_pose + merge_estimations) still works unchanged and
-        remains the more deliberate multi-viewpoint route; if you run it after
-        pressing 's' its output will overwrite this one, and vice versa --
-        they write the same file, so whichever you run last wins."""
-        d = {f"{name}_0": {"x": pos['x'], "y": pos['y']} for name, pos in self.fruit_map_display.items()}
-        with open(fname, 'w') as f:
-            json.dump(d, f, indent=4)
-
-=======
->>>>>>> Stashed changes
     def save_result(self):
         # save slam map after pressing "s"
         if self.command['save_slam']:
             self.ekf.save_map(fname=os.path.join(self.lab_output_dir, 'slam.txt'))
-            self.save_full_map(os.path.join(self.lab_output_dir, 'full_map.txt'))
-            if self.fruit_map_display:
-                # Only (re)write objects.txt when there's live fruit data to report --
-                # never silently blank out a previously-good objects.txt (e.g. one
-                # produced earlier via object_pose_est.py) just because this session
-                # hasn't detected any fruit yet.
-                self.save_objects_txt(os.path.join(self.lab_output_dir, 'objects.txt'))
-                self.notification = 'Map is saved (slam.txt + full_map.txt + objects.txt)'
-            else:
-                self.notification = 'Map is saved (slam.txt + full_map.txt) - no fruits tracked yet'
+            self.notification = 'Map is saved'
             self.command['save_slam'] = False
 
-<<<<<<< Updated upstream
-=======
         # load the true/ground-truth map and freeze it "l" (M2)
         if self.command['load_true_map']:
             if os.path.exists(self.true_map_fname):
@@ -515,12 +370,12 @@ class Operate:
                 self.notification = f'True map file not found: {self.true_map_fname}'
             self.command['load_true_map'] = False
 
->>>>>>> Stashed changes
         # save obj_detector result with the matching robot pose and detector labels
         if self.command['save_obj_detector']:
             if self.obj_detector_output is not None:
                 self.pred_fname = self.obj_detector.write_output(*self.obj_detector_output, self.lab_output_dir)
-                self.notification = f'Prediction is saved to {operate.pred_fname}'
+                self.notification = f'Prediction is saved to {self.pred_fname}'
+                self.process_object_estimates()
             else:
                 self.notification = f'No prediction in buffer, save ignored'
             self.command['save_obj_detector'] = False
@@ -543,150 +398,12 @@ class Operate:
         return len(set([box[0] for box in bboxes]))
 
     # using computer vision to detect objects
-    @staticmethod
-    def _in_frame_fraction(box):
-        """Fraction of this detection's box that lies within the camera frame.
-        estimate_pose's pinhole depth calc assumes box_height reflects the
-        object's true apparent height; if the object is cut off by the frame
-        edge, the reported height (or the box's x-extent, for the lateral
-        estimate) comes out too small and the position estimate is wrong.
-        Computed from the box's own reported centre/width/height (not
-        pre-clipped), so a box that genuinely extends past the frame scores
-        low. Some detector/library versions clip predicted boxes to the frame
-        internally, in which case a truncated object's box already sits fully
-        within bounds -- as a second signal, a box whose edge sits right at
-        the frame boundary is also treated as truncated either way.
-        """
-        x_center, y_center, w, h = box
-        if w <= 0 or h <= 0:
-            return 0.0
-        x0, x1 = x_center - w / 2.0, x_center + w / 2.0
-        y0, y1 = y_center - h / 2.0, y_center + h / 2.0
-
-        edge_margin = 2.0  # pixels; a box flush against the boundary either way
-        if (x0 <= edge_margin or x1 >= FRAME_WIDTH - edge_margin
-                or y0 <= edge_margin or y1 >= FRAME_HEIGHT - edge_margin):
-            return 0.0
-
-        vis_w = max(0.0, min(x1, FRAME_WIDTH) - max(x0, 0.0))
-        vis_h = max(0.0, min(y1, FRAME_HEIGHT) - max(y0, 0.0))
-        return (vis_w * vis_h) / (w * h)
-
-    def _fuse_fruit_observation(self, label, meas_x, meas_y, distance, heading):
-        """Incorporate one fruit position observation into that label's running
-        position/uncertainty estimate (self.fruit_state). Deliberately kept
-        independent of self.ekf.markers/taglist/P -- fruits are never added to
-        the actual SLAM state, so this can't affect M1's ArUco-only RMSE
-        grading -- but reuses self.ekf.measurement_noise() (the same fitted
-        noise-vs-distance model ArUco landmarks use), the same [depth,lateral]
-        -> world rotation by robot heading that estimate_pose itself uses to
-        build meas_x/meas_y (see object_pose_est.py), the same initial
-        uninitialised-landmark prior (self.ekf.init_lm_cov), the same
-        Joseph-form update, and the same covariance floor
-        (self.ekf.min_lm_var) -- so a fruit's uncertainty ellipse is computed
-        exactly the way an ArUco marker's is. Since estimate_pose already
-        outputs a direct world-frame (x,y) position, the observation model
-        here is linear (H = identity) -- unlike ArUco's EKF.update(), which
-        also has to account for robot-pose uncertainty via a Jacobian, this
-        takes the robot pose as given (whatever self.ekf currently estimates
-        it to be) rather than re-estimating it.
-        """
-        z = np.array([[meas_x], [meas_y]])
-        depth_var, lateral_var = self.ekf.measurement_noise(distance)
-        Rot = np.array([[np.cos(heading), -np.sin(heading)], [np.sin(heading), np.cos(heading)]])
-        R_world = Rot @ np.diag([depth_var, lateral_var]) @ Rot.T
-
-        if label not in self.fruit_state:
-            # First sighting -- same "uninitialised landmark" prior self.ekf starts a
-            # newly-added ArUco marker at (see EKF.init_lm_cov)
-            self.fruit_state[label] = {'pos': z, 'P': (self.ekf.init_lm_cov ** 2) * np.eye(2)}
-            return
-
-        st = self.fruit_state[label]
-        pos, P = st['pos'], st['P']
-
-        y = z - pos       # innovation; H = I since z is already a direct world-frame position
-        S = P + R_world
-        K = P @ np.linalg.inv(S)
-        pos = pos + K @ y
-
-        I2 = np.eye(2)
-        I_K = I2 - K
-        P = I_K @ P @ I_K.T + K @ R_world @ K.T
-        P = 0.5 * (P + P.T)
-
-        if P[0, 0] < self.ekf.min_lm_var:
-            P[0, 0] = self.ekf.min_lm_var
-        if P[1, 1] < self.ekf.min_lm_var:
-            P[1, 1] = self.ekf.min_lm_var
-
-        self.fruit_state[label] = {'pos': pos, 'P': P}
-
     def detect_object(self):
-        # Only run the detector once the robot's been physically still for a
-        # bit -- see stationary_settle_duration in __init__ -- so the captured
-        # frame isn't motion-blurred.
-        is_stationary = (time.time() - self.last_moving_time) >= self.stationary_settle_duration
-
-        # Auto-trigger: same flag "p" sets, just fired on a timer instead of a
-        # keypress, so the two paths share every line of detection logic below.
-        # Gated on SLAM being on -- same condition ArUco landmarks are added/
-        # updated under (see perform_slam()) -- so this doesn't spend YOLO
-        # cycles automatically when there's no trustworthy pose to anchor a
-        # position estimate to anyway.
-        if (self.auto_detect_enabled and self.ekf_on and self.obj_detector is not None
-                and is_stationary
-                and time.time() - self.last_auto_detect_time >= self.auto_detect_interval):
-            self.command['run_obj_detector'] = True
-            self.last_auto_detect_time = time.time()
-
         if self.command['run_obj_detector'] and self.obj_detector is not None:
-<<<<<<< Updated upstream
-            if not is_stationary:
-                # Manual "p" press while still moving/settling -- leave the flag
-                # set rather than dropping it, so this fires on its own on the
-                # very next still tick without needing to press "p" again.
-                self.notification = 'Waiting for robot to stop before running detector (avoids blur)'
-                return
-            bboxes, self.cv_vis = self.obj_detector.detect_single_image(self.img)
-=======
->>>>>>> Stashed changes
             self.command['run_obj_detector'] = False
             unique_detected = self._run_object_detector()
             self.notification = f'{unique_detected} object type(s) detected'
 
-<<<<<<< Updated upstream
-            # Live fruit-position estimate for the SLAM GUI/map (see __init__
-            # note). Same condition ArUco landmarks are added/updated under
-            # (self.ekf_on) -- with SLAM paused, self.ekf.robot.state is
-            # frozen wherever it was left, so a position computed from it now
-            # would be anchored to a stale pose. "p" still runs the detector
-            # (so the Detector view updates) even with SLAM off; it just
-            # won't feed fruit positions into the map while paused.
-            if self.ekf_on:
-                robot_pose = self.ekf.robot.state.tolist()
-                focal_length = self.ekf.robot.camera_matrix[0][0]
-                cx = self.ekf.robot.camera_matrix[0][2]
-                rx, ry = robot_pose[0][0], robot_pose[1][0]
-                heading = self.ekf.robot.state[2, 0]
-                for label, box in bboxes:
-                    true_height = self.object_dimensions.get(label)
-                    if true_height is None:
-                        continue  # unknown class, e.g. not in object_list.csv
-                    if self._in_frame_fraction(box) < 0.8:
-                        continue  # too close to/past the frame edge -- unreliable box size
-                    pose_x, pose_y = estimate_pose(robot_pose, box, true_height, focal_length, cx)
-                    dist = float(np.hypot(pose_x - rx, pose_y - ry))
-                    self._fuse_fruit_observation(label, pose_x, pose_y, dist, heading)
-
-                self.fruit_map_display = {
-                    label: {'x': float(st['pos'][0, 0]), 'y': float(st['pos'][1, 0]), 'P': st['P']}
-                    for label, st in self.fruit_state.items()
-                }
-
-    # paint the GUI
-    def draw(self, canvas):
-=======
     # M2: automatically capture + fuse fruit shots, repeatedly, for as long
     # as the robot stays stationary -- instead of requiring manual 'p' then
     # 'n' every time.
@@ -733,7 +450,6 @@ class Operate:
     # paint the GUI
     def draw(self, canvas):
         canvas.fill((0, 0, 0))
->>>>>>> Stashed changes
         canvas.blit(self.bg, (0, 0))
         text_colour = (220, 220, 220)
         v_pad, h_pad = 40, 20
@@ -743,20 +459,13 @@ class Operate:
         live_rmse_info = self.ekf.compute_live_rmse(active_true_map) if active_true_map is not None else None
 
         # paint SLAM outputs
-        fruit_colours = self.obj_detector.colour_code if self.obj_detector is not None else None
         ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause=self.ekf_on,
-<<<<<<< Updated upstream
-                                            true_map=active_true_map, live_rmse_info=live_rmse_info,
-                                            selected_tag=self.pending_delete_tag,
-                                            fruit_map=self.fruit_map_display, fruit_colours=fruit_colours)
-=======
                                     true_map=active_true_map, live_rmse_info=live_rmse_info,
                                     selected_tag=self.pending_delete_tag,
                                     object_gt=self.true_map_objects if self.show_live_rmse else None,
                                     object_estimates=self.live_object_estimates,
                                     object_rmse_info=self.live_object_rmse_info,
                                     object_ekf=self.fruit_ekf)
->>>>>>> Stashed changes
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
@@ -768,21 +477,22 @@ class Operate:
         self.put_caption(canvas, caption='SLAM', position=(2*h_pad+320, v_pad))
         self.put_caption(canvas, caption='Detector', position=(h_pad, 240+2*v_pad))
         self.put_caption(canvas, caption='Robot Cam', position=(h_pad, v_pad))
-        notification = TEXT_FONT.render(self.notification, False, text_colour)
+        notification = TEXT_FONT.render(self.notification[:55], False, text_colour)
         canvas.blit(notification, (h_pad+10, 596))
 
         # live RMSE readout in the main window
-        if self.true_map is None:
-            rmse_line = "No true map loaded"
+        if self.true_map_objects is None:
+            obj_rmse_line = "No object ground truth loaded"
         elif not self.show_live_rmse:
-            rmse_line = "Live RMSE tracking OFF (press L to toggle)"
-        elif live_rmse_info is None:
-            rmse_line = f"Live RMSE: need >=2 matched markers (have {len(self.ekf.taglist)})"
+            obj_rmse_line = ""
+        elif self.live_object_rmse_info is None:
+            obj_rmse_line = "Object RMSE: no matched estimates yet"
         else:
-            rmse_line = (f"Live RMSE: {live_rmse_info['rmse']:.4f} m "
-                        f"({len(live_rmse_info['matched_tags'])}/{len(self.true_map)} markers)")
-        rmse_surface = TEXT_FONT.render(rmse_line, False, text_colour)
-        canvas.blit(rmse_surface, (h_pad+10, 624))
+            info = self.live_object_rmse_info
+            obj_rmse_line = (f"Object RMSE: {info['rmse']:.4f} m "
+                            f"({len(info['matched'])}/{len(self.true_map_objects)} objects)")
+        obj_rmse_surface = TEXT_FONT.render(obj_rmse_line, False, text_colour)
+        canvas.blit(obj_rmse_surface, (h_pad+10, 652))
 
         time_remain = self.count_down - time.time() + self.start_time
         if time_remain > 0:
@@ -792,7 +502,7 @@ class Operate:
         else:
             time_remain = ""
         count_down_surface = TEXT_FONT.render(time_remain, False, (50, 50, 50))
-        canvas.blit(count_down_surface, (2*h_pad+320+5, 530))
+        canvas.blit(count_down_surface, (h_pad+10, 680))
         return canvas
 
     @staticmethod
@@ -861,10 +571,6 @@ class Operate:
             # save SLAM map
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_s:
                 self.command['save_slam'] = True
-<<<<<<< Updated upstream
-            # reset SLAM map (or, while the true map is loaded, just the fruits --
-            # see below)
-=======
             # load true map M2 (freezes landmark positions, SLAM only localises)
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_l:
                 self.command['load_true_map'] = True
@@ -879,50 +585,13 @@ class Operate:
                 state = 'ON' if self.auto_capture_enabled else 'OFF'
                 self.notification = f'Auto fruit capture {state}'
             # reset SLAM map
->>>>>>> Stashed changes
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
                 if self.double_reset_comfirm == 0:
-                    confirm_msg = ('Press again to confirm CLEAR FRUITS' if self.ekf.freeze_map
-                                    else 'Press again to confirm CLEAR MAP')
-                    self.notification = confirm_msg
-                    self.double_reset_comfirm +=1
+                    self.notification = 'Press again to confirm CLEAR MAP'
+                    self.double_reset_comfirm += 1
                 elif self.double_reset_comfirm == 1:
+                    self.notification = 'SLAM Map is cleared'
                     self.double_reset_comfirm = 0
-<<<<<<< Updated upstream
-                    self.fruit_state = {}
-                    self.fruit_map_display = {}
-                    if self.ekf.freeze_map:
-                        # True map is loaded -- 'r' only clears fruit tracking.
-                        # self.ekf (markers/taglist/P/freeze_map, robot pose) is
-                        # left completely untouched; 't' is the only thing that
-                        # unloads the true map now (see below).
-                        self.notification = 'Fruits cleared - true map still loaded'
-                    else:
-                        self.ekf.reset()
-                        if os.path.exists(self.slam_state_fname):
-                            os.remove(self.slam_state_fname)
-                        self.notification = 'SLAM map and fruits are cleared'
-            # M2: toggle-load the ground-truth ArUco map into self.ekf.markers and
-            # freeze it, so SLAM keeps localising the robot pose without ever
-            # adding or moving landmarks -- this is what the M2 spec means by
-            # loading truemap.txt's coordinates into self.markers, and what it
-            # explicitly allows ("you are allowed to use the true map during
-            # demonstration"). A frozen, correctly-anchored robot pose is what
-            # makes estimate_pose's fruit positions (see detect_object())
-            # accurate. Press again to unload (drop the true markers, un-freeze,
-            # robot pose belief left as-is) and go back to SLAM building its own
-            # map from scratch -- 'r' no longer does this while a true map is
-            # loaded (see above).
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_t:
-                if self.ekf.freeze_map:
-                    n = self.ekf.unload_true_map()
-                    self.notification = f'True map unloaded ({n} markers dropped) - SLAM will build its own map'
-                elif os.path.exists(self.truemap_path):
-                    n = self.ekf.load_true_map(self.truemap_path)
-                    self.notification = f'True map loaded ({n} markers) - map is now frozen'
-                else:
-                    self.notification = f'No true map found at {self.truemap_path}'
-=======
                     self.ekf.reset()
 
                     # clear in-memory fruit/object accumulators
@@ -954,7 +623,6 @@ class Operate:
                         csv.writer(f).writerow(
                             ['shot_id', 'object', 'robot_x', 'robot_y', 'robot_theta_deg', 'est_x', 'est_y', 'raw_error_m']
                         )
->>>>>>> Stashed changes
             # run object/fruit detector
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_p:
                 self.command['run_obj_detector'] = True
@@ -964,16 +632,6 @@ class Operate:
             # capture and save raw image
             elif event.type == pygame.KEYDOWN and event.key  == pygame.K_i:
                 self.command['save_image'] = True
-            # toggle live RMSE tracking on/off
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_l:
-                self.show_live_rmse = not self.show_live_rmse
-                state = 'ON' if self.show_live_rmse else 'OFF'
-                self.notification = f'Live RMSE tracking {state}'
-            # toggle automatic background fruit detection on/off
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_a:
-                self.auto_detect_enabled = not self.auto_detect_enabled
-                state = 'ON' if self.auto_detect_enabled else 'OFF'
-                self.notification = f'Auto fruit detection {state}'
             # select/delete a marker by its tag number (press once to select, again to delete)
             elif event.type == pygame.KEYDOWN and event.key in self.MARKER_DELETE_KEYS:
                 tag = self.MARKER_DELETE_KEYS[event.key]
@@ -1019,7 +677,6 @@ class Operate:
         # the move_manual([0,0]) call below would immediately flip botconnect
         # back to mode 0 and cancel the pulse before it's even sent.
         if base_l == 0.0 and base_r == 0.0 and time.time() < self.pulse_active_until:
-            self.last_moving_time = time.time()  # the pulse is still physically driving the robot
             self.prev_base_wheel_speed = [base_l, base_r]
             return
 
@@ -1051,11 +708,7 @@ class Operate:
         self.command['wheel_speed'] = adjusted
         self.botconnect.move_manual(adjusted)
         self.prev_base_wheel_speed = [base_l, base_r]
-        if adjusted[0] != 0.0 or adjusted[1] != 0.0:
-            self.last_moving_time = time.time()
 
-<<<<<<< Updated upstream
-=======
     def process_object_estimates(self):
         """Runs after every 'n' (save prediction), and automatically from
         auto_capture_fruit() while the robot is stationary. Each
@@ -1170,7 +823,6 @@ class Operate:
                 info = self.live_object_rmse_info
                 print(f"[Live] Object RMSE: {info['rmse']:.4f} m "
                     f"({len(info['matched'])}/{len(self.true_map_objects)} objects)")
->>>>>>> Stashed changes
 
 
 
@@ -1186,11 +838,7 @@ if __name__ == "__main__":
     TITLE_FONT = pygame.font.Font('ui/8-BitMadness.ttf', 35)
     TEXT_FONT = pygame.font.Font('ui/8-BitMadness.ttf', 40)
 
-<<<<<<< Updated upstream
-    width, height = 700, 660
-=======
     width, height = 900, 760
->>>>>>> Stashed changes
     canvas = pygame.display.set_mode((width, height))
     pygame.display.set_caption('ECE4078 Lab')
     pygame.display.set_icon(pygame.image.load('ui/8bit/pibot5.png'))
@@ -1216,11 +864,7 @@ if __name__ == "__main__":
             pygame.display.update()
             counter += 2
 
-<<<<<<< Updated upstream
-    width, height = 900, 660
-=======
     width, height = 900, 760
->>>>>>> Stashed changes
     canvas = pygame.display.set_mode((width, height))
     operate = Operate(args)
     while start:
