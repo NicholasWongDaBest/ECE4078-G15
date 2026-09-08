@@ -534,28 +534,33 @@ class EKF:
             rmse_text = f"RMSE {live_rmse_info['rmse']:.4f}m ({len(matched_tags)}/{len(true_map)})"
             cv2.putText(canvas, rmse_text, (5, res[1]-8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,0), 1, cv2.LINE_AA)
 
-            # --- overlay fruit/object ground truth + live merged estimates ---
+        # --- overlay fruit/object ground truth (only when ground truth is provided) ---
+        matched_objs = set(object_rmse_info['matched']) if object_rmse_info else set()
+        coor_gt_by_obj = {}
         if object_gt is not None and live_rmse_info is not None:
             R, t = live_rmse_info['R'], live_rmse_info['t']
-            matched_objs = set(object_rmse_info['matched']) if object_rmse_info else set()
             for obj_type, gt_xy in object_gt.items():
                 gt_in_est = R.T @ (gt_xy - t) - center_xy
                 coor_gt = self.to_im_coor((gt_in_est[0,0], gt_in_est[1,0]), res, m2pixel)
+                coor_gt_by_obj[obj_type] = coor_gt
                 colour = (0, 140, 220) if obj_type in matched_objs else (150, 100, 40)
                 cv2.drawMarker(canvas, coor_gt, colour, markerType=cv2.MARKER_SQUARE, markerSize=8, thickness=2)
                 cv2.putText(canvas, obj_type[:3], (coor_gt[0]+6, coor_gt[1]-6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA)
 
-                # current merged estimate (already in the estimated/SLAM frame -- no R,t needed)
-                # + an error line from estimate -> where it should be
-                if object_estimates is not None:
-                    key_0 = obj_type + '_0'
-                    if key_0 in object_estimates:
-                        est = object_estimates[key_0]
-                        est_xy_local = np.array([[est['x']], [est['y']]]) - center_xy
-                        coor_est = self.to_im_coor((est_xy_local[0,0], est_xy_local[1,0]), res, m2pixel)
-                        cv2.drawMarker(canvas, coor_est, (0, 200, 255), markerType=cv2.MARKER_DIAMOND, markerSize=8, thickness=2)
-                        cv2.line(canvas, coor_est, coor_gt, (255, 120, 0), 1)
+        # --- overlay live merged predicted-fruit estimates (independent of ground truth,
+        # so these still show up in demo mode when object_gt/live_rmse_info are None) ---
+        if object_estimates is not None:
+            for key_0, est in object_estimates.items():
+                obj_type = key_0.rsplit('_', 1)[0]
+                est_xy_local = np.array([[est['x']], [est['y']]]) - center_xy
+                coor_est = self.to_im_coor((est_xy_local[0,0], est_xy_local[1,0]), res, m2pixel)
+                cv2.drawMarker(canvas, coor_est, (0, 200, 255), markerType=cv2.MARKER_DIAMOND, markerSize=8, thickness=2)
+                cv2.putText(canvas, obj_type[:3], (coor_est[0]+6, coor_est[1]+14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 255), 1, cv2.LINE_AA)
+                # error line only drawable if we actually have the matching ground-truth point
+                if obj_type in coor_gt_by_obj:
+                    cv2.line(canvas, coor_est, coor_gt_by_obj[obj_type], (255, 120, 0), 1)
 
         surface = pygame.surfarray.make_surface(np.rot90(canvas))
         surface = pygame.transform.flip(surface, True, False)

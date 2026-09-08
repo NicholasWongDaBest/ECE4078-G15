@@ -170,6 +170,7 @@ class Operate:
         self.pending_delete_tag = None  # marker tag awaiting a second keypress to confirm deletion
         self.image_id = 0
         self.show_live_rmse = True   # toggle with 'L'
+        self.demo_mode = False       # toggle with 'D' -- hides ground truth/RMSE, keeps predictions visible
         if self.ekf.number_landmarks() > 0:
             self.notification = f'Restored {self.ekf.number_landmarks()} landmark(s) - view markers & press ENTER to relocalise'
         else:
@@ -368,17 +369,18 @@ class Operate:
         text_colour = (220, 220, 220)
         v_pad, h_pad = 40, 20
 
-        # compute live RMSE only if a true map is loaded AND tracking is enabled
-        active_true_map = self.true_map if (self.true_map is not None and self.show_live_rmse) else None
+        # compute live RMSE only if a true map is loaded, tracking is enabled, AND not in demo mode
+        active_true_map = None if self.demo_mode else (self.true_map if (self.true_map is not None and self.show_live_rmse) else None)
         live_rmse_info = self.ekf.compute_live_rmse(active_true_map) if active_true_map is not None else None
 
-        # paint SLAM outputs
+        # paint SLAM outputs -- object_estimates is always passed so predictions
+        # stay visible in demo mode; ground truth/RMSE are suppressed instead
         ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause=self.ekf_on,
                                     true_map=active_true_map, live_rmse_info=live_rmse_info,
                                     selected_tag=self.pending_delete_tag,
-                                    object_gt=self.true_map_objects if self.show_live_rmse else None,
+                                    object_gt=None if self.demo_mode else (self.true_map_objects if self.show_live_rmse else None),
                                     object_estimates=self.live_object_estimates,
-                                    object_rmse_info=self.live_object_rmse_info)
+                                    object_rmse_info=None if self.demo_mode else self.live_object_rmse_info)
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
@@ -393,8 +395,10 @@ class Operate:
         notification = TEXT_FONT.render(self.notification[:55], False, text_colour)
         canvas.blit(notification, (h_pad+10, 596))
 
-        # live RMSE readout in the main window
-        if self.true_map_objects is None:
+        # live RMSE readout in the main window -- suppressed entirely in demo mode
+        if self.demo_mode:
+            obj_rmse_line = ""
+        elif self.true_map_objects is None:
             obj_rmse_line = "No object ground truth loaded"
         elif not self.show_live_rmse:
             obj_rmse_line = ""
@@ -492,6 +496,11 @@ class Operate:
                 self.show_live_rmse = not self.show_live_rmse
                 state = 'ON' if self.show_live_rmse else 'OFF'
                 self.notification = f'Live RMSE tracking {state}'
+            # demo mode -- hide ground truth markers/objects/RMSE, keep predictions visible
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_d:
+                self.demo_mode = not self.demo_mode
+                state = 'ON' if self.demo_mode else 'OFF'
+                self.notification = f'Demo mode {state} (ground truth hidden)'
             # reset SLAM map
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
                 if self.double_reset_comfirm == 0:
@@ -662,10 +671,14 @@ class Operate:
             with open(self.obj_rmse_log_fname, 'a', newline='') as f:
                 csv.writer(f).writerows(shot_rows)
 
+        # Always merge estimates so they can be displayed (e.g. in demo mode),
+        # regardless of whether ground truth is loaded.
+        merged = merge_estimations(self.object_pose_dict)
+        self.live_object_estimates = {k: v for k, v in merged.items()
+                               if k.rsplit('_', 1)[0] in self.detected_objects}
+
+        # RMSE only makes sense with ground truth loaded
         if self.true_map_objects is not None:
-            merged = merge_estimations(self.object_pose_dict)
-            self.live_object_estimates = {k: v for k, v in merged.items()
-                                   if k.rsplit('_', 1)[0] in self.detected_objects}
             self.live_object_rmse_info = compute_object_rmse(self.live_object_estimates, self.true_map_objects)
             if self.live_object_rmse_info:
                 info = self.live_object_rmse_info
