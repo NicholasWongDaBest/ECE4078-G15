@@ -643,14 +643,12 @@ class Operate:
             if predicted_class not in self.object_dimensions:
                 continue
             img_height, img_width = self.img.shape[:2]
-            # clipped = is_box_clipped(box, img_width=img_width, img_height=img_height)
-            # print(f"[DEBUG] {predicted_class} box={box} img=({img_width}x{img_height}) clipped={clipped}")
-            # if clipped:
-            #     continue
-            # malformed = is_box_malformed(box, predicted_class)
-            # print(f"[DEBUG] {predicted_class} box={box} img=({img_width}x{img_height}) malformed={malformed}")
-            # if malformed:
-            #     continue
+
+            if is_box_clipped(box, img_width=img_width, img_height=img_height):
+                continue
+            if is_box_malformed(box, predicted_class, self.object_dimensions):
+                continue
+
             true_height = self.object_dimensions[predicted_class][2]
             pose_x, pose_y = estimate_pose(robot_pose, box, true_height, self.obj_focal_length, self.obj_cx)
             dist = float(np.hypot(pose_x - robot_x, pose_y - robot_y))
