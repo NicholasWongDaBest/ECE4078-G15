@@ -31,6 +31,19 @@ from object_pose_est import estimate_pose
 # size is -- imported above, not redefined here.
 
 
+# What to do with the previous run's lab_output/ at startup.
+#   False (default) -- move it to lab_output_archive/run_<timestamp>/. Gives a
+#                      clean lab_output while keeping pred.txt + pred_*.png,
+#                      which are what object_pose_est.py needs to rebuild the
+#                      graded objects.txt and what any offline re-tuning or
+#                      ablation runs on.
+#   True            -- delete it outright. Nothing from that run is recoverable.
+# Old archives are never pruned automatically; they're a few hundred MB per run,
+# so clear lab_output_archive/ out by hand when you're done with them.
+LAB_OUTPUT_HARD_DELETE = False
+LAB_OUTPUT_ARCHIVE_DIR = 'lab_output_archive/'
+
+
 def load_true_map(fname):
     """
     Load ground-truth ArUco marker positions from a truemap.txt-style JSON
@@ -88,10 +101,47 @@ class Operate:
         # on the robot side).
         self.botconnect.set_pid(use_pid=1, kp=2, ki=0.04, kd=0.29)
 
-        # Create a folder "lab_output" that stores the results of the lab
+        # Create a folder "lab_output" that stores the results of the lab.
+        # Wiped on every launch, same as raw_images/ below, so a run can never
+        # be scored against leftovers from a previous one (a stale objects.txt
+        # or slam.txt is easy to mistake for this run's output).
+        #
+        # Deliberately relative, not the absolute D:\... path: it resolves to
+        # the same folder when operate.py is launched from the project
+        # directory, and it keeps working on a teammate's machine and in the
+        # marking environment.
+        #
+        # This runs BEFORE load_state(), before the rmse log is created, and
+        # before ObjectDetector opens pred.txt -- deleting the folder out from
+        # under any of those would either lose the file or fail on Windows
+        # while the handle is still open.
+        #
+        # Two consequences worth knowing: the persisted SLAM map no longer
+        # survives a restart (load_state() below will always find nothing), and
+        # any ekf_calib_log_*.json you recorded for calibrate_ekf.py is gone the
+        # next time you launch -- copy those out before relaunching if you want
+        # to keep them.
+        # ARCHIVED rather than deleted -- see LAB_OUTPUT_HARD_DELETE below.
+        # lab_output/pred.txt + pred_*.png are the ONLY record of what was
+        # detected and where the robot was standing, and object_pose_est.py
+        # rebuilds the graded objects.txt from exactly that. Deleting them
+        # outright means a run can never be re-processed, re-tuned, or
+        # ablated afterwards -- and cv/detector.py already opens pred.txt
+        # with 'w' at startup, so the previous run's poses are destroyed the
+        # moment you relaunch even without this. Moving the folder aside
+        # gives the clean slate (nothing here can be scored against
+        # leftovers) without throwing the evidence away.
         self.lab_output_dir = 'lab_output/'
-        if not os.path.exists(self.lab_output_dir):
-            os.makedirs(self.lab_output_dir)
+        if os.path.isdir(self.lab_output_dir) and os.listdir(self.lab_output_dir):
+            if LAB_OUTPUT_HARD_DELETE:
+                shutil.rmtree(self.lab_output_dir)
+            else:
+                stamp = time.strftime('%Y%m%d_%H%M%S')
+                archive = os.path.join(LAB_OUTPUT_ARCHIVE_DIR, f'run_{stamp}')
+                os.makedirs(LAB_OUTPUT_ARCHIVE_DIR, exist_ok=True)
+                shutil.move(self.lab_output_dir, archive)
+                print(f"Previous run archived to {archive}")
+        os.makedirs(self.lab_output_dir, exist_ok=True)
 
         # Initialise SLAM parameters
         self.ekf = self.init_ekf(args.calib_dir, args.ip)
@@ -171,6 +221,20 @@ class Operate:
         self.capture_pose_ang_threshold = np.deg2rad(15.0)  # or this much rotation
         self.captures_at_pose = 0
         self.capture_burst_pose = None    # (x, y, theta) the current burst started from
+
+        # Detector-health counters, per predicted class. These record the boxes
+        # process_object_estimates() throws away, which is information that was
+        # previously discarded entirely -- a class that keeps getting skipped
+        # for an implausible box shape is being occluded or merged with
+        # something, and a class that keeps getting relabelled is being
+        # confused with its CONFUSABLE_PAIRS partner. Neither shows up in any
+        # position metric, because a box that never fuses never moves an
+        # estimate. Toggle the readout with 'v'.
+        self.box_skip_frame = {}    # class -> boxes dropped for being clipped by the frame edge
+        self.box_skip_shape = {}    # class -> boxes dropped for an implausible aspect ratio
+        self.relabel_counts = {}    # 'predicted->fused' -> times the confusable fix fired
+        self.coverage_view = 0      # 0 = fruit coverage, 1 = detector health, 2 = focal check
+        self.f_eff_samples = []     # see record_focal_check()
         self.last_marker_count = 0   # number of known (tag 1-10) ArUco markers seen in the most
                                        # recent frame -- set in perform_slam(), read by
                                        # auto_capture_fruit() so it can skip a marker-free frame
@@ -294,6 +358,12 @@ class Operate:
         camera_matrix = np.loadtxt(fileK, delimiter=',')
         self.obj_focal_length = camera_matrix[0][0]
         self.obj_cx = camera_matrix[0][2]
+        # fy, kept only for the focal-length check (record_focal_check). Depth
+        # from an object's HEIGHT is governed by fy, but estimate_pose() is
+        # handed fx above -- for most cameras they're close, but if yours
+        # differ by a few percent that gap is a straight systematic depth error
+        # on every fruit, and the check below will show it.
+        self.obj_focal_length_y = camera_matrix[1][1]
         fileD = os.path.join(calib_dir, 'distCoeffs.txt')
         dist_coeffs = np.loadtxt(fileD, delimiter=',')
         fileS = os.path.join(calib_dir, 'scale.txt')
@@ -366,6 +436,76 @@ class Operate:
                 self.ekf.predict(drive_measurement)
             self.ekf.add_landmarks(sensor_measurement)
             self.ekf.update(sensor_measurement, drive_measurement)  # pass drive_measurement so update() knows how much rotation is happening right now
+            # After update(), so the pose the map distance is measured against
+            # is this tick's corrected one. Measurement only -- see the method.
+            self.record_focal_check(sensor_measurement)
+
+    def record_focal_check(self, sensor_measurement):
+        """Measure the camera's EFFECTIVE focal length from markers in view, to
+        test whether depth-from-apparent-height is correctly scaled.
+
+        A marker's true height is known (aruco_sensor.marker_length, 6cm), its
+        apparent height in pixels comes back on the Marker now, and its true
+        distance is the mapped position vs. the robot's pose. Pinhole says
+        h_px = f * H / d, so:
+
+            f_eff = d_map * h_px / H
+
+        Compare f_eff against the calibrated fx/fy: the ratio IS your
+        calibration scale error, and since estimate_pose() uses the same
+        depth-from-height relation for fruit, that error passes straight into
+        every fruit depth.
+
+        Two things this deliberately does NOT do:
+
+        1. It never uses solvePnP's depth. solvePnP is handed the same
+           camera_matrix, so its depth already carries the same scale error --
+           feeding that back would give f_eff == f_calibrated exactly, an
+           algebraic no-op that still looks like it's working. The distance
+           here comes from the MAP.
+        2. It doesn't correct anything. It only measures. Correcting the
+           focal term is only worth doing if it's large, and it can even make
+           matters worse: a focal error and an opposing YOLO box-height bias
+           partially cancel today, so removing one alone exposes the other.
+           Read the number first, then decide.
+
+        Only meaningful with a true map loaded ('l'). In ordinary SLAM the map
+        is triangulated from these same solvePnP readings, so its scale
+        inherits the same error and the ratio comes back at ~1.00 by
+        construction, telling you nothing.
+        """
+        if not self.ekf_on or self.ekf.number_landmarks() == 0:
+            return
+        H = float(getattr(self.aruco_sensor, 'marker_length', 0.06))
+        rx, ry = float(self.ekf.robot.state[0, 0]), float(self.ekf.robot.state[1, 0])
+        for lm in sensor_measurement:
+            h_px = getattr(lm, 'height_px', None)
+            if h_px is None or h_px <= 0 or lm.tag not in self.ekf.taglist:
+                continue
+            idx = self.ekf.taglist.index(lm.tag)
+            mx, my = self.ekf.markers[0, idx], self.ekf.markers[1, idx]
+            d_map = float(np.hypot(mx - rx, my - ry))
+            if d_map < 0.15:      # too close for the pinhole model to be meaningful
+                continue
+            self.f_eff_samples.append(d_map * h_px / H)
+        if len(self.f_eff_samples) > 4000:
+            self.f_eff_samples = self.f_eff_samples[-4000:]
+
+    def focal_check_line(self):
+        """Third readout mode ('v'): calibrated vs. measured focal length."""
+        n = len(self.f_eff_samples)
+        if n < 20:
+            return (f"focal check: {n}/20 samples "
+                    f"({'load true map first' if not self.ekf.freeze_map else 'gathering'})",
+                    (220, 220, 220))
+        f_eff = float(np.median(self.f_eff_samples))   # median: robust to a bad detection
+        ratio = f_eff / self.obj_focal_length
+        err_pct = (ratio - 1.0) * 100.0
+        if not self.ekf.freeze_map:
+            return (f"focal check: ratio {ratio:.3f} (MEANINGLESS - no true map)", (150, 150, 150))
+        colour = (120, 220, 120) if abs(err_pct) < 2.0 else (240, 180, 60)
+        return (f"focal: meas {f_eff:.0f} vs fx {self.obj_focal_length:.0f} "
+                f"fy {self.obj_focal_length_y:.0f} = {err_pct:+.1f}% (n={n})", colour)
 
     def save_result(self):
         # save slam map after pressing "s"
@@ -532,10 +672,37 @@ class Operate:
                     f" - view from another side", (240, 180, 60))
 
         if cov['worst']:
-            label, sigma, views = cov['worst'][0]
-            return (f"worst: {label} +/-{sigma*1000:.0f}mm ({views} views)", (120, 220, 120))
+            # Ranked by risk() -- geometry, not covariance. Showing spread and
+            # closest range rather than +/-mm because those are the two things
+            # you can actually act on, and because sigma is pinned at
+            # sqrt(min_var) (~28mm) for every converged fruit, so it can't
+            # distinguish a good estimate from a bad one.
+            label, risk, spread, min_d, views = cov['worst'][0]
+            return (f"check: {label} {spread:.0f}deg arc, "
+                    f"nearest {min_d:.1f}m ({views} views)", (120, 220, 120))
 
         return "No fruit fused yet", (220, 220, 220)
+
+    def detector_health_line(self):
+        """Second readout mode ('v'): what the DETECTOR is doing wrong, which no
+        position metric can see. A box dropped by the frame/shape gates never
+        fuses, so it never moves an estimate and never shows up as uncertainty
+        -- but a class being dropped repeatedly is being occluded, merged with
+        a neighbour, or misread, and that's usually why a fruit ends up in the
+        wrong place or missing entirely."""
+        parts = []
+        shape = sorted(self.box_skip_shape.items(), key=lambda kv: -kv[1])[:2]
+        frame = sorted(self.box_skip_frame.items(), key=lambda kv: -kv[1])[:1]
+        rel = sorted(self.relabel_counts.items(), key=lambda kv: -kv[1])[:1]
+        for cls, n in shape:
+            parts.append(f"{cls} {n} bad-shape")
+        for cls, n in frame:
+            parts.append(f"{cls} {n} clipped")
+        for key, n in rel:
+            parts.append(f"{key} x{n}")
+        if not parts:
+            return "detector: no boxes dropped", (120, 220, 120)
+        return ("dropped: " + ", ".join(parts), (240, 180, 60))
 
     # paint the GUI
     def draw(self, canvas):
@@ -588,7 +755,12 @@ class Operate:
         # how much it costs to leave alone -- a fruit never seen scores nothing
         # at all, a fruit seen only through a narrow arc has an unverified
         # depth (see FruitEKF.bearing_spread), and only then plain uncertainty.
-        cov_line, cov_colour = self.fruit_coverage_line()
+        if self.coverage_view == 1:
+            cov_line, cov_colour = self.detector_health_line()
+        elif self.coverage_view == 2:
+            cov_line, cov_colour = self.focal_check_line()
+        else:
+            cov_line, cov_colour = self.fruit_coverage_line()
         cov_surface = TEXT_FONT.render(cov_line[:55], False, cov_colour)
         canvas.blit(cov_surface, (h_pad+10, 624))
 
@@ -664,6 +836,12 @@ class Operate:
                 self.show_live_rmse = not self.show_live_rmse
                 state = 'ON' if self.show_live_rmse else 'OFF'
                 self.notification = f'Live RMSE tracking {state}'
+            # toggle the bottom readout: fruit coverage <-> detector health
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_v:
+                self.coverage_view = (self.coverage_view + 1) % 3
+                self.notification = ['Readout: fruit coverage',
+                                      'Readout: detector health',
+                                      'Readout: focal length check'][self.coverage_view]
             # M2: toggle automatic fruit capture-on-stop
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_a:
                 self.auto_capture_enabled = not self.auto_capture_enabled
@@ -686,6 +864,9 @@ class Operate:
                     self.obj_shot_id = 0
                     self.captures_at_pose = 0
                     self.capture_burst_pose = None
+                    self.box_skip_frame = {}
+                    self.box_skip_shape = {}
+                    self.relabel_counts = {}
 
                     # pred.txt is held open by ObjectDetector for the whole session, so it
                     # must be closed/reopened by the class itself rather than deleted here
@@ -892,9 +1073,11 @@ class Operate:
             # rest of the shot.
             if in_frame_fraction(box, FRAME_WIDTH, FRAME_HEIGHT) < IN_FRAME_FRACTION_THRESHOLD:
                 notes.append(f'{predicted_class} skipped (<{IN_FRAME_FRACTION_THRESHOLD * 100:.0f}% in frame)')
+                self.box_skip_frame[predicted_class] = self.box_skip_frame.get(predicted_class, 0) + 1
                 continue
             if not is_box_shape_plausible(predicted_class, box, self.object_dimensions):
                 notes.append(f'{predicted_class} skipped (implausible box shape)')
+                self.box_skip_shape[predicted_class] = self.box_skip_shape.get(predicted_class, 0) + 1
                 continue
 
             true_height = self.object_dimensions[predicted_class][2]
@@ -915,6 +1098,8 @@ class Operate:
             if alt_pose is not None:
                 notes.append(f'{predicted_class} relabelled as {fuse_class} '
                              f'(within {CONFUSABLE_DISTANCE_THRESHOLD * 100:.0f}cm of existing {fuse_class})')
+                key = f'{predicted_class}->{fuse_class}'
+                self.relabel_counts[key] = self.relabel_counts.get(key, 0) + 1
                 pose_x, pose_y = alt_pose
 
             dist = float(np.hypot(pose_x - robot_x, pose_y - robot_y))

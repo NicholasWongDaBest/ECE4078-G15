@@ -88,10 +88,30 @@ class Operate:
         # on the robot side).
         self.botconnect.set_pid(use_pid=1, kp=2, ki=0.04, kd=0.29)
 
-        # Create a folder "lab_output" that stores the results of the lab
+        # Create a folder "lab_output" that stores the results of the lab.
+        # Wiped on every launch, same as raw_images/ below, so a run can never
+        # be scored against leftovers from a previous one (a stale objects.txt
+        # or slam.txt is easy to mistake for this run's output).
+        #
+        # Deliberately relative, not the absolute D:\... path: it resolves to
+        # the same folder when operate.py is launched from the project
+        # directory, and it keeps working on a teammate's machine and in the
+        # marking environment.
+        #
+        # This runs BEFORE load_state(), before the rmse log is created, and
+        # before ObjectDetector opens pred.txt -- deleting the folder out from
+        # under any of those would either lose the file or fail on Windows
+        # while the handle is still open.
+        #
+        # Two consequences worth knowing: the persisted SLAM map no longer
+        # survives a restart (load_state() below will always find nothing), and
+        # any ekf_calib_log_*.json you recorded for calibrate_ekf.py is gone the
+        # next time you launch -- copy those out before relaunching if you want
+        # to keep them.
         self.lab_output_dir = 'lab_output/'
-        if not os.path.exists(self.lab_output_dir):
-            os.makedirs(self.lab_output_dir)
+        if os.path.isdir(self.lab_output_dir):
+            shutil.rmtree(self.lab_output_dir)
+        os.makedirs(self.lab_output_dir, exist_ok=True)
 
         # Initialise SLAM parameters
         self.ekf = self.init_ekf(args.calib_dir, args.ip)
@@ -171,6 +191,19 @@ class Operate:
         self.capture_pose_ang_threshold = np.deg2rad(15.0)  # or this much rotation
         self.captures_at_pose = 0
         self.capture_burst_pose = None    # (x, y, theta) the current burst started from
+
+        # Detector-health counters, per predicted class. These record the boxes
+        # process_object_estimates() throws away, which is information that was
+        # previously discarded entirely -- a class that keeps getting skipped
+        # for an implausible box shape is being occluded or merged with
+        # something, and a class that keeps getting relabelled is being
+        # confused with its CONFUSABLE_PAIRS partner. Neither shows up in any
+        # position metric, because a box that never fuses never moves an
+        # estimate. Toggle the readout with 'v'.
+        self.box_skip_frame = {}    # class -> boxes dropped for being clipped by the frame edge
+        self.box_skip_shape = {}    # class -> boxes dropped for an implausible aspect ratio
+        self.relabel_counts = {}    # 'predicted->fused' -> times the confusable fix fired
+        self.coverage_view = 0      # 0 = fruit coverage, 1 = detector health
         self.last_marker_count = 0   # number of known (tag 1-10) ArUco markers seen in the most
                                        # recent frame -- set in perform_slam(), read by
                                        # auto_capture_fruit() so it can skip a marker-free frame
@@ -532,10 +565,37 @@ class Operate:
                     f" - view from another side", (240, 180, 60))
 
         if cov['worst']:
-            label, sigma, views = cov['worst'][0]
-            return (f"worst: {label} +/-{sigma*1000:.0f}mm ({views} views)", (120, 220, 120))
+            # Ranked by risk() -- geometry, not covariance. Showing spread and
+            # closest range rather than +/-mm because those are the two things
+            # you can actually act on, and because sigma is pinned at
+            # sqrt(min_var) (~28mm) for every converged fruit, so it can't
+            # distinguish a good estimate from a bad one.
+            label, risk, spread, min_d, views = cov['worst'][0]
+            return (f"check: {label} {spread:.0f}deg arc, "
+                    f"nearest {min_d:.1f}m ({views} views)", (120, 220, 120))
 
         return "No fruit fused yet", (220, 220, 220)
+
+    def detector_health_line(self):
+        """Second readout mode ('v'): what the DETECTOR is doing wrong, which no
+        position metric can see. A box dropped by the frame/shape gates never
+        fuses, so it never moves an estimate and never shows up as uncertainty
+        -- but a class being dropped repeatedly is being occluded, merged with
+        a neighbour, or misread, and that's usually why a fruit ends up in the
+        wrong place or missing entirely."""
+        parts = []
+        shape = sorted(self.box_skip_shape.items(), key=lambda kv: -kv[1])[:2]
+        frame = sorted(self.box_skip_frame.items(), key=lambda kv: -kv[1])[:1]
+        rel = sorted(self.relabel_counts.items(), key=lambda kv: -kv[1])[:1]
+        for cls, n in shape:
+            parts.append(f"{cls} {n} bad-shape")
+        for cls, n in frame:
+            parts.append(f"{cls} {n} clipped")
+        for key, n in rel:
+            parts.append(f"{key} x{n}")
+        if not parts:
+            return "detector: no boxes dropped", (120, 220, 120)
+        return ("dropped: " + ", ".join(parts), (240, 180, 60))
 
     # paint the GUI
     def draw(self, canvas):
@@ -588,7 +648,10 @@ class Operate:
         # how much it costs to leave alone -- a fruit never seen scores nothing
         # at all, a fruit seen only through a narrow arc has an unverified
         # depth (see FruitEKF.bearing_spread), and only then plain uncertainty.
-        cov_line, cov_colour = self.fruit_coverage_line()
+        if self.coverage_view == 1:
+            cov_line, cov_colour = self.detector_health_line()
+        else:
+            cov_line, cov_colour = self.fruit_coverage_line()
         cov_surface = TEXT_FONT.render(cov_line[:55], False, cov_colour)
         canvas.blit(cov_surface, (h_pad+10, 624))
 
@@ -664,6 +727,11 @@ class Operate:
                 self.show_live_rmse = not self.show_live_rmse
                 state = 'ON' if self.show_live_rmse else 'OFF'
                 self.notification = f'Live RMSE tracking {state}'
+            # toggle the bottom readout: fruit coverage <-> detector health
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_v:
+                self.coverage_view = 1 - self.coverage_view
+                self.notification = ('Readout: detector health' if self.coverage_view
+                                      else 'Readout: fruit coverage')
             # M2: toggle automatic fruit capture-on-stop
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_a:
                 self.auto_capture_enabled = not self.auto_capture_enabled
@@ -686,6 +754,9 @@ class Operate:
                     self.obj_shot_id = 0
                     self.captures_at_pose = 0
                     self.capture_burst_pose = None
+                    self.box_skip_frame = {}
+                    self.box_skip_shape = {}
+                    self.relabel_counts = {}
 
                     # pred.txt is held open by ObjectDetector for the whole session, so it
                     # must be closed/reopened by the class itself rather than deleted here
@@ -892,9 +963,11 @@ class Operate:
             # rest of the shot.
             if in_frame_fraction(box, FRAME_WIDTH, FRAME_HEIGHT) < IN_FRAME_FRACTION_THRESHOLD:
                 notes.append(f'{predicted_class} skipped (<{IN_FRAME_FRACTION_THRESHOLD * 100:.0f}% in frame)')
+                self.box_skip_frame[predicted_class] = self.box_skip_frame.get(predicted_class, 0) + 1
                 continue
             if not is_box_shape_plausible(predicted_class, box, self.object_dimensions):
                 notes.append(f'{predicted_class} skipped (implausible box shape)')
+                self.box_skip_shape[predicted_class] = self.box_skip_shape.get(predicted_class, 0) + 1
                 continue
 
             true_height = self.object_dimensions[predicted_class][2]
@@ -915,6 +988,8 @@ class Operate:
             if alt_pose is not None:
                 notes.append(f'{predicted_class} relabelled as {fuse_class} '
                              f'(within {CONFUSABLE_DISTANCE_THRESHOLD * 100:.0f}cm of existing {fuse_class})')
+                key = f'{predicted_class}->{fuse_class}'
+                self.relabel_counts[key] = self.relabel_counts.get(key, 0) + 1
                 pose_x, pose_y = alt_pose
 
             dist = float(np.hypot(pose_x - robot_x, pose_y - robot_y))
