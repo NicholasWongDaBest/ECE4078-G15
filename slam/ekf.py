@@ -477,7 +477,7 @@ class EKF:
         y_im = int(y*m2pixel+h/2.0)
         return (x_im, y_im)
 
-    def draw_slam_state(self, res = (320, 500), not_pause=True, true_map=None, live_rmse_info=None, selected_tag=None,object_gt=None, object_estimates=None, object_rmse_info=None):
+    def draw_slam_state(self, res = (320, 500), not_pause=True, true_map=None, live_rmse_info=None, selected_tag=None,object_gt=None, object_estimates=None, object_rmse_info=None, suppressed_objects=None):
         # Draw landmarks
         m2pixel = 100
         if not_pause:
@@ -555,9 +555,12 @@ class EKF:
                 obj_type = key_0.rsplit('_', 1)[0]
                 est_xy_local = np.array([[est['x']], [est['y']]]) - center_xy
                 coor_est = self.to_im_coor((est_xy_local[0,0], est_xy_local[1,0]), res, m2pixel)
-                cv2.drawMarker(canvas, coor_est, (0, 200, 255), markerType=cv2.MARKER_DIAMOND, markerSize=8, thickness=2)
-                cv2.putText(canvas, obj_type[:3], (coor_est[0]+6, coor_est[1]+14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 255), 1, cv2.LINE_AA)
+                is_suppressed = suppressed_objects is not None and obj_type in suppressed_objects
+                colour = (140, 140, 140) if is_suppressed else (0, 200, 255)
+                cv2.drawMarker(canvas, coor_est, colour, markerType=cv2.MARKER_DIAMOND, markerSize=8, thickness=2)
+                label = obj_type[:3] + ('*' if is_suppressed else '')
+                cv2.putText(canvas, label, (coor_est[0]+6, coor_est[1]+14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA)
                 # error line only drawable if we actually have the matching ground-truth point
                 if obj_type in coor_gt_by_obj:
                     cv2.line(canvas, coor_est, coor_gt_by_obj[obj_type], (255, 120, 0), 1)
