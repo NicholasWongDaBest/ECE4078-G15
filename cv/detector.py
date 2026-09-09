@@ -54,7 +54,7 @@ class ObjectDetector:
         # numpy array assumes BGR (the cv2/training convention), so convert here
         # predict target type and bounding box with your trained YOLO
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        predictions = self.model.predict(img_bgr, imgsz=480, verbose=False)
+        predictions = self.model.predict(img_bgr, imgsz=480, verbose=False, conf=0.8, iou=0.5)
 
         # get bounding box and class label for target(s) detected
         bounding_boxes = []

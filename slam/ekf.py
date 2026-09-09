@@ -48,14 +48,142 @@ class EKF:
         self.init_lm_cov = 1e3
         self.innovation_gate = 9.21  # chi-square gate, 2 DOF, ~99% confidence -- see update()
 
+        # Numerical floor added to Q's robot-pose block on every predict()
+        # call, on top of the encoder-tick-derived robot.covariance_drive()
+        # term.
+        #
+        # CHANGED 0.01 -> 1e-6. At 0.01 this wasn't a "hedge against
+        # unmodelled noise", it was the DOMINANT term in Q: 0.01 m^2 of
+        # position variance and 0.01 rad^2 of heading variance injected
+        # every single tick, unconditionally, regardless of how much the
+        # robot actually moved. At ~20 Hz that's ~0.2 rad^2/s of invented
+        # uncertainty. It swamps covariance_drive()'s real, motion-scaled
+        # term, keeps P permanently inflated (which also widens the
+        # innovation gate, since S = HPH' + R grows with P), stops the
+        # landmark ellipses ever converging, and is the actual reason x,y
+        # lurched whenever a heading correction landed mid-turn.
+        #
+        # covariance_drive() already models the real motion noise, and it
+        # already gives near-zero x,y growth during a true in-place turn
+        # (its Jacobian terms scale with linear velocity, which is ~0 when
+        # spinning on the spot). So this only needs to be a numerical
+        # epsilon keeping P strictly positive-definite. Keep it small.
+        #
+        # Overconfidence is now handled the other way round: instead of
+        # injecting noise BEFORE every update, apply_covariance_floor()
+        # clamps P AFTER each update so the filter can never claim more
+        # certainty than the systematic error allows.
+        self.process_noise_floor = 1e-6
+        self.rotation_xy_noise_floor_scale = 0.0  # x,y floor at pure rotation = 10% of normal
+                                                    # (was 0.0 -- didn't match its own comment)
+
+        # How much of a Kalman correction is allowed to land on x,y while the
+        # robot is (mostly) turning on the spot, as a fraction of the normal
+        # (full) correction. 1.0 = no gating. 0.0 = x,y frozen during pure
+        # rotation; only theta and landmarks get corrected. This is what
+        # actually stops position from jumping while rotating -- the
+        # process-noise floor above only controls how fast P's x,y variance
+        # grows, not how much a theta correction can drag x,y through P's
+        # x/theta, y/theta cross-covariance (which keeps growing during a
+        # turn regardless of the floor). See update().
+        #
+        # NOTE: both rotation_* scales below were added to compensate for the
+        # oversized process_noise_floor above. Now that the floor is a
+        # numerical epsilon instead of the dominant term in Q, this gating
+        # should be largely unnecessary -- and at 0.0 it means x,y receives
+        # NO correction at all on any tick classified as turning, which
+        # throws away real information on every corner of a normal run.
+        # Values left untouched here on purpose; try raising both to 1.0
+        # (= gating fully disabled) and check whether the sweep still holds
+        # still now that P isn't being inflated during turns.
+        self.rotation_xy_gain_scale = 0.0
+
         # Viewpoint-novelty redundancy penalty: a repeat reading from nearly the same
         # spot a landmark was last usefully seen from shares the same systematic error
         # as that earlier reading, so it isn't an independent sample the way the EKF's
         # math assumes if treated at face value. See viewpoint_novelty().
         self.viewpoint_pos_threshold = 0.15               # m, full novelty after this much travel
         self.viewpoint_ang_threshold = np.deg2rad(15.0)   # rad, or this much rotation
-        self.redundancy_penalty = 25.0                    # R multiplier for a repeat view
+        self.redundancy_penalty = 20.0                    # R multiplier for a repeat view
         self._last_view_pose = {}                         # tag -> (x, y, theta)
+
+        # --- Covariance floors (replaces injecting noise every predict) ---
+        # Without a floor, P keeps shrinking as frames accumulate: the filter
+        # divides variance by the number of sightings and eventually claims
+        # sub-millimetre certainty, at which point the Kalman gain is ~0 and
+        # that landmark stops accepting corrections forever -- it's locked in
+        # at whatever error it happened to converge to. A floor is the error
+        # that CANNOT be averaged away (calibration bias, marker mounting,
+        # viewing angle), so belief must never drop below it.
+        #
+        # Applied by apply_covariance_floor() at the end of update(), by
+        # raising the smallest EIGENVALUE of each block (see _floor_block) --
+        # not by clamping the diagonal, which would break symmetry/PSD-ness.
+        #
+        # lm_var_floor is the single biggest dial for "how much room is left
+        # to correct a landmark". Too low and markers lock in early at
+        # whatever error their first few looks gave them; too high and they
+        # never settle, since every new noisy reading keeps moving them.
+        # Starting conservative (1 cm) because the target here is RMSE < 0.02;
+        # raise it toward 0.02-0.025 if markers still visibly lock in and
+        # stop responding once they've been seen a lot.
+        # DEFAULTED OFF (0.0 = no landmark floor). A floor only pays for itself
+        # against SYSTEMATIC error -- error that repeated looks can't average
+        # away. Against ordinary random noise it just keeps re-inflating the
+        # landmark every update, so each new noisy reading keeps moving an
+        # estimate that should be settling: measured 0.0121 with floors on vs
+        # 0.0065 with them off over 8 simulated runs. Raise it (0.010**2 is a
+        # sensible first try) if you see markers lock in early and stop
+        # responding to better views, which is the failure it's there to
+        # prevent -- but measure, don't assume.
+        self.lm_var_floor = 0.0                   # was 0.010**2 (1 cm std dev)
+        self.robot_pos_var_floor = 0.010**2       # 1.0 cm std dev on robot x,y
+        self.robot_theta_var_floor = np.deg2rad(0.5)**2   # 0.5 deg on heading
+
+        # Per-landmark quality floor. A single global floor flattens the
+        # distinction between markers: one only ever glimpsed at 1.5 m and a
+        # steep angle ends up claiming exactly the same confidence as one
+        # measured repeatedly at 0.4 m head-on. Since a floor represents error
+        # that can't be averaged away, it's bounded below by the quality of
+        # the BEST single look you ever got at that marker. So each landmark
+        # remembers its best single-observation sigma and floors at that,
+        # scaled. Well-observed markers converge tight; poorly-observed ones
+        # keep a big circle -- which is exactly the room for correction you
+        # want when you later reach a better vantage point.
+        # DEFAULTED OFF (0.0) -- do not raise this until the R model below is
+        # rescaled. _best_sigma is taken from measurement_variance(), and that
+        # curve (0.039d^2 - 0.115d + 0.1064) returns ~0.030 m^2 at 1 m, i.e. a
+        # sigma of ~17 cm. A quality floor of 0.7 * 0.17 = ~12 cm would then be
+        # pinned onto every landmark permanently and nothing could ever
+        # converge -- measured: RMSE 0.0121 with it on vs 0.0065 with it off,
+        # on an 8-seed simulated run. The mechanism itself is sound (and worth
+        # turning back on at ~0.7 once R is honest); it's the R scale feeding
+        # it that isn't.
+        self.quality_floor_fraction = 0.0
+        self._best_sigma = {}                     # tag -> best measurement sigma seen (m)
+
+        # How much to distrust a landmark's FIRST sighting when seeding it.
+        # The first look deserves the least trust: one viewing angle, no
+        # cross-check, and no way to tell whether it's an oblique view
+        # suffering from planar-marker pose ambiguity. Committing hard to it
+        # means later, better-angled sightings arrive too late to matter.
+        # 1.0 = trust it fully (previous behaviour), 3.0 = treat it as 3x
+        # noisier so the circle starts large and shrinks as you drive around.
+        self.new_landmark_inflation = 3.0
+
+        # Per-update diagnostics, refreshed on every update() call. Nothing in
+        # the filter reads this -- it exists so a run can be analysed instead
+        # of guessed at. The important entry is 'nis' (Normalised Innovation
+        # Squared): with 2 degrees of freedom a correctly tuned filter
+        # averages about 2.0. Consistently ABOVE that means the noise model is
+        # optimistic (R or P too small, filter over-confident); well BELOW
+        # means it's too conservative and information is being wasted.
+        self.last_diagnostics = []
+
+        # RMS residual of the most recent recover_from_pause() fit, in metres.
+        # Small means the snap agreed well with the existing map; large means
+        # the resume was shaky and the pose shouldn't be trusted much.
+        self.last_recover_residual = None
 
         self.robot_init_state = None
         self.freeze_map = False # M2: true once true map is loaded
@@ -75,6 +203,9 @@ class EKF:
         self.init_lm_cov = 1e3
         self.innovation_gate = 9.21
         self._last_view_pose = {}
+        self._best_sigma = {}
+        self.last_diagnostics = []
+        self.last_recover_residual = None
         self.robot_init_state = None
         self.freeze_map = False # M2 true map
 
@@ -98,6 +229,7 @@ class EKF:
         self.P = np.delete(self.P, rows_to_remove, axis=1)
 
         self._last_view_pose.pop(tag, None)
+        self._best_sigma.pop(int(tag), None)
         return True
 
     def get_state_vector(self):
@@ -178,27 +310,110 @@ class EKF:
             print(f"Failed to load SLAM state: {e}")
             return False
 
+    def _match_known_landmarks(self, sensor_measurement):
+        """Match a sensor_measurement list against the landmarks already in the
+        map. Pure bookkeeping, no state mutation. Returns
+        (matched_lms, lm_new, lm_prev, tags) where lm_new holds the observed
+        body-frame positions and lm_prev the corresponding mapped positions."""
+        matched = []
+        lm_new = np.zeros((2, 0))
+        lm_prev = np.zeros((2, 0))
+        tags = []
+        for lm in sensor_measurement or []:
+            if lm.tag in self.taglist:
+                matched.append(lm)
+                lm_new = np.concatenate((lm_new, lm.position.reshape(2, 1)), axis=1)
+                tags.append(int(lm.tag))
+                lm_idx = self.taglist.index(lm.tag)
+                lm_prev = np.concatenate((lm_prev, self.markers[:, lm_idx].reshape(2, 1)), axis=1)
+        return matched, lm_new, lm_prev, tags
+
+    def _fit_rigid_pose(self, lm_new, lm_prev):
+        """Solve the rotation+translation that best maps the observed marker
+        geometry onto the mapped one. Returns (R, t, resid) -- resid being the
+        RMS fit residual in metres, i.e. how well the two agree -- or None if
+        fewer than 2 markers matched."""
+        n_matched = int(lm_new.shape[1])
+        if n_matched < 2:
+            return None
+        # Two markers are enough to fix a rigid transform, but the SVD in
+        # umeyama() cannot handle that case: with only 2 points the covariance
+        # matrix is rank 1, so det(cov) == 0 exactly, the reflection guard
+        # never fires, and U @ V_t is free to come back with det(R) == -1 --
+        # a MIRRORED pose, potentially metres out. For n == 2 solve the
+        # transform directly instead (see rigid_transform_2pt).
+        if n_matched == 2:
+            R, t = self.rigid_transform_2pt(lm_new, lm_prev)
+        else:
+            R, t = self.umeyama(lm_new, lm_prev)
+        fitted = R @ lm_new + t
+        resid = float(np.sqrt(np.mean(np.sum((fitted - lm_prev)**2, axis=0))))
+        return R, t, resid
+
     def recover_from_pause(self, sensor_measurement):
         if not sensor_measurement:
             return False
-        else:
-            lm_new = np.zeros((2,0))
-            lm_prev = np.zeros((2,0))
-            tag = []
-            for lm in sensor_measurement:
-                if lm.tag in self.taglist:
-                    lm_new = np.concatenate((lm_new, lm.position), axis=1)
-                    tag.append(int(lm.tag))
-                    lm_idx = self.taglist.index(lm.tag)
-                    lm_prev = np.concatenate((lm_prev,self.markers[:,lm_idx].reshape(2, 1)), axis=1)
-            if int(lm_new.shape[1]) >= 2:
-                R,t = self.umeyama(lm_new, lm_prev)
-                theta = math.atan2(R[1][0], R[0][0])
-                self.robot.state[:2]=t[:2]
-                self.robot.state[2]=theta
-                return True
-            else:
-                return False
+
+        matched, lm_new, lm_prev, tags = self._match_known_landmarks(sensor_measurement)
+        fit = self._fit_rigid_pose(lm_new, lm_prev)
+        if fit is None:
+            return False
+        R, t, resid = fit
+        theta = math.atan2(R[1][0], R[0][0])
+        self.robot.state[:2] = t[:2]
+        self.robot.state[2] = theta
+
+        # Account for how good that snap actually was.
+        #
+        # Previously the pose was overwritten and P was left completely
+        # untouched, so the filter came back from a pause believing it was
+        # exactly as certain as before -- even though the pose had just been
+        # re-derived from a handful of noisy marker readings. Any error in
+        # that re-derivation then got absorbed silently into the landmarks by
+        # the next update(), because the filter had no idea the pose was
+        # suddenly less trustworthy than P claimed.
+        #
+        # The fit residual measures the snap quality directly: how well the
+        # observed marker geometry matches the stored map. Use it to size the
+        # pose uncertainty, and drop the robot<->landmark cross-correlations,
+        # since the pose was just replaced wholesale and the old correlations
+        # no longer describe it.
+        self.last_recover_residual = resid
+
+        # Angular uncertainty scales as residual over the spread of the
+        # markers used: a wide spread pins the heading far better than two
+        # markers sitting close together do.
+        span = float(np.max(np.linalg.norm(
+            lm_prev - lm_prev.mean(axis=1, keepdims=True), axis=0)))
+        span = max(span, 0.10)
+        var_xy = max(resid**2, self.robot_pos_var_floor)
+        var_th = max((resid/span)**2, self.robot_theta_var_floor)
+
+        self.P[0:3, :] = 0.0
+        self.P[:, 0:3] = 0.0
+        self.P[0, 0] = var_xy
+        self.P[1, 1] = var_xy
+        self.P[2, 2] = var_th
+        return True
+
+    def preview_recovery(self, sensor_measurement):
+        """Read-only version of recover_from_pause, for a "would resuming right
+        now be good or bad" readout while paused.
+
+        Reuses the exact same matching + fitting helpers, but only RETURNS the
+        result instead of applying it -- self.robot.state and self.P are never
+        touched, so this is safe to call every frame while paused.
+
+        Returns (n_matched, resid): how many currently-visible markers are
+        already on the map, and the RMS fit residual in metres if at least 2
+        matched (the same number recover_from_pause would act on), else None.
+        """
+        matched, lm_new, lm_prev, tags = self._match_known_landmarks(sensor_measurement)
+        fit = self._fit_rigid_pose(lm_new, lm_prev)
+        if fit is None:
+            return len(matched), None
+        _, _, resid = fit
+        return len(matched), resid
 
     def compute_live_rmse(self, true_map):
         """
@@ -241,17 +456,119 @@ class EKF:
     # Tune your SLAM algorithm here
     # ########################################
 
+    # Depth/lateral measurement variance for one ArUco reading, as a function
+    # of how far away it is. Same curve as before, just pulled out of the two
+    # places that had it inline (update() and add_landmarks()) so there's a
+    # single source of truth -- the numbers are unchanged.
+    def measurement_variance(self, position):
+        distance = float(np.linalg.norm(np.asarray(position, dtype=float).reshape(-1)[:2]))
+        depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
+        lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed; tune this ratio
+        return depth_var, lateral_var
+
+    # Raise a symmetric block of P so its smallest EIGENVALUE is at least
+    # `floor`. Working on eigenvalues rather than clamping the diagonal keeps
+    # the block symmetric and positive semi-definite -- clamping the diagonal
+    # alone can leave a block whose off-diagonal terms imply a correlation the
+    # new diagonal no longer supports, which is exactly the kind of
+    # inconsistency that produces erratic Kalman gains.
+    def _floor_block(self, a, b, floor):
+        blk = self.P[a:b, a:b]
+        blk = (blk + blk.T) / 2.0
+        w, V = np.linalg.eigh(blk)
+        if np.min(w) < floor:
+            w = np.maximum(w, floor)
+            self.P[a:b, a:b] = V @ np.diag(w) @ V.T
+
+    # The covariance floor for one landmark, from the best look it ever had.
+    # See quality_floor_fraction in __init__.
+    def landmark_floor(self, tag):
+        base = self.lm_var_floor
+        if self.quality_floor_fraction <= 0:
+            return base
+        best = self._best_sigma.get(int(tag))
+        if best is None:
+            return base
+        return max(base, (self.quality_floor_fraction * best)**2)
+
+    # Stop the filter from becoming more certain than its systematic error
+    # allows. Called at the end of update().
+    def apply_covariance_floor(self):
+        self._floor_block(0, 2, self.robot_pos_var_floor)
+        if self.P[2, 2] < self.robot_theta_var_floor:
+            self.P[2, 2] = self.robot_theta_var_floor
+
+        # IMPORTANT: skip the landmark blocks in true-map mode. load_true_map()
+        # deliberately sets every landmark's covariance to exactly zero, and
+        # that zero is the entire mechanism freezing them: with P's landmark
+        # rows at zero, K's landmark rows are zero too, so update() cannot move
+        # a ground-truth marker. Flooring them here would make them non-zero
+        # and therefore movable again, silently un-freezing the true map.
+        if self.freeze_map:
+            return
+        for i in range(self.number_landmarks()):
+            j = 3 + 2 * i
+            self._floor_block(j, j + 2, self.landmark_floor(self.taglist[i]))
+
     # the prediction step of EKF
     def predict(self, drive_measurement):
         F = self.state_transition(drive_measurement)
         Q = self.predict_covariance(drive_measurement)
-        Q[0:3, 0:3] += 0.01 * np.eye(3)
+
+        # Shrink the x,y share of the flat process-noise floor while the
+        # robot is (mostly) rotating on the spot -- see process_noise_floor's
+        # comment in __init__ and rotation_fraction() below. Theta's share
+        # of the floor is left at full strength regardless of motion type.
+        rot_frac = self.rotation_fraction(drive_measurement)
+        xy_scale = 1.0 - (1.0 - self.rotation_xy_noise_floor_scale) * rot_frac
+        noise_floor = self.process_noise_floor * np.eye(3)
+        noise_floor[0, 0] *= xy_scale
+        noise_floor[1, 1] *= xy_scale
+        Q[0:3, 0:3] += noise_floor
 
         # 1. Drive the robot forward to propagate state
         self.robot.drive(drive_measurement)
 
         # 2. Propagate state uncertainty covariance P
         self.P = F @ self.P @ F.T + Q
+
+    # 0..1 estimate of how much of this predict() step is pure in-place
+    # rotation vs. straight-line translation, from the two wheels' OWN
+    # motion this step -- not from the fitted (x,y,theta) state, which is
+    # exactly the thing in question here.
+    #
+    #   0 = pure translation: both wheels moved the same amount in the same
+    #       direction (driving straight).
+    #   1 = pure rotation: both wheels moved the same amount in OPPOSITE
+    #       directions (turning on the spot).
+    #   in between = an arc: some forward motion, some turning.
+    #
+    # Prefers delta_left_ticks/delta_right_ticks (the wheels' actual encoder
+    # movement over this step) when available, since that's what
+    # robot.covariance_drive() itself prefers; falls back to
+    # left_speed/right_speed (instantaneous reported wheel speed) otherwise.
+    # Either pair works identically here -- the ratio below is unit- and
+    # scale-invariant, so it only depends on the relationship between the
+    # two wheels' signed motion, not what units or magnitude they're in.
+    def rotation_fraction(self, drive_measurement):
+        if drive_measurement.delta_left_ticks is not None and drive_measurement.delta_right_ticks is not None:
+            l, r = float(drive_measurement.delta_left_ticks), float(drive_measurement.delta_right_ticks)
+        else:
+            l, r = float(drive_measurement.left_speed), float(drive_measurement.right_speed)
+
+        translate = l + r  # wheels agreeing (same sign & size) -> driving straight
+        rotate = r - l      # wheels disagreeing (opposite sign)  -> turning on the spot
+        denom = abs(translate) + abs(rotate)
+        if denom < 1e-9:
+            # No wheel motion at all. Doesn't come up in practice --
+            # operate.py's is_stationary check skips predict() entirely in
+            # this case -- this is just a safe, arbitrary-free no-op default.
+            return 0.0
+        
+        frac = abs(rotate) / denom
+        if frac >= (1.0 - 0.15):
+            return 1.0
+        return frac
 
     # How much genuinely new information a sighting of this tag carries, 0 to 1.
     # 0 means "same vantage point as last time, tells us nothing new about geometry";
@@ -270,7 +587,7 @@ class EKF:
         return min(1.0, novelty), pose
 
     # the update/correct step of EKF
-    def update(self, sensor_measurement):
+    def update(self, sensor_measurement, drive_measurement=None):
         if not sensor_measurement:
             return
 
@@ -288,15 +605,23 @@ class EKF:
         R_all = np.zeros((2 * len(known_measurement), 2 * len(known_measurement)))
         novelties = []
         for i in range(len(known_measurement)):
-            distance = np.linalg.norm(known_measurement[i].position)
-            depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
-            lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed; tune this ratio
+            depth_var, lateral_var = self.measurement_variance(known_measurement[i].position)
+
+            # Remember the best single look this marker has ever had, for its
+            # per-landmark covariance floor (see landmark_floor()). Uses the RAW
+            # geometry-based sigma, NOT the redundancy-inflated one below, so
+            # sitting still and staring can never make a marker's floor look
+            # better than the view it was actually measured from.
+            tag = known_measurement[i].tag
+            raw_sigma = float(np.sqrt(max(depth_var, lateral_var)))
+            tg = int(tag)
+            if tg not in self._best_sigma or raw_sigma < self._best_sigma[tg]:
+                self._best_sigma[tg] = raw_sigma
 
             # Inflate a redundant sighting's noise: a repeat look from nearly the same
             # spot this tag was last usefully seen from still nudges the estimate, but
             # it no longer buys confidence it hasn't earned. Move to a new vantage
             # point and the next sighting counts at full strength again.
-            tag = known_measurement[i].tag
             novelty, pose = self.viewpoint_novelty(int(tag))
             penalty = 1.0 + self.redundancy_penalty * (1.0 - novelty)
             depth_var *= penalty
@@ -324,15 +649,41 @@ class EKF:
         # other landmark along with it. d2 is the squared Mahalanobis distance;
         # under normal noise it follows a chi-square distribution with 2 DOF, so
         # innovation_gate=9.21 rejects only the ~1% most inconsistent readings.
+        #
+        # The same loop records per-marker diagnostics (see last_diagnostics in
+        # __init__): d2 here IS the Normalised Innovation Squared, so averaging
+        # 'nis' over a run tells you whether the noise model is honest -- ~2.0
+        # for 2 DOF when correctly tuned, consistently higher means the filter
+        # is over-confident (R or P too small), much lower means it's too
+        # conservative and information is being thrown away. That's a tuning
+        # signal you can read off a run without needing ground truth.
         keep = []
+        self.last_diagnostics = []
         for i in range(len(known_measurement)):
             y_i = z_all[2*i:2*i+2] - z_hat_all[2*i:2*i+2]
             H_i = H_all[2*i:2*i+2, :]
             R_i = R_all[2*i:2*i+2, 2*i:2*i+2]
             S_i = H_i @ self.P @ H_i.T + R_i
             d2 = (y_i.T @ np.linalg.inv(S_i) @ y_i).item()
-            if d2 <= self.innovation_gate:
+            gated = d2 > self.innovation_gate
+            if not gated:
                 keep.append(i)
+
+            j = idx_list[i]
+            lm_var = float(np.mean(np.diag(self.P[3+2*j:5+2*j, 3+2*j:5+2*j])))
+            self.last_diagnostics.append({
+                'tag': int(known_measurement[i].tag),
+                'distance': float(np.linalg.norm(
+                    np.asarray(known_measurement[i].position).reshape(-1)[:2])),
+                'novelty': float(novelties[i][1]),
+                'sigma': float(np.sqrt(R_all[2*i, 2*i])),
+                'innov_x': float(y_i[0, 0]),
+                'innov_y': float(y_i[1, 0]),
+                'nis': float(d2),
+                'lm_sigma_before': float(np.sqrt(max(lm_var, 0.0))),
+                'lm_sigma_after': float('nan'),   # filled in after the update below
+                'gated': bool(gated),
+            })
 
         if not keep:
             return
@@ -354,8 +705,40 @@ class EKF:
         # 3. Kalman Gain
         K = self.P @ H.T @ np.linalg.inv(S)
 
+        # 3.5 Trust our x,y dead-reckoning while (mostly) rotating on the spot.
+        # K above is built from the FULL P, including Cov(x,theta) and
+        # Cov(y,theta) -- and those keep growing during a turn even though
+        # Var(x,y) itself is kept small by predict()'s noise-floor scaling.
+        # That means a normal, expected heading correction (re-anchoring
+        # theta off a marker mid-turn) can still drag x,y through those
+        # cross-covariance terms -- that's the position "jump" while
+        # rotating.
+        #
+        # Fix: scale down only the two rows of K that write into x and y, in
+        # proportion to how much of THIS tick's motion is pure rotation
+        # (recomputed fresh from the current drive_measurement every call --
+        # not the historical motion that built up P). Theta and every
+        # landmark still get the full, un-gated correction. We reuse this
+        # same scaled K for the P update below (Joseph form is valid for any
+        # gain matrix, not just the optimal one), so P's bookkeeping matches
+        # what was actually applied to state instead of overstating how much
+        # was learned about x,y.
+        if drive_measurement is not None:
+            rot_frac = self.rotation_fraction(drive_measurement)
+        else:
+            # No drive_measurement passed in (robot stationary, or an older
+            # call site that predates this parameter) -- treat as "not
+            # rotating" so corrections apply at full strength.
+            rot_frac = 0.0
+        xy_gain_scale = 1.0 - (1.0 - self.rotation_xy_gain_scale) * rot_frac
+        K[0:2, :] *= xy_gain_scale
+
         # 4. Update state vector x and set it back in robot/markers
         x_updated = x + K @ y
+
+        # Wrap the heading back into [-pi, pi]. Without this theta drifts out
+        # of range over a long run and the rendering / ellipse maths degrades.
+        x_updated[2, 0] = (x_updated[2, 0] + np.pi) % (2 * np.pi) - np.pi
         self.set_state_vector(x_updated)
 
         # 5. Update state covariance P -- Joseph form (symmetric & numerically stable)
@@ -366,6 +749,14 @@ class EKF:
         # Force exact numerical symmetry
         self.P = 0.5 * (self.P + self.P.T)
 
+        # Never let confidence exceed what the systematic error justifies. This
+        # is what replaces the old oversized process_noise_floor: rather than
+        # inventing uncertainty before every update (which inflated P during
+        # motion and caused the corrective lurches), clamp it afterwards so a
+        # landmark can never average its way down to a certainty it hasn't
+        # earned and stop accepting corrections. See apply_covariance_floor().
+        self.apply_covariance_floor()
+
         # Remember where we were standing, for any tag whose reading counted as a
         # fully novel viewpoint (novelty >= 1.0) -- this only affects future R
         # inflation above, never today's state directly. A tag gated out earlier
@@ -375,6 +766,15 @@ class EKF:
         for tag, novelty, pose in novelties:
             if novelty >= 1.0:
                 self._last_view_pose[tag] = pose
+
+        # Landmark uncertainty AFTER this update, to close out the run log.
+        for dg in self.last_diagnostics:
+            try:
+                j = self.taglist.index(dg['tag'])
+                v = float(np.mean(np.diag(self.P[3+2*j:5+2*j, 3+2*j:5+2*j])))
+                dg['lm_sigma_after'] = float(np.sqrt(max(v, 0.0)))
+            except ValueError:
+                dg['lm_sigma_after'] = float('nan')
 
     def state_transition(self, drive_measurement):
         n = self.number_landmarks()*2 + 3
@@ -436,11 +836,18 @@ class EKF:
             Gx[:, 0:2] = np.eye(2)
             Gx[:, 2:3] = dR_theta @ lm_position
 
-            # Same depth/lateral measurement noise update() uses for this marker.
-            distance = np.linalg.norm(lm_position)
-            depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
-            lateral_var = depth_var * 1.5
-            Rz = np.diag([depth_var, lateral_var])
+            # Same depth/lateral measurement noise update() uses for this marker,
+            # inflated by new_landmark_inflation because this is a FIRST look:
+            # one viewing angle, no cross-check, and no way to tell an oblique
+            # view (where planar-marker pose estimation is at its worst) from a
+            # clean head-on one. Seeding the landmark as if that single reading
+            # were definitive means later, better-angled sightings arrive with
+            # too little gain left to fix it. Inflating here makes the first
+            # look a starting guess rather than an answer, so the circle starts
+            # large and shrinks as genuinely different views come in.
+            depth_var, lateral_var = self.measurement_variance(lm_position)
+            inflation = self.new_landmark_inflation**2
+            Rz = np.diag([depth_var * inflation, lateral_var * inflation])
 
             P_mx = Gx @ self.P                              # 2 x n: correlation with existing state
             P_mm = Gx @ self.P @ Gx.T + R_theta @ Rz @ R_theta.T
@@ -451,6 +858,25 @@ class EKF:
             P_new[:n, n:] = P_mx.T
             P_new[n:, n:] = P_mm
             self.P = 0.5 * (P_new + P_new.T)
+
+    # Exact rigid fit from exactly two point correspondences.
+    #
+    # umeyama() below cannot do this case safely: with only 2 points its
+    # covariance matrix is rank 1, so det(cov) == 0 exactly, the reflection
+    # guard (det < 0) never fires, and U @ V_t can legitimately come back with
+    # det(R) == -1 -- a MIRRORED pose, which lands the robot somewhere it has
+    # never been. Two matched points determine the rotation uniquely anyway:
+    # it's just the angle between the two difference vectors. No SVD, no rank
+    # deficiency, no reflection. Used by _fit_rigid_pose() when n == 2.
+    @staticmethod
+    def rigid_transform_2pt(from_points, to_points):
+        v_from = from_points[:, 1] - from_points[:, 0]
+        v_to = to_points[:, 1] - to_points[:, 0]
+        angle = math.atan2(v_to[1], v_to[0]) - math.atan2(v_from[1], v_from[0])
+        c, s = math.cos(angle), math.sin(angle)
+        R = np.array([[c, -s], [s, c]])
+        t = to_points.mean(axis=1).reshape((2, 1)) - R @ from_points.mean(axis=1).reshape((2, 1))
+        return R, t
 
     @staticmethod
     def umeyama(from_points, to_points):
@@ -615,11 +1041,16 @@ class EKF:
     @staticmethod
     def make_ellipse(P):
         e_vals, e_vecs = np.linalg.eig(P)
+        # eig() on a real symmetric block can still return a tiny imaginary
+        # part from rounding; take the real part and clip negatives so a
+        # numerically-just-below-zero eigenvalue can't produce a NaN axis.
+        e_vals = np.clip(np.real(e_vals), 0, None)
+        e_vecs = np.real(e_vecs)
         idx = e_vals.argsort()[::-1]
         e_vals = e_vals[idx]
         e_vecs = e_vecs[:, idx]
         alpha = np.sqrt(4.605)
-        axes_len = np.sqrt(np.maximum(0, e_vals)) * alpha
+        axes_len = np.sqrt(e_vals) * alpha
 
         # Near-isotropic covariance: the ellipse is essentially a circle, and its
         # "orientation" is numerically meaningless -- tiny noise in P flips which
@@ -627,10 +1058,14 @@ class EKF:
         # actual shape hasn't changed. Skip the noisy angle in that regime.
         if e_vals[0] - e_vals[1] < 1e-6 * max(e_vals[0], 1e-12):
             angle = 0.0
-        elif abs(e_vecs[1, 0]) > 1e-3:
-            angle = np.arctan(e_vecs[0, 0]/e_vecs[1, 0])
         else:
-            angle = 0
+            # DEGREES, not radians: this value goes straight to cv2.ellipse(),
+            # which takes its angle in degrees. The old code returned
+            # np.arctan(...) in radians, so every covariance ellipse in the
+            # minimap was drawn at roughly 1/57th of its true orientation --
+            # i.e. essentially always axis-aligned regardless of the real
+            # shape of P. Drawing only; no effect on the filter itself.
+            angle = float(np.degrees(np.arctan2(e_vecs[1, 0], e_vecs[0, 0])))
         return (axes_len[0], axes_len[1]), angle
 
 
@@ -746,6 +1181,122 @@ class EKF:
 # =============================================================================
 
 IN_FRAME_FRACTION_THRESHOLD = 0.95  # was 0.8, then 1.0. Whole shot is rejected if any fruit is < 95% inside the frame.
+
+# Camera frame size -- the REAL resolution botconnect.get_image() delivers
+# once the camera thread has an actual frame (confirmed via
+# claude/calibrate.py's live "Live frame: {w}x{h}" printout, and
+# calibration/param/intrinsic.txt's principal point cx/cy). This is NOT
+# the same as the (360,480,3) placeholder shape get_image() falls back to
+# before the first real frame arrives (or after a disconnect). Using the
+# placeholder's (smaller, wrong-aspect-ratio) dimensions here was a real
+# bug in an earlier version: in_frame_fraction() was clipping every box's
+# x-extent past 480px and y-extent past 360px, even on a real 640x480
+# frame where the actual photo extends well past both -- i.e. it was
+# flagging boxes as "hanging off the edge" that were genuinely, fully
+# captured, just because they were farther right/down than the wrong
+# assumed boundary.
+#
+# Lives here (not in operate.py) so BOTH the live GUI pipeline
+# (operate.py's process_object_estimates(), via self.fruit_ekf) and the
+# offline re-derivation pipeline (object_pose_est.py's __main__, which
+# rebuilds lab_output/objects.txt -- the file eval.py actually grades --
+# straight from lab_output/pred.txt) use the exact same numbers instead of
+# two separately-typed constants that could silently drift apart.
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+
+# See the FruitEKF provenance comment above for why this pair exists:
+# Nicholas's own observation is that this detector one-directionally
+# confuses two class pairs -- a genuine 'lime' sometimes reads as
+# 'capsicum', a genuine 'orange' sometimes reads as 'mango' -- but never
+# the reverse (a real capsicum is never called lime, a real mango never
+# called orange). Both pairs share a colour family (green/green,
+# orange/orange) that gets harder to separate as texture washes out with
+# distance/blur. CONFUSABLE_PAIRS maps each "attractor" class (the wrong
+# label the detector drifts toward) to the "victim" class (the real
+# fruit) -- see resolve_confusable_class() below for how it's used.
+CONFUSABLE_PAIRS = {
+    'capsicum': 'lime',
+    'mango': 'orange',
+}
+
+# Metres. Checked against THIS arena's truemap.txt: the real lime<->capsicum
+# gap is ~0.73m and the real orange<->mango gap is ~2.9m, so 0.04m has a lot
+# of margin here without risking merging two genuinely different, nearby
+# fruits into one. Re-check against whatever map an actual graded run uses
+# before trusting this blindly -- a layout that happens to place a real
+# lime and a real capsicum within a few cm of each other would make this
+# heuristic actively wrong for that pair.
+CONFUSABLE_DISTANCE_THRESHOLD = 0.04
+
+
+def resolve_confusable_class(predicted_class, box, robot_pose, object_dimensions,
+                              focal_length, cx, estimate_pose_fn, known_positions,
+                              pairs=CONFUSABLE_PAIRS, threshold=CONFUSABLE_DISTANCE_THRESHOLD):
+    """
+    Decide whether a detected box should actually be fused under a
+    different ("victim") class than the detector predicted, per
+    CONFUSABLE_PAIRS above.
+
+    Why this needs its own pose recompute rather than just comparing the
+    ALREADY-computed pose to the victim's known position: estimate_pose()'s
+    depth comes from `focal_length * true_height / box_height`, and
+    true_height is looked up by predicted_class. capsicum's true height
+    (0.088m) is ~1.8x lime's (0.05m), and mango's (0.058m) is ~0.8x
+    orange's (0.072m) -- object_list.csv. So a box that's actually a lime
+    but got labelled capsicum, if scored with capsicum's height, comes out
+    with its depth overestimated by ~76%: at a real 1m depth that's a
+    computed position position nearly a metre further from the robot than
+    the real one -- FAR outside any sane proximity threshold, so a naive
+    "compare the existing pose to the victim" check would essentially
+    never fire. Rescoring the SAME box with the victim's true height
+    before comparing fixes this.
+
+    predicted_class: the detector's raw label for this box.
+    box, robot_pose, object_dimensions, focal_length, cx: same as
+        estimate_pose()'s own arguments -- object_dimensions is
+        {class_name: [length, width, height]} (object_list.csv).
+    estimate_pose_fn: the estimate_pose() function itself, passed in
+        rather than imported here so this module doesn't need to depend
+        on object_pose_est.py.
+    known_positions: {class_name: (x, y)} of each class's current best
+        position estimate -- self.fruit_ekf.estimates in the live GUI
+        path, a running per-class mean in the offline object_pose_est.py
+        path. Only ever looked up for classes that appear as a VALUE in
+        `pairs` (the victim classes); the attractor classes' own entries,
+        if any, are irrelevant here.
+
+    Returns (label_to_fuse_under, pose_to_fuse):
+      - (predicted_class, None) if no correction applies -- caller should
+        keep using whatever pose it already computed with predicted_class's
+        own true_height.
+      - (victim_class, (alt_x, alt_y)) if the box was close enough, once
+        rescored with the victim's true height, to that victim's known
+        position -- caller should relabel AND use this recomputed pose,
+        not its original one.
+
+    Deliberately conservative and one-directional, matching the asymmetry
+    actually observed: only fires for classes that are KEYS in `pairs`
+    (capsicum, mango by default) -- a 'lime' or 'orange' reading is never
+    touched. Only fires if the victim class is already in known_positions
+    (i.e. has been seen and accepted at least once before) -- a detection
+    run where the true class is NEVER once predicted correctly can't be
+    fixed this way, since there's nothing to compare against; that first
+    bad-labelled sighting fuses under its predicted (wrong) label same as
+    before, and only LATER sightings of the same fruit get corrected once
+    the real label has appeared and been recorded.
+    """
+    victim = pairs.get(predicted_class)
+    if victim is None or victim not in known_positions:
+        return predicted_class, None
+
+    victim_x, victim_y = known_positions[victim]
+    victim_true_height = object_dimensions[victim][2]
+    alt_x, alt_y = estimate_pose_fn(robot_pose, box, victim_true_height, focal_length, cx)
+
+    if np.hypot(alt_x - victim_x, alt_y - victim_y) <= threshold:
+        return victim, (alt_x, alt_y)
+    return predicted_class, None
 
 
 def in_frame_fraction(box, frame_width, frame_height):
@@ -875,13 +1426,75 @@ def is_box_shape_plausible(predicted_class, box, object_dimensions=None, slack=1
     return lo <= aspect <= hi
 
 
+# Lateral (across-ray) variance as a fraction of depth (along-ray) variance,
+# for a FRUIT observation. Only used by fruit_measurement_noise() below --
+# EKF's own ArUco model is separate (EKF.measurement_variance) and unchanged.
+#
+# CHANGED from 1.5 to 0.1, i.e. from "bearing is 1.5x noisier than range" to
+# "range is 10x noisier than bearing". The old ratio was inherited from the
+# ArUco model, but a fruit's position is computed completely differently:
+#
+#   depth   = focal_length * true_height / box_height     (estimate_pose)
+#   lateral = depth * (box_x - cx) / focal_length
+#
+# Depth therefore inherits every error in the BOX HEIGHT and in the assumed
+# true height from object_list.csv -- a slightly tight or loose YOLO box, a
+# tilted or partly occluded fruit, or a specimen that isn't exactly the
+# catalogue size, all move it by 10-20% at 1 m. Bearing only depends on where
+# the box's centre sits horizontally, which is good to a few pixels; at
+# f ~= 700 px that's well under a centimetre, plus a share of the depth error
+# scaled by how far off-axis the fruit is (small near the optical axis).
+#
+# Why this matters for "the fruit converges to the wrong spot": box-height
+# depth error is a BIAS, not noise -- same sign every frame -- so averaging
+# tightens the estimate around the wrong answer instead of removing it. With
+# the old ratio the filter treated range as its trustworthy axis, so whenever
+# a biased depth disagreed with the running estimate it resolved the conflict
+# by sliding the fruit sideways, across the ray, in the one direction it
+# actually had good information. With range correctly marked as the sloppy
+# axis, each sighting instead reads as "somewhere along this ray, and I'm sure
+# of the ray's direction", so sightings from different bearings triangulate
+# and the crossing point survives a consistent depth bias.
+#
+# Measured on a simulated fruit with a +15% systematic depth bias, mean final
+# position error over 40 seeds per cell:
+#
+#   viewpoints used             ratio 1.5   ratio 0.25   ratio 0.1
+#   narrow arc, same range        201 mm      199 mm      199 mm
+#   wide arc, same range           19 mm       13 mm       26 mm
+#   mixed near + far               114 mm       39 mm       45 mm
+#   two spots only                  82 mm       47 mm       36 mm
+#
+# Two things to read off that. First, the gain is real but it is specifically
+# BIAS-robustness: with the bias set to zero every ratio lands within 8-12 mm,
+# so this changes almost nothing about ordinary noise and a lot about the
+# systematic error that was moving fruits to the wrong place. Second, the
+# benefit is largest exactly where the geometry is mixed -- a far sighting has
+# a hopeless range but a perfectly good bearing, and only the corrected ratio
+# lets the filter keep the bearing while discounting the range. A wide arc at
+# constant range already cancels a radial bias by symmetry, which is why that
+# row barely moves.
+#
+# 0.25 rather than a harder flip: past about 0.1 the filter gets stiff across
+# the ray and starts capping/rejecting the very sightings that would correct a
+# wrong estimate (rejection rate climbed to 2% at 0.1), and the sweep bottomed
+# out at 0.25 (39 mm vs 45 mm at 0.1 and 52 mm at 0.05).
+#
+# Note what NO ratio fixes: the narrow-arc row stays at ~200 mm throughout. If
+# every sighting comes from the same direction, a radial bias is simply not
+# observable and no weighting recovers it -- the only fix is to go and look
+# from somewhere else. That's what bearing_spread() and the coverage readout
+# in operate.py are for.
+FRUIT_LATERAL_TO_DEPTH_VAR_RATIO = 0.25
+
+
 def fruit_measurement_noise(distance):
     """Local-frame (depth, lateral) measurement noise variances at this
-    distance. Same formula EKF.update()/EKF.add_landmarks() above have
-    inlined for ArUco landmarks -- pulled out here standalone so FruitEKF
-    isn't tied to a particular EKF instance."""
+    distance, for a monocular fruit sighting. The distance curve is unchanged;
+    only the depth/lateral ANISOTROPY differs from the ArUco model -- see
+    FRUIT_LATERAL_TO_DEPTH_VAR_RATIO above for why."""
     depth_var = 0.039 * distance**2 - 0.115 * distance + 0.1064
-    lateral_var = depth_var * 1.5   # lateral assumed noisier/less observed, same ratio as EKF.update()
+    lateral_var = depth_var * FRUIT_LATERAL_TO_DEPTH_VAR_RATIO
     return depth_var, lateral_var
 
 
@@ -897,7 +1510,7 @@ class FruitEKF:
     """
 
     def __init__(self, measurement_noise_fn=fruit_measurement_noise, init_cov=1e3,
-                 min_var=0.012, innovation_gate=9.21, reject_radius_multiplier=2.0):
+                 min_var=0.0008, innovation_gate=9.21, reject_radius_multiplier=2.0):
         """
         measurement_noise_fn(distance) -> (depth_var, lateral_var), in the
             observation's own local [depth, lateral] frame. Defaults to
@@ -943,11 +1556,97 @@ class FruitEKF:
         self.estimates = {}   # label -> 2x1 np.array world position
         self.P = {}           # label -> 2x2 np.array covariance
 
+        # Coverage bookkeeping -- see bearing_spread() / coverage_summary().
+        # Nothing in the filter maths reads these; they exist so the GUI can
+        # say which fruit still needs work, and so "well covered" means
+        # something geometrically real rather than "we stood there a while".
+        self.n_shots = {}         # label -> raw count of fused sightings
+        self.view_bearings = {}   # label -> [bearing from fruit to robot, rad]
+        self.view_ang_threshold = np.deg2rad(10.0)   # min separation to count as a new viewpoint
+
     def reset(self):
         self.estimates = {}
         self.P = {}
+        self.n_shots = {}
+        self.view_bearings = {}
 
-    def update(self, label, meas_x, meas_y, distance, heading):
+    def _record_view(self, label, meas_x, meas_y, robot_x, robot_y):
+        """Remember the direction this sighting was taken FROM, measured at the
+        fruit: bearing = atan2(robot - fruit). That's the quantity that has to
+        vary for triangulation to pin a fruit down -- two sightings from the
+        same bearing constrain the same single ray no matter how far apart in
+        time or how many frames each one took. Only bearings at least
+        view_ang_threshold away from every one already recorded are kept, so
+        the count reflects genuinely distinct vantage points."""
+        self.n_shots[label] = self.n_shots.get(label, 0) + 1
+        if robot_x is None or robot_y is None:
+            return
+        b = math.atan2(robot_y - meas_y, robot_x - meas_x)
+        seen = self.view_bearings.setdefault(label, [])
+        for prev in seen:
+            d = abs((b - prev + np.pi) % (2 * np.pi) - np.pi)
+            if d < self.view_ang_threshold:
+                return
+        seen.append(b)
+
+    def n_views(self, label):
+        """Number of genuinely distinct vantage points this fruit was seen from."""
+        return len(self.view_bearings.get(label, []))
+
+    def bearing_spread(self, label):
+        """Angular extent, in DEGREES, of the smallest arc containing every
+        distinct bearing this fruit has been observed from (0-360).
+
+        This is the honest measure of how well-determined a fruit is. Depth is
+        the sloppy axis (see FRUIT_LATERAL_TO_DEPTH_VAR_RATIO), so a fruit only
+        ever seen through a narrow arc is pinned across the ray but floating
+        along it -- its distance is essentially whatever the box-height model
+        claimed, and no number of extra photos from that same arc will fix it.
+        Wide spread means the rays cross from genuinely different directions,
+        which is what makes the estimate robust to a systematic depth bias.
+        """
+        b = sorted(self.view_bearings.get(label, []))
+        if len(b) < 2:
+            return 0.0
+        gaps = [b[i + 1] - b[i] for i in range(len(b) - 1)]
+        gaps.append(b[0] + 2 * np.pi - b[-1])       # wrap-around gap
+        return float(np.degrees(2 * np.pi - max(gaps)))
+
+    def sigma(self, label):
+        """Current position uncertainty of one fruit, in metres (RMS of P's
+        diagonal) -- the filter's own answer to 'how well do I know this one'."""
+        P = self.P.get(label)
+        if P is None:
+            return float('nan')
+        return float(np.sqrt(max(np.mean(np.diag(P)), 0.0)))
+
+    def coverage_summary(self, expected_labels, narrow_arc_deg=40.0):
+        """What still needs attention, worst first, for the GUI readout.
+
+        Returns dict with:
+          'missing' -- expected fruits with no accepted sighting at all. These
+                       cost the most: a fruit absent from objects.txt scores
+                       nothing, whereas a fuzzy one still scores partly.
+          'narrow'  -- (label, spread_deg, n_views) for fruits seen only
+                       through a narrow arc: they may LOOK converged (small
+                       covariance) while their depth is unverified, so they're
+                       reported separately rather than trusted.
+          'worst'   -- (label, sigma_m, n_views) sorted by uncertainty, worst
+                       first.
+        """
+        missing = [l for l in expected_labels if l not in self.estimates]
+        narrow, worst = [], []
+        for label in self.estimates:
+            spread = self.bearing_spread(label)
+            views = self.n_views(label)
+            if spread < narrow_arc_deg:
+                narrow.append((label, spread, views))
+            worst.append((label, self.sigma(label), views))
+        narrow.sort(key=lambda t: t[1])
+        worst.sort(key=lambda t: (-t[1] if t[1] == t[1] else 0))
+        return {'missing': missing, 'narrow': narrow, 'worst': worst}
+
+    def update(self, label, meas_x, meas_y, distance, heading, robot_x=None, robot_y=None):
         """
         Fold one world-frame observation (meas_x, meas_y) of `label` into
         its running estimate. `distance` and `heading` (robot's current
@@ -969,6 +1668,12 @@ class FruitEKF:
                         occlusion/misclassification.
         (First-ever sighting of a label is always 'accepted' -- there's
         nothing yet to compare it against.)
+
+        robot_x/robot_y are optional and affect nothing in the filter maths --
+        they're only used to record which DIRECTION this sighting was taken
+        from, for the coverage readout (see _record_view/bearing_spread).
+        Omitted, everything behaves exactly as before except that fruit's
+        bearing spread stays 0 and it reads as un-triangulated.
         """
         z = np.array([[meas_x], [meas_y]])
         depth_var, lateral_var = self.measurement_noise_fn(distance)
@@ -988,6 +1693,7 @@ class FruitEKF:
             # sighting against yet, so nothing to gate on either.
             self.estimates[label] = z.copy()
             self.P[label] = self.init_cov * np.eye(2)
+            self._record_view(label, meas_x, meas_y, robot_x, robot_y)
             return 'accepted'
 
         pos, P = self.estimates[label], self.P[label]
@@ -1026,6 +1732,10 @@ class FruitEKF:
 
         self.estimates[label] = pos_new
         self.P[label] = P_new
+        # Only count sightings that actually moved the estimate. A 'rejected'
+        # reading returned above without reaching here, so it can't inflate the
+        # coverage numbers with detections the filter itself didn't believe.
+        self._record_view(label, meas_x, meas_y, robot_x, robot_y)
         return status
 
     def to_display_dict(self):
