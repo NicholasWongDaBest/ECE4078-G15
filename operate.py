@@ -400,11 +400,100 @@ class Operate:
             self.ekf.add_landmarks(sensor_measurement)
             self.ekf.update(sensor_measurement, drive_measurement)  # pass drive_measurement so update() knows how much rotation is happening right now
 
+    def save_live_objects(self):
+        """Write the LIVE FruitEKF estimates to lab_output/objects.txt -- the
+        file eval.py grades (its --object-est default).
+
+        Until now the live fruit filter was display-only: the diamonds on the
+        minimap lived in self.fruit_ekf in RAM and died with the process, and
+        the only thing that ever produced objects.txt was running
+        object_pose_est.py separately afterwards. This makes 's' persist the
+        live estimate too, so a run is submittable the moment you stop driving.
+
+        The two pipelines are genuinely different estimators over the same raw
+        data, not two copies of one:
+
+          live FruitEKF        incremental 2D Kalman filter, one per fruit
+                               class, with a 3-tier innovation gate,
+                               per-sighting noise that scales with range, and
+                               the depth/lateral anisotropy fix
+                               (FRUIT_LATERAL_TO_DEPTH_VAR_RATIO). Sees each
+                               detection once, in the order it happened, using
+                               the SLAM pose as it was AT THAT MOMENT.
+
+          object_pose_est.py   re-derives every pose offline from pred.txt,
+                               then merges per class by median + outlier
+                               rejection + inverse-distance weighting. Sees
+                               every detection at once, but reuses the same
+                               logged robot poses, so a late loop closure that
+                               improved the live map is NOT reflected in them.
+
+        Neither dominates -- run both, score both with eval.py, keep whichever
+        is better. That is why an existing objects.txt is copied aside to
+        objects_prev.txt rather than quietly overwritten.
+
+        Returns a short string to append to the on-screen notification.
+        """
+        objects = self.fruit_ekf.to_objects_dict()
+        fname = os.path.join(self.lab_output_dir, 'objects.txt')
+
+        # Refuse to replace a real objects.txt with an empty one. Pressing 's'
+        # early in a run (or right after 'r') must not wipe a good estimate
+        # object_pose_est.py wrote earlier.
+        if not objects:
+            print("[save] No live fruit estimates yet -- objects.txt left untouched.")
+            return ' (no fruit yet)'
+
+        if os.path.exists(fname):
+            try:
+                shutil.copyfile(fname, os.path.join(self.lab_output_dir, 'objects_prev.txt'))
+            except OSError as e:
+                print(f"[save] Could not back up existing objects.txt: {e}")
+
+        with open(fname, 'w') as fo:
+            json.dump(objects, fo, indent=4)
+
+        # --- console report -------------------------------------------------
+        # eval.py's eval_object() seeds EVERY ground-truth fruit with
+        # MAX_ERROR = 1.0 m and only overwrites the ones present in the file.
+        # A fruit absent from objects.txt therefore costs a full metre of
+        # error -- it is never simply "not counted". So it's worth knowing, at
+        # the moment you save, exactly which fruits made it in and which of
+        # the saved ones are geometrically shaky.
+        print(f"\n[save] {len(objects)} fruit written to {fname}")
+        for key in sorted(objects):
+            label = key.rsplit('_', 1)[0]
+            est = objects[key]
+            spread = self.fruit_ekf.bearing_spread(label)   # already in degrees
+            n_v = self.fruit_ekf.n_views(label)
+            d = self.fruit_ekf.min_view_dist.get(label, float('nan'))
+            shots = self.fruit_ekf.n_shots.get(label, 0)
+            flag = '   <-- narrow arc, likely off' if spread < 40.0 else ''
+            print(f"       {label:<11} x={est['x']:+.3f} y={est['y']:+.3f}   "
+                  f"{spread:5.1f}deg arc, {n_v} viewpoint(s), {shots} shot(s), "
+                  f"nearest {d:.2f}m{flag}")
+
+        # object_list.csv lists every fruit the detector knows about (7),
+        # normally more than any single arena contains, so an absent label is
+        # a warning, not necessarily a miss.
+        unseen = [l for l in self.object_list if (l + '_0') not in objects]
+        if unseen:
+            print(f"       not seen this run: {', '.join(unseen)}  (fine if "
+                  f"they aren't in this arena; each one that IS costs 1.0 m)")
+        print()
+
+        return f' + {len(objects)} fruit'
+
     def save_result(self):
         # save slam map after pressing "s"
         if self.command['save_slam']:
             self.ekf.save_map(fname=os.path.join(self.lab_output_dir, 'slam.txt'))
-            self.notification = 'Map is saved'
+            # 's' now saves BOTH halves of the submission: slam.txt (the ArUco
+            # map) and objects.txt (the live fruit estimates). See
+            # save_live_objects() for why the live estimate is worth keeping
+            # even though object_pose_est.py can regenerate one offline.
+            obj_msg = self.save_live_objects()
+            self.notification = f'Map is saved{obj_msg}'
             self.command['save_slam'] = False
 
         # load the true/ground-truth map and freeze it "l" (M2)
