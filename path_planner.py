@@ -64,7 +64,8 @@ def load_object_radii(csv_path="object_list.csv"):
 
 def build_obstacles(aruco_positions, object_positions, robot_radius,
                      marker_radius=DEFAULT_MARKER_RADIUS, object_radii=None,
-                     default_object_radius=0.08, safety_margin=0.05, exclude=None):
+                     default_object_radius=0.08, safety_margin=0.05, exclude=None,
+                     object_safety_margin=None):
     """
     Build the list of inflated circular obstacles the planner must avoid.
 
@@ -79,9 +80,15 @@ def build_obstacles(aruco_positions, object_positions, robot_radius,
     @param safety_margin: extra clearance on top of the geometric sum (m), to
         absorb SLAM/pose noise -- e.g. your M2 fruit-pose RMSE
     @param exclude: object name to leave out (typically the current target)
+    @param object_safety_margin: margin for the fruits, if different from the
+        markers' (a fruit is round and soft, and in Level 3 its position
+        error is already priced into its radius, so it needs less blanket
+        margin than a marker block)
     @return: (N, 3) array of [x, y, inflated_radius]
     """
     object_radii = object_radii or {}
+    if object_safety_margin is None:
+        object_safety_margin = safety_margin
     circles = []
 
     for ax, ay in aruco_positions:
@@ -91,7 +98,7 @@ def build_obstacles(aruco_positions, object_positions, robot_radius,
         if exclude is not None and name == exclude:
             continue
         obj_r = object_radii.get(name, default_object_radius)
-        circles.append([ox, oy, robot_radius + obj_r + safety_margin])
+        circles.append([ox, oy, robot_radius + obj_r + object_safety_margin])
 
     return np.array(circles, dtype=float) if circles else np.empty((0, 3))
 
@@ -132,6 +139,11 @@ def segment_in_collision(p1, p2, obstacles):
 
 def dist_between(a, b):
     return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+
+def path_length(path):
+    """Total length of a waypoint list, m."""
+    return float(sum(dist_between(path[k], path[k + 1]) for k in range(len(path) - 1)))
 
 
 def segment_clearance(p1, p2, obstacles):
@@ -329,7 +341,12 @@ class OccupancyGrid:
         self.cost = 1.0 + float(clearance_weight) * t ** 2
 
     def _clearance_field(self, radii):
-        clearance = np.full((self.nx, self.ny), np.inf)
+        # The arena boundary counts as an edge too: bounds already stop the
+        # grid at the legal limit for the robot's centre, but without a cost
+        # band A* would happily run the whole route along the tape, where a
+        # few cm of pose error is an out-of-bounds penalty.
+        clearance = np.minimum.reduce([self.gx - self.xmin, self.xmax - self.gx,
+                                       self.gy - self.ymin, self.ymax - self.gy])
         for (ox, oy, _), r in zip(self.obstacles, radii):
             clearance = np.minimum(clearance, np.hypot(self.gx - ox, self.gy - oy) - r)
         return clearance
@@ -355,7 +372,8 @@ class OccupancyGrid:
         for i, _depth in inside:
             d = float(np.hypot(self.obstacles[i, 0] - start[0], self.obstacles[i, 1] - start[1]))
             radii[i] = max(d - 0.5 * self.res, 0.0)
-        return self._clearance_field(radii) <= 0.0
+        blocked = self._clearance_field(radii) <= 0.0
+        return blocked
 
     def to_cell(self, point):
         return (int((point[0] - self.xmin) / self.res), int((point[1] - self.ymin) / self.res))
