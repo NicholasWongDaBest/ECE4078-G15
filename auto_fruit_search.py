@@ -112,6 +112,37 @@ def init_ekf(calib_dir):
     return EKF(robot), float(baseline)
 
 
+def load_turn_scale(fname=os.path.join('calibration', 'param', 'turn_scale.txt')):
+    """
+    Rotation correction factor, as measured by calibrate_turn.py.
+
+    Navigator.turn() works out its tick count from arc-length geometry, which
+    assumes the wheels roll cleanly about the robot's centre. Turning on the
+    spot scrubs both tyres sideways instead, so a tick of wheel rotation
+    sweeps less body angle than the geometry predicts and the robot lands
+    short. turn_scale is the measured ratio between the two.
+
+    Falls back to 1.0 (the raw geometry, i.e. what turn() did before any
+    calibration) if the file isn't there, so the script still runs on a fresh
+    clone -- it just under-turns.
+    """
+    if not os.path.exists(fname):
+        print(f"No {fname} -- turns will use the raw geometry (turn_scale = 1.0), "
+              f"which under-turns. Run calibrate_turn.py to measure it.")
+        return 1.0
+    try:
+        scale = float(np.loadtxt(fname, delimiter=','))
+    except Exception as e:
+        print(f"Could not read {fname} ({e}) -- falling back to turn_scale = 1.0")
+        return 1.0
+    if not (0.5 <= scale <= 2.0):
+        print(f"turn_scale = {scale:.4f} from {fname} is outside the plausible 0.5-2.0 "
+              f"range -- ignoring it and using 1.0. Re-run calibrate_turn.py.")
+        return 1.0
+    print(f"Turn calibration: turn_scale = {scale:.4f} (from {fname})")
+    return scale
+
+
 class Navigator:
     """
     Wraps the robot connection and the frozen-map SLAM (slam/ekf.py's
@@ -505,6 +536,9 @@ if __name__ == "__main__":
     parser.add_argument("--calib-dir", type=str, default='calibration/param/')
     parser.add_argument("--manual", action="store_true",
                          help="manual waypoint entry instead of the full Level 1 search_list run")
+    parser.add_argument("--turn-scale", type=float, default=None,
+                         help="override the measured turn_scale from "
+                              "calibration/param/turn_scale.txt (see calibrate_turn.py)")
     args, _ = parser.parse_known_args()
 
     botconnect = BotConnect(args.ip)
@@ -515,7 +549,8 @@ if __name__ == "__main__":
     ekf.load_true_map(args.map)  # freezes markers, M3 Level 1/2/3 all localise-only
     aruco_sensor = ArucoSensor(ekf.robot, marker_length=0.06)
 
-    nav = Navigator(botconnect, ekf, aruco_sensor, baseline)
+    turn_scale = args.turn_scale if args.turn_scale is not None else load_turn_scale()
+    nav = Navigator(botconnect, ekf, aruco_sensor, baseline, turn_scale=turn_scale)
 
     # read in the true map
     object_list, object_true_pos, aruco_true_pos = read_true_map(args.map)
