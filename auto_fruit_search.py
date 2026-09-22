@@ -17,6 +17,7 @@ from slam.robot import Robot
 from slam.aruco_sensor import ArucoSensor
 
 import path_planner
+from m3_display import M3Display, NullDisplay, M3Abort
 
 
 def read_true_map(fname):
@@ -167,6 +168,11 @@ class Navigator:
         self._has_moved = False
         self._warned_no_initial_fix = False
 
+        # Live window (m3_display.py). NullDisplay does nothing, so the
+        # navigation code can call it unconditionally; main() swaps in an
+        # M3Display unless --no-display is given.
+        self.display = NullDisplay()
+
         # Marker noise model for M3. slam/ekf.py's measurement_variance() was
         # tuned for M1 mapping and puts a 15-30 cm std dev on every marker
         # reading, which is so wide that update() barely moves the robot's
@@ -218,7 +224,7 @@ class Navigator:
                 self._localised = True
                 s = self.ekf.robot.state
                 print("Initial pose from {} markers: [{:.3f}, {:.3f}, {:.1f}deg] (fit residual {:.3f} m)".format(
-                    n_known, s[0, 0], s[1, 0], math.degrees(s[2, 0]), self.ekf.last_recover_residual))
+                    n_known, s[0, 0], s[1, 0], math.degrees(_normalize_angle(s[2, 0])), self.ekf.last_recover_residual))
             elif not self._warned_no_initial_fix:
                 self._warned_no_initial_fix = True
                 print("get_robot_pose: fewer than 2 known markers in view for the initial fix -- "
@@ -232,7 +238,7 @@ class Navigator:
                     s = self.ekf.robot.state
                     print("get_robot_pose: markers disagreed with the predicted pose -- re-anchored "
                           "from {} markers to [{:.3f}, {:.3f}, {:.1f}deg]".format(
-                              n_known, s[0, 0], s[1, 0], math.degrees(s[2, 0])))
+                              n_known, s[0, 0], s[1, 0], math.degrees(_normalize_angle(s[2, 0]))))
 
         state = self.ekf.robot.state
         return np.array([state[0, 0], state[1, 0], state[2, 0]])
@@ -296,6 +302,7 @@ class Navigator:
             2.0 * ticks / (self.ticks_per_meter * self.wheel_separation * self.turn_scale), dtheta)
         self._predict_commanded_motion(wheel_speeds, time.time() - start,
                                        dtheta=commanded, completed=completed)
+        self._settle()
 
     def drive_forward(self, distance):
         """Drive straight forward by `distance` metres (>= 0)."""
@@ -308,6 +315,7 @@ class Navigator:
         completed = self._wait_for_move()
         self._predict_commanded_motion(wheel_speeds, time.time() - start,
                                        distance=ticks / self.ticks_per_meter, completed=completed)
+        self._settle()
 
     def _wait_for_move(self):
         """Wait for the robot to finish a move_auto_encoder() command.
@@ -320,12 +328,15 @@ class Navigator:
                 self.botconnect.stop()
                 completed = False
                 break
-            time.sleep(0.02)
-        # Give the camera time to deliver a frame taken AFTER the robot stopped,
-        # so the next marker update isn't comparing the new pose with a blurred
-        # frame from mid-move.
-        time.sleep(self.settle_time)
+            self.display.idle(0.02)   # keeps the window updating while the robot moves
         return completed
+
+    def _settle(self):
+        """Give the camera time to deliver a frame taken AFTER the robot
+        stopped, so the next marker update isn't comparing the new pose with a
+        blurred frame from mid-move. (Called after the move has been fed to
+        the EKF, so the map already shows where the robot should now be.)"""
+        self.display.idle(self.settle_time)
 
 
 def _normalize_angle(angle):
@@ -346,6 +357,7 @@ def drive_to_point(waypoint, nav):
     recommendation to correct pose after every waypoint step.
     @return: robot pose (np.array([x, y, theta])) after arriving
     """
+    nav.display.set_waypoint(waypoint)
     pose = nav.get_robot_pose()
     if math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1]) < nav.min_move:
         return pose  # already there -- and atan2 of a ~zero vector is a random heading
@@ -363,7 +375,7 @@ def drive_to_point(waypoint, nav):
 
     pose = nav.get_robot_pose()
     print("Arrived near [{:.3f}, {:.3f}] -- pose now [{:.3f}, {:.3f}, {:.1f}deg]".format(
-        waypoint[0], waypoint[1], pose[0], pose[1], math.degrees(pose[2])))
+        waypoint[0], waypoint[1], pose[0], pose[1], math.degrees(_normalize_angle(pose[2]))))
     return pose
 
 
@@ -417,22 +429,32 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos):
     """
     object_radii = path_planner.load_object_radii()
     object_positions = {name: tuple(pos) for name, pos in zip(object_list, object_true_pos)}
+    display = nav.display
+
+    def skip(name, reason):
+        print(f"[{name}] {reason} -- skipping")
+        display.notify(f"{name}: {reason} -- skipped")
+        display.target_done(name, None, False)
 
     for i, target_name in enumerate(search_list, start=1):
         if target_name not in object_positions:
             print(f"WARNING: '{target_name}' from search_list.txt isn't in the true map -- skipping")
+            display.target_done(target_name, None, False)
             continue
         target = object_positions[target_name]
 
-        pose = nav.get_robot_pose()
         obstacles = path_planner.build_obstacles(
             aruco_true_pos, object_positions, path_planner.ROBOT_RADIUS,
             object_radii=object_radii, exclude=target_name)
+        display.begin_target(i, target_name, target, obstacles)
+        display.notify(f"Planning route to {target_name} ({i}/{len(search_list)})")
+        display.refresh(force=True)
+
+        pose = nav.get_robot_pose()
 
         start = _escape_obstacles(pose[:2], obstacles)
         if start is None:
-            print(f"[{target_name}] robot at [{pose[0]:.2f}, {pose[1]:.2f}] is boxed in by obstacle "
-                  f"safety circles -- skipping")
+            skip(target_name, f"robot at [{pose[0]:.2f}, {pose[1]:.2f}] is boxed in by safety circles")
             continue
         if path_planner.dist_between(start, pose[:2]) > 1e-9:
             print(f"[{target_name}] pose estimate is inside an obstacle's safety circle -- "
@@ -440,7 +462,7 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos):
 
         goal = path_planner.standoff_point(target, obstacles, reference=start)
         if goal is None:
-            print(f"[{target_name}] no collision-free standoff point found -- skipping")
+            skip(target_name, "no collision-free standoff point")
             continue
 
         path = None
@@ -452,7 +474,7 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos):
         except ValueError as e:
             print(f"[{target_name}] planner refused: {e}")
         if path is None:
-            print(f"[{target_name}] no route found -- skipping")
+            skip(target_name, "no route found")
             continue
         path = path_planner.smooth_path(path, obstacles)
 
@@ -461,6 +483,8 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos):
         waypoints = path[1:] if path_planner.dist_between(path[0], pose[:2]) < nav.min_move else path
 
         print(f"\n[{target_name}] driving {len(waypoints)}-waypoint route towards [{target[0]:.2f}, {target[1]:.2f}]")
+        display.set_route(goal, waypoints)
+        display.notify(f"Driving to {target_name} ({i}/{len(search_list)})")
         for wp in waypoints:
             drive_to_point(wp, nav)
 
@@ -469,7 +493,8 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos):
         status = "OK" if dist_to_target <= 0.4 else "OUT OF TOLERANCE"
         print(f"=== Found {target_name} at [{target[0]:.2f}, {target[1]:.2f}] "
               f"(robot is {dist_to_target:.3f}m away -- {status}) ===")
-        input(f"Press ENTER once the demonstrator has verified this ({i}/{len(search_list)})...")
+        display.target_done(target_name, dist_to_target, dist_to_target <= 0.4)
+        display.wait_for_key(f"Found {target_name} ({dist_to_target:.2f} m). ENTER when verified")
 
 
 def run_manual(nav):
@@ -505,6 +530,8 @@ if __name__ == "__main__":
     parser.add_argument("--calib-dir", type=str, default='calibration/param/')
     parser.add_argument("--manual", action="store_true",
                          help="manual waypoint entry instead of the full Level 1 search_list run")
+    parser.add_argument("--no-display", action="store_true",
+                         help="terminal only: no camera/map window and no setup phase")
     args, _ = parser.parse_known_args()
 
     botconnect = BotConnect(args.ip)
@@ -522,7 +549,30 @@ if __name__ == "__main__":
     search_list = read_search_list()
     print_object_pos(search_list, object_list, object_true_pos)
 
-    if args.manual:
-        run_manual(nav)
-    else:
-        run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos)
+    display = None
+    try:
+        if not args.no_display:
+            object_positions = {name: tuple(pos) for name, pos in zip(object_list, object_true_pos)}
+            display = M3Display(nav, aruco_true_pos, object_positions, search_list,
+                                object_radii=path_planner.load_object_radii())
+            nav.display = display
+            # Turn with the arrow keys until 2+ markers are in view, then ENTER.
+            display.run_setup()
+
+        if args.manual:
+            if display is not None:
+                display.run_manual(lambda wp: drive_to_point(wp, nav))
+            else:
+                run_manual(nav)
+        else:
+            run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos)
+            print("Level 1 run finished.")
+            if display is not None:
+                display.finish("Run finished. ESC to exit")
+    except (M3Abort, KeyboardInterrupt):
+        print("Stopped by user.")
+    finally:
+        botconnect.stop()
+        if display is not None:
+            import pygame
+            pygame.quit()

@@ -32,7 +32,9 @@ The work is split in two, like a sat-nav and a driver:
 ## 3. What happens when you run it
 
 Command: `python auto_fruit_search.py --ip <robot-ip>`
-(Optional flags: `--map` defaults to `truemap.txt`, `--calib-dir` defaults to `calibration/param/`, and `--manual` lets you type waypoints by hand instead.)
+(Optional flags: `--map` defaults to `truemap.txt`, and `--calib-dir` defaults to `calibration/param/`. `--manual` lets you choose waypoints yourself: click the map in the window, or type them in the terminal with `--no-display`. `--no-display` runs without the window, as it did before section 8 was added.)
+
+It opens a window like `operate.py`'s, with the camera, the map and a setup step for pointing the robot at markers before it starts. Section 8 covers the window.
 
 The `if __name__ == "__main__":` block at the bottom runs these steps in order:
 
@@ -191,11 +193,57 @@ Testing those fixes turned up four more problems, also fixed:
 | Turns 20% short, drives 5% long | 0/60 · 7/20 | 1/60 · 10/20 |
 | Same, with `turn_scale = 1.25` | 0/60 · 0/20 | 0/60 · 0/20 |
 
+The table used the earlier `truemap.txt`. On the updated map (changed 22 September), results were similar: no collisions with accurate or 10%-slip turns, and 2–3 runs in 20 with a collision at 20% slip.
+
 For comparison, the same fixes with M1's marker noise model gave 2 fruits out of tolerance and 6/20 runs with a collision in the 10%-slip case. The simulation is only as good as its guesses about slip and marker noise. It shows the logic works, but not that the real robot will score. The row that matters is how much your robot's turns actually slip.
 
 **What to check on the real robot, in order:**
 
 1. Run `python path_planner.py` to plan and plot the routes without the robot.
-2. Put the robot at the centre facing +x, run `python auto_fruit_search.py --ip <ip> --manual`, and enter (0, 0.5). It should turn left about 90° and drive 0.5 m. Watch where the *first* turn stops, before any correction turns. If turns are consistently short or long, set `turn_scale` in the `Navigator(...)` line of the `__main__` block. For example, if it reaches 80° when asked for 90°, use `turn_scale=1.125`.
+2. Put the robot at the centre facing +x, run `python auto_fruit_search.py --ip <ip> --manual`, lock the pose in the setup step, then click the map at (0, 0.5): the grid lines are every 0.5 m, so that's one line straight up from the centre. It should turn left about 90° and drive 0.5 m. Watch where the *first* turn stops, before any correction turns. If turns are consistently short or long, set `turn_scale` in the `Navigator(...)` line of the `__main__` block. For example, if it reaches 80° when asked for 90°, use `turn_scale=1.125`.
 3. After a few waypoints, compare the printed "pose now" with a tape measure. More than about 5 cm apart means the pose tracking needs tuning (`marker_noise`, `turn_noise_frac`, `drive_noise_frac`).
 4. Do a full run: `python auto_fruit_search.py --ip <ip> --map truemap.txt`.
+
+---
+
+## 8. The live window (`m3_display.py`, added 22 September)
+
+The window uses `operate.py`'s layout, font and marker and robot artwork:
+
+- **Robot Cam** (top left) shows the camera with detected markers outlined, plus a count of how many known markers are in view. The count is green at 2 or more, orange at 1 and red at 0.
+- **Status** (bottom left) shows the markers in view, the robot's pose, and its uncertainty (SD). SD turns orange and then red as the robot gets less sure where it is. It also shows the pose the visible markers imply (FIT), each target with its result, and the run time.
+- **Map** (right) is centred on the arena, with +x to the right, +y up and grid lines every 0.5 m:
+  - The thick square is the boundary tape, and the thin red square is where the robot's centre is allowed to go.
+  - Markers seen in the current frame get a green ring. Fruits are drawn in their colour, and targets are numbered in search order.
+  - Grey circles are the safety circles for the current leg. The robot's *centre* must stay outside them, so the robot's drawn body overlapping a circle is normal.
+  - The green circle around the current target is its 0.4 m success zone.
+  - The blue line is the planned route and the cross is the parking spot.
+  - The yellow lines show what the camera can see, and the small ellipse is the pose uncertainty.
+
+**Setup step (before anything drives).** Put the robot at the centre. Then:
+
+- **← / →** turn it 15° on the spot (5° with SHIFT).
+- **ENTER with 2+ markers in view** locks the full pose from them.
+- **ENTER with 1 marker in view** locks the heading from that marker, assuming the robot is at the centre. The window warns you if the marker's measured distance is more than 15 cm off its map distance, which usually means the robot isn't at the centre. Press ENTER again to accept it anyway.
+- **ENTER with no markers in view** (pressed twice) starts from the assumed pose: the centre, facing +x, plus any turns you made.
+
+Until the pose is locked, the map labels the robot "assumed" and draws the camera's view from the marker fit. That way you can see which way the robot really faces, even if it wasn't placed facing +x.
+
+**Your camera's view is narrow.** `intrinsic.txt` gives a focal length of about 1073 px, which is only about ±16° of view (32° total). From the centre, two markers rarely fit in view at once. That's why the one-marker heading lock exists, and in simulation it's what you'll use most of the time. The same narrow view means markers are seen less often while driving, so the pose relies more on the wheels.
+
+Re-running the simulation with the narrow view (20 runs per scenario, noisy markers):
+
+| Wheels | Fruits over 0.4 m | Runs with a collision |
+|---|---|---|
+| Turns and drives accurate | 0/60 | 0/20 |
+| Turns 10% short, drives 3% short | 0/60 | 0/20 |
+| Turns 20% short, drives 5% long | 4/60 | 7/20 |
+
+In the 10% case the closest call was 0.399 m, so calibrating `turn_scale` matters more with this camera.
+
+**During the run:** the window keeps updating while the robot moves. After each fruit, press **ENTER or SPACE in the window** (not the terminal) once the demonstrator has checked it.
+
+**Any time:** **ESC**, or closing the window, stops the robot and quits.
+
+**With `--manual`:** click anywhere on the map and the robot drives there (turn, check, drive, check). ← / → still turn it on the spot.
+
