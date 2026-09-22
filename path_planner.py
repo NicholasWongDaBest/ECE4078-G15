@@ -134,6 +134,38 @@ def dist_between(a, b):
     return float(np.hypot(a[0] - b[0], a[1] - b[1]))
 
 
+def segment_clearance(p1, p2, obstacles):
+    """
+    Smallest gap between the segment p1->p2 and any inflated circle's EDGE
+    (negative = the segment enters that circle). segment_in_collision() is
+    exactly `segment_clearance() <= 0`; this keeps the magnitude, which is
+    what tells a 2 cm squeeze apart from a 15 cm berth.
+    """
+    if len(obstacles) == 0:
+        return math.inf
+    p1 = np.asarray(p1, dtype=float)
+    p2 = np.asarray(p2, dtype=float)
+    seg = p2 - p1
+    seg_len2 = float(seg @ seg)
+    centres = obstacles[:, :2]
+    radii = obstacles[:, 2]
+    if seg_len2 < 1e-12:
+        d = np.hypot(centres[:, 0] - p1[0], centres[:, 1] - p1[1])
+    else:
+        t = np.clip(((centres - p1) @ seg) / seg_len2, 0.0, 1.0)
+        closest = p1 + np.outer(t, seg)
+        d = np.hypot(closest[:, 0] - centres[:, 0], closest[:, 1] - centres[:, 1])
+    return float(np.min(d - radii))
+
+
+def circles_containing(point, obstacles):
+    """Indices of the inflated circles `point` lies inside, with the depth (m)."""
+    if len(obstacles) == 0:
+        return []
+    d = np.hypot(obstacles[:, 0] - point[0], obstacles[:, 1] - point[1])
+    return [(int(i), float(obstacles[i, 2] - d[i])) for i in np.where(d <= obstacles[:, 2])[0]]
+
+
 # ---------------------------------------------------------------------------
 # RRT*
 # ---------------------------------------------------------------------------
@@ -259,29 +291,71 @@ def rrt_star(start, goal, obstacles, bounds=ARENA_BOUNDS, step_size=0.15, goal_b
 
 class OccupancyGrid:
     """
-    The arena cut into square cells, each marked blocked if its centre lies
-    inside any inflated obstacle circle (build_obstacles() already includes
-    the robot's own radius in those circles, so a free cell centre is a legal
-    place for the robot's centre to be).
+    The arena cut into square cells. Each cell carries:
+      clearance  distance from its centre to the nearest inflated circle's
+                 edge (negative = inside one). build_obstacles() already puts
+                 the robot's own radius in those circles, so clearance > 0
+                 means the robot's centre can legally be there.
+      blocked    clearance <= 0
+      cost       1.0 on open floor, rising quadratically to 1 + clearance_weight
+                 as clearance drops from clearance_pref to 0.
 
-    Built once per obstacle set and reused for every re-plan against it. That
-    is the point of a grid here: auto_fruit_search.py re-plans after EVERY
-    waypoint, once it has a freshly measured pose, and a plan on a prebuilt
-    grid is a few milliseconds -- collision checks are array lookups, not
-    circle tests -- so re-planning that often costs nothing.
+    The cost is what makes A* prefer the middle of a corridor and avoid
+    threading a tight gap between two obstacles unless there is genuinely no
+    other way: a 2 cm gap is "free" to a binary grid, but the pose estimate
+    the robot will actually drive with is 5-10 cm off, so a route that only
+    works if the pose is perfect is not a route. Nothing is forbidden by the
+    cost, only priced, so a robot boxed in can still get out.
+
+    Built once per obstacle set and reused for every re-plan against it --
+    auto_fruit_search.py re-plans after every waypoint, and a plan on a
+    prebuilt grid is a few milliseconds.
     """
 
-    def __init__(self, obstacles, bounds=ARENA_BOUNDS, resolution=0.05):
+    def __init__(self, obstacles, bounds=ARENA_BOUNDS, resolution=0.05,
+                 clearance_pref=0.15, clearance_weight=6.0):
         (self.xmin, self.xmax), (self.ymin, self.ymax) = bounds
         self.res = float(resolution)
+        self.obstacles = np.asarray(obstacles, dtype=float).reshape(-1, 3)
+        self.clearance_pref = float(clearance_pref)
         self.nx = int(math.ceil((self.xmax - self.xmin) / self.res))
         self.ny = int(math.ceil((self.ymax - self.ymin) / self.res))
         xs = self.xmin + (np.arange(self.nx) + 0.5) * self.res
         ys = self.ymin + (np.arange(self.ny) + 0.5) * self.res
-        gx, gy = np.meshgrid(xs, ys, indexing="ij")
-        self.blocked = np.zeros((self.nx, self.ny), dtype=bool)
-        for ox, oy, r in np.asarray(obstacles, dtype=float).reshape(-1, 3):
-            self.blocked |= (gx - ox) ** 2 + (gy - oy) ** 2 <= r ** 2
+        self.gx, self.gy = np.meshgrid(xs, ys, indexing="ij")
+        self.clearance = self._clearance_field(self.obstacles[:, 2])
+        self.blocked = self.clearance <= 0.0
+        t = np.clip(1.0 - np.clip(self.clearance, 0.0, None) / max(self.clearance_pref, 1e-9), 0.0, 1.0)
+        self.cost = 1.0 + float(clearance_weight) * t ** 2
+
+    def _clearance_field(self, radii):
+        clearance = np.full((self.nx, self.ny), np.inf)
+        for (ox, oy, _), r in zip(self.obstacles, radii):
+            clearance = np.minimum(clearance, np.hypot(self.gx - ox, self.gy - oy) - r)
+        return clearance
+
+    def relaxed_blocked(self, start):
+        """
+        Blocked mask for a plan whose START is inside one or more circles.
+
+        Those circles are shrunk, for this plan only, to just under the
+        robot's current distance from their centre: cells further out than
+        the robot already is become passable, cells deeper stay blocked. So
+        the plan is allowed to LEAVE a circle it is already in but never to go
+        further in, and the route out is simply the first part of the route
+        to the goal. That replaces the old "push the start to the nearest free
+        point and drive there first" step, which between two close obstacles
+        picked a different side every time the pose estimate wobbled and
+        drove the robot back and forth between them.
+        """
+        inside = circles_containing(start, self.obstacles)
+        if not inside:
+            return self.blocked
+        radii = self.obstacles[:, 2].copy()
+        for i, _depth in inside:
+            d = float(np.hypot(self.obstacles[i, 0] - start[0], self.obstacles[i, 1] - start[1]))
+            radii[i] = max(d - 0.5 * self.res, 0.0)
+        return self._clearance_field(radii) <= 0.0
 
     def to_cell(self, point):
         return (int((point[0] - self.xmin) / self.res), int((point[1] - self.ymin) / self.res))
@@ -289,21 +363,22 @@ class OccupancyGrid:
     def to_world(self, cell):
         return (self.xmin + (cell[0] + 0.5) * self.res, self.ymin + (cell[1] + 0.5) * self.res)
 
-    def free(self, cell):
+    def free(self, cell, blocked=None):
         i, j = cell
-        return 0 <= i < self.nx and 0 <= j < self.ny and not self.blocked[i, j]
+        blocked = self.blocked if blocked is None else blocked
+        return 0 <= i < self.nx and 0 <= j < self.ny and not blocked[i, j]
 
-    def nearest_free(self, cell, max_radius_cells=10):
+    def nearest_free(self, cell, max_radius_cells=10, blocked=None):
         """The cell itself if free, else the nearest free cell in expanding
         square rings around it, else None. Used to snap a start or goal that
         sits a fraction of a cell inside a blocked one."""
-        if self.free(cell):
+        if self.free(cell, blocked):
             return cell
         ci, cj = cell
         for r in range(1, max_radius_cells + 1):
             ring = [(ci + dx, cj + dy) for dx in range(-r, r + 1) for dy in (-r, r)]
             ring += [(ci + dx, cj + dy) for dy in range(-r + 1, r) for dx in (-r, r)]
-            ring = [c for c in ring if self.free(c)]
+            ring = [c for c in ring if self.free(c, blocked)]
             if ring:
                 return min(ring, key=lambda c: (c[0] - ci) ** 2 + (c[1] - cj) ** 2)
         return None
@@ -316,22 +391,28 @@ _NEIGHBOURS = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
 
 def astar(start, goal, grid):
     """
-    Shortest 8-connected path from `start` to `goal` over an OccupancyGrid.
+    Lowest-cost 8-connected path from `start` to `goal` over an OccupancyGrid,
+    where an edge costs its length times the mean cell cost at its ends -- so
+    the cheapest route is the shortest one that also keeps its distance from
+    obstacles, and only squeezes through a tight gap when nothing else works.
 
-    Deterministic and optimal on the grid (Euclidean heuristic, which is
-    admissible for 8-connected moves), so two plans from nearly the same pose
-    give nearly the same route -- unlike RRT*, whose random sampling gave a
-    different wiggle every call, which mattered once the route was being
-    re-planned after every waypoint. Diagonal moves are refused when either
-    orthogonal neighbour is blocked, so the path never clips a corner.
+    Deterministic and optimal on the grid (Euclidean heuristic, admissible
+    since every cell costs at least 1), so two plans from nearly the same
+    pose give nearly the same route -- which matters when re-planning after
+    every waypoint. Diagonal moves are refused when either orthogonal
+    neighbour is blocked, so the path never clips a corner.
+
+    A start inside a circle is allowed (see OccupancyGrid.relaxed_blocked):
+    the route leads out of it, never deeper.
 
     @return: list of (x, y) waypoints from `start` to `goal` (both exact, with
         grid-cell centres in between), or None if no path exists
     """
     start = (float(start[0]), float(start[1]))
     goal = (float(goal[0]), float(goal[1]))
+    blocked = grid.relaxed_blocked(start)
     s0, g0 = grid.to_cell(start), grid.to_cell(goal)
-    s, g = grid.nearest_free(s0), grid.nearest_free(g0)
+    s, g = grid.nearest_free(s0, blocked=blocked), grid.nearest_free(g0, blocked=blocked)
     if s is None or g is None:
         return None
     if s == g:
@@ -340,6 +421,7 @@ def astar(start, goal, grid):
     def h(c):
         return math.hypot(c[0] - g[0], c[1] - g[1])
 
+    cost = grid.cost
     open_heap = [(h(s), 0.0, s)]
     came_from = {s: None}
     g_cost = {s: 0.0}
@@ -353,11 +435,11 @@ def astar(start, goal, grid):
             break
         for dx, dy, w in _NEIGHBOURS:
             n = (c[0] + dx, c[1] + dy)
-            if not grid.free(n):
+            if not grid.free(n, blocked):
                 continue
-            if dx and dy and (not grid.free((c[0] + dx, c[1])) or not grid.free((c[0], c[1] + dy))):
+            if dx and dy and (not grid.free((c[0] + dx, c[1]), blocked) or not grid.free((c[0], c[1] + dy), blocked)):
                 continue  # no corner cutting
-            ng = gc + w
+            ng = gc + w * 0.5 * (cost[c[0], c[1]] + cost[n[0], n[1]])
             if ng < g_cost.get(n, math.inf):
                 g_cost[n] = ng
                 came_from[n] = c
@@ -382,7 +464,7 @@ def astar(start, goal, grid):
 
 
 def plan(start, goal, obstacles, planner="astar", grid=None, bounds=ARENA_BOUNDS,
-         resolution=0.05, rng=None):
+         resolution=0.05, rng=None, clearance_pref=0.15):
     """
     One entry point for both planners. Returns a raw (unsmoothed) waypoint
     list start -> goal, or None. Pass a prebuilt OccupancyGrid as `grid` to
@@ -397,7 +479,7 @@ def plan(start, goal, obstacles, planner="astar", grid=None, bounds=ARENA_BOUNDS
             return None
         return path
     if grid is None:
-        grid = OccupancyGrid(obstacles, bounds=bounds, resolution=resolution)
+        grid = OccupancyGrid(obstacles, bounds=bounds, resolution=resolution, clearance_pref=clearance_pref)
     return astar(start, goal, grid)
 
 
@@ -405,27 +487,45 @@ def plan(start, goal, obstacles, planner="astar", grid=None, bounds=ARENA_BOUNDS
 # Path smoothing
 # ---------------------------------------------------------------------------
 
-def smooth_path(path, obstacles, iterations=100, rng=None):
+def smooth_path(path, obstacles, iterations=100, rng=None, min_clearance=0.0):
     """
     Shortcut-smooth a path: repeatedly try connecting two non-adjacent waypoints
-    directly, keeping the shortcut if the straight line is collision-free. This
-    is what turns A*'s staircase (or RRT*'s wiggle) into a small number of straight
-    segments the robot can actually execute cleanly -- fewer turns means less
-    opportunity for encoder drift to compound (see M1 notes on swerving from
-    stacked corrections).
+    directly, keeping the shortcut if it is safe. This is what turns A*'s
+    staircase (or RRT*'s wiggle) into a small number of straight segments the
+    robot can actually execute cleanly -- fewer turns means less opportunity
+    for encoder drift to compound.
+
+    "Safe" is stricter than "not touching": a shortcut must keep at least
+    min(min_clearance, the clearance of the stretch it replaces). Otherwise
+    smoothing quietly undoes the planner's care, cutting the corner of a
+    circle the A* route had given a wide berth. And a shortcut from a point
+    that is INSIDE a circle must head away from that circle's centre, so it
+    can only ever shorten the way out, never go deeper.
     """
     rng = rng or random
+
+    def safe(i, j, path):
+        a, b = path[i], path[j]
+        if segment_in_collision(a, b, obstacles) and not circles_containing(a, obstacles):
+            return False
+        for k, _depth in circles_containing(a, obstacles):
+            cx, cy = obstacles[k, 0], obstacles[k, 1]
+            if (cx - a[0]) * (b[0] - a[0]) + (cy - a[1]) * (b[1] - a[1]) > 0:
+                return False  # would head towards that circle's centre
+        replaced = min(segment_clearance(path[k], path[k + 1], obstacles) for k in range(i, j))
+        return segment_clearance(a, b, obstacles) >= min(min_clearance, replaced) - 1e-9
+
     path = list(path)
 
     # Greedy pass first: from each kept point, jump straight to the farthest
-    # later point reachable without a collision. Deterministic, and it
-    # collapses an A* staircase (dozens of cell centres) into a handful of
-    # segments in one sweep -- the random shortcutting below then only polishes.
+    # later point reachable safely. Deterministic, and it collapses an A*
+    # staircase (dozens of cell centres) into a handful of segments in one
+    # sweep -- the random shortcutting below then only polishes.
     greedy = [path[0]]
     i = 0
     while i < len(path) - 1:
         j = len(path) - 1
-        while j > i + 1 and segment_in_collision(path[i], path[j], obstacles):
+        while j > i + 1 and not safe(i, j, path):
             j -= 1
         greedy.append(path[j])
         i = j
@@ -437,7 +537,7 @@ def smooth_path(path, obstacles, iterations=100, rng=None):
         i, j = sorted(rng.sample(range(len(path)), 2))
         if j - i < 2:
             continue
-        if not segment_in_collision(path[i], path[j], obstacles):
+        if safe(i, j, path):
             path = path[:i + 1] + path[j:]
     return path
 
@@ -535,7 +635,7 @@ if __name__ == "__main__":
             print(f"[{target_name}] FAILED -- {args.planner} found no path")
             all_ok = False
             continue
-        path = smooth_path(path, obstacles)
+        path = smooth_path(path, obstacles, min_clearance=0.15)
 
         xs, ys = zip(*path)
         ax.plot(xs, ys, "-o", color=colors[i % 10], label=f"{i+1}. {target_name}", markersize=3)
