@@ -2,7 +2,7 @@
 
 This covers the two files behind Milestone 3 Level 1: `path_planner.py` and `auto_fruit_search.py`. It assumes no prior background. It describes the code as it is on disk right now, and checks every number in it against that code.
 
-> **Read section 7 before your next robot run.** While tracing through the code for this walkthrough, I found five bugs. Three of them would stop Level 1 working on the real robot: it would crash on the first target, and the robot would barely turn. They're in code I wrote or kept unchanged, and each one comes with a fix.
+> **Updated 22 September 2026.** The first version of this walkthrough reported five bugs, three of which would have stopped Level 1 working on the robot. They're now fixed, and sections 4 and 6 describe the fixed code. Section 7 lists what changed, the simulation results, and what to check on the real robot.
 
 ---
 
@@ -54,13 +54,14 @@ This happens for each fruit on the shopping list, in order:
 1. **Look up the fruit's position** in the map. If it isn't there, print a warning and skip it.
 2. **Ask "where am I?"** with `nav.get_robot_pose()` (explained in section 6.2).
 3. **Build the obstacle list.** Every marker and every fruit *except the current target* becomes a circle to avoid. The target is left out so that it doesn't block its own approach (section 5.1).
-4. **Pick a parking spot next to the target.** You can't drive *to* the fruit, because you'd hit it. `standoff_point()` finds a clear spot 0.3 m from it, which leaves a 0.1 m margin inside the 0.4 m rule (section 5.3).
-5. **Plan a route** from where you are to that spot with `rrt_star()` (section 5.4).
-6. **Straighten the route** with `smooth_path()` (section 5.5).
-7. **Drive it.** For each waypoint, `drive_to_point()` does turn, check, drive, check (section 6.4).
-8. **Check and report.** The code measures the distance from the robot's SLAM pose to the fruit. It prints `=== Found redapple at [...] (robot is 0.3xx m away -- OK) ===`, or `OUT OF TOLERANCE` if the distance is over 0.4 m. Then it waits on `input()` until the demonstrator presses ENTER.
+4. **Make sure the start is clear.** After parking next to something, pose noise can put the estimate a centimetre or two inside a neighbour's safety circle, and the planner refuses to start from inside one. `_escape_obstacles()` finds the nearest clear point, and the route starts from there.
+5. **Pick a parking spot next to the target.** You can't drive *to* the fruit, because you'd hit it. `standoff_point()` finds a clear spot 0.3 m from it, which leaves a 0.1 m margin inside the 0.4 m rule (section 5.3).
+6. **Plan a route** to that spot with `rrt_star()` (section 5.4). If it finds nothing in 2000 rounds, it tries once more with 4000.
+7. **Straighten the route** with `smooth_path()` (section 5.5).
+8. **Drive it.** The route's first point is where the robot already is, so it's dropped (unless step 4 moved the start). Each remaining waypoint goes to `drive_to_point()` (section 6.4).
+9. **Check and report.** The code measures the distance from the robot's SLAM pose to the fruit. It prints `=== Found redapple at [...] (robot is 0.3xx m away -- OK) ===`, or `OUT OF TOLERANCE` if the distance is over 0.4 m. Then it waits on `input()` until the demonstrator presses ENTER.
 
-If there's no parking spot or no route, the code prints why and skips to the next fruit. It isn't supposed to crash, but section 7 covers two cases where it currently does.
+If there's still no parking spot or route, the code prints why and skips to the next fruit. Reaching fruits out of order scores nothing for that run, so if you see a skip, stop and restart rather than letting it carry on.
 
 ---
 
@@ -113,7 +114,7 @@ After all 2000 rounds (the loop keeps improving the route even after first reach
 
 **Why RRT\* and not plain RRT?** Plain RRT stops at the first route it finds, which is usually zig-zaggy. Steps 5 and 6 keep reshaping the tree toward shorter routes. Fewer, straighter segments means fewer turns, and every turn is a chance for the wheels to slip.
 
-**Safety check at the start:** if the start or the goal is already inside an obstacle, `rrt_star` raises a `ValueError` instead of planning. Section 7 explains why this matters.
+**Safety check at the start:** if the start or the goal is already inside an obstacle, `rrt_star` raises a `ValueError` instead of planning. `run_level1` avoids that by moving the start to the nearest clear point first (section 4, step 4).
 
 ### 5.5 Straightening the route (`smooth_path`)
 
@@ -128,65 +129,73 @@ Run `python path_planner.py` from the repo folder. It plans a full route through
 ## 6. Inside `auto_fruit_search.py` (the driver)
 
 ### 6.1 `init_ekf()`
-This loads the calibration files and builds `Robot` → `EKF`, exactly as `operate.py` does. It returns the EKF and the baseline value from `baseline.txt`, which `turn()` uses. See bug 3 in section 7.
+This loads the calibration files and builds `Robot` → `EKF`, exactly as `operate.py` does. It returns the EKF and the value in `baseline.txt`. That value is stored as −0.1386 (the minus sign comes from the calibration formula), so the `Navigator` uses its size, 0.1386 m, for its turning maths and leaves the EKF's copy exactly as M1 has always used it.
 
 ### 6.2 "Where am I?" (`Navigator.get_robot_pose`)
 
-The same function behaves differently on the first call and on every call after that:
+Every call grabs the latest camera frame and finds the markers in it. At startup, it first waits (up to 5 s) for the camera to deliver its first frame. What happens next depends on whether the robot has moved yet.
 
-**First call** (before the robot has moved):
-The EKF has just had its map frozen, and its uncertainty **P for the robot is exactly zero**. A filter that is 100% sure of itself ignores new evidence, so a normal EKF update would change nothing. Instead, the code grabs a camera frame, finds the markers, and calls `ekf.recover_from_pause()`. That function solves for the pose directly: "given where these markers appear to me and where the map says they are, where must I be standing?" This is a best-fit alignment called Umeyama. It needs **at least 2 markers** in view. If fewer are visible, it prints a warning and the pose stays at the default `(0, 0, 0)`. That's why starting at the arena centre, facing +x, matters: the default happens to be correct.
+**Before the first move:** the EKF has just had its map frozen, and its uncertainty **P for the robot is exactly zero**. A filter that is 100% sure of itself ignores new evidence, so a normal update would change nothing. Instead, it calls `ekf.recover_from_pause()`, which solves for the pose directly: "given where these markers appear to me and where the map says they are, where must I be standing?" This is a best-fit alignment (Umeyama). It needs **at least 2 known markers** in view, and prints `Initial pose from N markers: ...` when it works. If it doesn't, it prints a warning once, and the pose stays at the default `(0, 0, 0)`: the arena centre, facing the map's +x. That's why starting there, facing +x, is the safe choice.
 
-**Every later call:**
-1. **Predict:** "Since I last asked, the wheels turned this many ticks, so I've probably moved here." `_drive_measurement_since_last_call()` reads the wheel counters, subtracts the previous reading, and packs the difference into a `DriveMeasurement`. `ekf.predict()` then moves the pose estimate and increases P (it gets a bit less sure).
-2. **Correct:** grab a frame, detect markers, `ekf.update()`. Each marker's seen position is compared with where it *should* appear from the predicted pose, and the pose is nudged to reduce the difference. Because P is no longer zero, the nudge actually does something.
-3. Return `[x, y, θ]`.
+**After that:** `turn()` and `drive_forward()` have already told the EKF about the move (section 6.3), so this only needs the **correct** step. `ekf.update()` compares where each marker appears with where it *should* appear from the predicted pose, and nudges the pose to close the gap. If 2 or more markers are in view but the update rejects every one of them as too far from what it expected, the prediction has gone badly wrong. It then re-anchors straight from the markers with `recover_from_pause()`, and prints that it did.
 
-`_drive_measurement_since_last_call()` also has a guard copied from `operate.py`: if either counter went *down* by more than 10 ticks, it assumes the counters were reset and treats the movement as zero. See bug 4 in section 7.
+**How much to trust a marker.** `slam/ekf.py` was tuned for M1 mapping, and it assumes each marker reading could be 15–30 cm out. That's so wide that an update fixes only about 2% of a position error. With the map frozen, there are no marker estimates to protect, so the `Navigator` gives this EKF a tighter noise model: 3 cm + 3 cm per metre of distance (`marker_noise`). Nothing changes in `ekf.py` or `operate.py`.
 
 ### 6.3 Moving (`turn`, `drive_forward`, `_wait_for_move`)
 
 - **`drive_forward(d)`**: ticks = `d × 172.5`, so 0.5 m is 86 ticks. It sends both wheels forward at speed 0.4 with that tick target (`move_auto_encoder`). The robot counts the ticks itself and stops.
-- **`turn(dθ)`**: spinning on the spot, each wheel travels an arc of `(baseline / 2) × |dθ|`. With a 0.1386 m baseline, a 90° turn is 0.109 m per wheel, which is 19 ticks. The wheels spin in opposite directions: `[-0.35, +0.35]` turns left (the same as operate.py's left arrow key), and `[+0.35, -0.35]` turns right.
-- **`_wait_for_move()`**: waits for the robot to report "done" (`autonomous_done`), checking every 20 ms. If a move takes longer than 15 s, it force-stops the robot and prints a warning.
+- **`turn(dθ)`**: spinning on the spot, each wheel travels an arc of `(0.1386 / 2) × |dθ|`, so a 90° turn is 0.109 m per wheel, which is 19 ticks. The wheels spin in opposite directions: `[-0.35, +0.35]` turns left (the same as operate.py's left arrow key), and `[+0.35, -0.35]` turns right. One tick is the smallest possible turn (about 4.8°), so a turn under half a tick is skipped. If turns come up consistently short or long on the real floor, `turn_scale` sends proportionally more or fewer ticks (section 7).
+- **Telling the EKF about the move.** Straight after each move, `_predict_commanded_motion()` calls `ekf.predict()` with the move that was *commanded*: the tick counts sent to the robot. It doesn't read the wheel counters, because the Pi zeroes them whenever the robot stops. A commanded move is less certain than a measured one, so it also widens the pose uncertainty by 10% of each turn (heading) and 5% of each drive (position). That's what lets the next marker update pull the pose back when a move came up short or long.
+- **`_wait_for_move()`**: waits for the robot to report "done" (`autonomous_done`), checking every 20 ms. If a move takes longer than 15 s, it force-stops the robot, prints a warning and widens the uncertainty a lot. After every move, it waits 0.4 s so that the next pose check uses a camera frame taken after the robot stopped, not a blurred one from mid-move.
 
 ### 6.4 Going to one waypoint (`drive_to_point`)
 
-1. Get the pose. Work out the compass direction to the waypoint (`atan2`), subtract the current heading, and wrap the result into −180°…+180° (`_normalize_angle`), so the robot never turns 270° left when 90° right would do. Then **turn**.
-2. Get the pose **again**, because the turn is never perfect. Measure the straight-line distance to the waypoint from where the robot *actually* is now, then **drive** it.
-3. Get the pose a third time, print it, and return it. The next waypoint starts from this corrected pose, so errors get fixed at each waypoint instead of piling up.
+1. Get the pose. If the waypoint is under 2 cm away, it's already there, so return.
+2. Work out the compass direction to the waypoint (`atan2`), subtract the current heading, and wrap the result into −180°…+180° (`_normalize_angle`), so the robot never turns 270° left when 90° right would do. Then **turn**.
+3. Get the pose again. If the heading is still more than 5° off (the turn slipped, or the markers showed it isn't where it thought), turn again, up to 2 extra times. A 10° error would put the robot 17 cm off course after 1 m.
+4. Measure the straight-line distance from where the robot *actually* is now, and **drive** it.
+5. Get the pose once more, print it, and return it. The next waypoint starts from this corrected pose, so errors get fixed at each waypoint instead of piling up.
 
 ### 6.5 `run_manual()`
 With `--manual`, you type an x and y, the robot drives there with `drive_to_point`, and it asks whether you want another. This is useful for testing the driving on its own.
 
 ---
 
-## 7. Bugs I found while writing this (fix before the next robot run)
+## 7. What was fixed on 22 September, and what to check on the robot
 
-I checked these against the real files on disk, plus a simulated robot that uses your real `slam/ekf.py` and calibration files.
+Tracing the code for the first version of this walkthrough turned up five bugs. All five are now fixed in `auto_fruit_search.py`. `path_planner.py`, `slam/ekf.py` and `operate.py` were not changed.
 
-**Bug 1 (would crash on the first target): `read_true_map()` puts the markers in the wrong rows.**
-It stores marker *N* in row `int(key[5])`, so aruco1 goes in row 1 and aruco9 in row 9. Then aruco10 is also written to row 9, which overwrites aruco9. Row 0 is never filled. It comes from `np.empty`, so it holds whatever junk was in memory; in my test that was ≈ `(0, 0)`, the robot's starting spot. The result: a phantom marker at the start, and marker 9 at (−0.95, 1.05) missing from the obstacle list. In my test, `rrt_star` immediately raised `ValueError: start point is inside an inflated obstacle` on redapple.
-*Fix:* `marker_id = int(key[5:].split('_')[0]) - 1` (this works for 1–10), and use `np.zeros` rather than `np.empty`. I kept this function from the manual's template without checking it. That's on me.
+| # | Bug | What it did | Fix |
+|---|---|---|---|
+| 1 | `read_true_map()` put marker *N* in row *N* | aruco10 overwrote aruco9, and row 0 was left as junk (≈ the start point), so the planner crashed on the first fruit | Marker *N* goes in row *N*−1, and the array starts as zeros |
+| 2 | `read_true_map()` rounded positions to 0.1 m | Obstacles moved by up to 6.8 cm, more than the safety margin | Uses the exact values |
+| 3 | `baseline.txt` holds −0.1386 | Every turn was sent as 1 tick (about 5°) | Turning uses the size, 0.1386 m |
+| 4 | Wheel counters read before and after whole moves | The Pi zeroes them when it stops, so SLAM never saw the robot move | Each move is fed to the EKF as commanded, with extra uncertainty (6.3) |
+| 5 | `rrt_star`'s `ValueError` not caught | A pose estimate just inside a safety circle would crash the run | Plans from the nearest clear point, and retries with 4000 rounds before giving up (section 4) |
 
-**Bug 2 (shifts obstacles by up to 7 cm): `read_true_map()` rounds positions to 0.1 m.**
-Your map has positions like −0.920. Rounding moves things by up to 0.068 m, which is more than the 0.05 m safety margin. It also means the planner and the SLAM filter disagree about where the markers are, because the filter reads the exact values. The parking spot was 0.264 m from greenapple and 0.324 m from orange instead of 0.300 m.
-*Fix:* remove the `np.round(..., 1)` so the exact values are used.
+Testing those fixes turned up four more problems, also fixed:
 
-**Bug 3 (the robot barely turns): the calibrated baseline is negative.**
-`calibration/param/baseline.txt` contains **−0.1386**. The minus sign comes from the calibration formula using the −0.5 wheel speed. `turn()` computes ticks from `baseline / 2`, so the result is negative, and `max(1, …)` turns it into **1 tick** for every turn, about 5°. In simulation, asking for (0, 0.5) from the start made the robot turn 4.8°, drive along x instead, and finish 0.68 m from the waypoint.
-*Fix:* use `abs(baseline)` in `turn()`. Leave the file alone: the SLAM filter has been working with the negative value since M1, so the counters and the filter are presumably already consistent with it.
+- The route's first waypoint was the robot's own position. Aiming at a point 0 m away gives a random heading, so the robot made a pointless turn at the start of every route.
+- The first pose check could run before the camera had sent a frame.
+- M1's marker noise model stopped updates from correcting position (6.2).
+- `drive_to_point` drove off even when a turn had clearly slipped (6.4).
 
-**Bug 4 (the robot loses track of its moves): encoder differences are taken across whole moves.**
-`operate.py` reads the counters on every pass of its main loop, so each difference is small. My `Navigator` reads them only before and after a whole turn or drive, and that breaks in two ways:
-- In an on-the-spot turn, one wheel's counter goes *down*. Any turn bigger than about 50° drops it by more than 10 ticks, so the "counter reset" guard throws the whole turn away.
-- Your own `calibrate_encoder.py` notes that **the Pi resets its counters to zero the moment the robot stops**. If that also happens in encoder mode, as it very likely does, the counters read ≈0 before and after every move, and predict thinks the robot never moved.
+`print_object_pos()` also only checked the first few objects in the map.
 
-In the simulation with counters reset on stop, the robot really drove 0.4 m, but SLAM still said `(0.00, 0.00)`. Marker updates alone didn't rescue it.
-*Fix:* straight after each `turn()` / `drive_forward()` finishes, feed the EKF the move you *commanded*. Build a `DriveMeasurement` from the requested ticks, written in the EKF's own left/right convention, so it works whatever the counters do. Then drop the before/after counter reading.
+**Simulated test.** I ran the fixed code 20 times per scenario on a fake robot that uses your real `ekf.py`, map, calibration and planner, with the Pi zeroing its counters at every stop. The fake camera sees markers within ±30° and 2 m. "Clean" markers have 1 cm + 1 cm/m of noise. "Noisy" markers have 3 cm + 3 cm/m, with every range reading 2% long.
 
-**Bug 5 (could crash mid-run): `rrt_star`'s `ValueError` isn't caught.**
-Parking spots can sit right at the edge of a neighbour's grown circle. If the SLAM pose lands 1–2 cm inside that edge after arriving, the next plan raises `ValueError` and the whole script stops, mid-demo.
-*Fix:* in `run_level1`, catch it and plan from the nearest free point instead, for example by stepping the start point straight out of the circle it's in.
+| Wheels | Clean markers: fruits over 0.4 m / runs with a collision | Noisy markers: fruits over 0.4 m / runs with a collision |
+|---|---|---|
+| Turns and drives accurate | 0/60 · 0/20 | 0/60 · 1/20 |
+| Turns 10% short, drives 3% short | 0/60 · 0/20 | 0/60 · 1/20 |
+| Turns 20% short, drives 5% long | 0/60 · 7/20 | 1/60 · 10/20 |
+| Same, with `turn_scale = 1.25` | 0/60 · 0/20 | 0/60 · 0/20 |
 
-**Quick way to see bugs 3 and 4 on the real robot:** put the robot at the centre facing +x. Run `python auto_fruit_search.py --ip <ip> --manual` and enter x = 0, y = 0.5. It *should* turn left 90° and drive 0.5 m. With the current code, it will barely turn, and the printed "pose now" won't match where the robot actually is.
+For comparison, the same fixes with M1's marker noise model gave 2 fruits out of tolerance and 6/20 runs with a collision in the 10%-slip case. The simulation is only as good as its guesses about slip and marker noise. It shows the logic works, but not that the real robot will score. The row that matters is how much your robot's turns actually slip.
+
+**What to check on the real robot, in order:**
+
+1. Run `python path_planner.py` to plan and plot the routes without the robot.
+2. Put the robot at the centre facing +x, run `python auto_fruit_search.py --ip <ip> --manual`, and enter (0, 0.5). It should turn left about 90° and drive 0.5 m. Watch where the *first* turn stops, before any correction turns. If turns are consistently short or long, set `turn_scale` in the `Navigator(...)` line of the `__main__` block. For example, if it reaches 80° when asked for 90°, use `turn_scale=1.125`.
+3. After a few waypoints, compare the printed "pose now" with a tape measure. More than about 5 cm apart means the pose tracking needs tuning (`marker_noise`, `turn_noise_frac`, `drive_noise_frac`).
+4. Do a full run: `python auto_fruit_search.py --ip <ip> --map truemap.txt`.
