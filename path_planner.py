@@ -1,5 +1,6 @@
 """
-path_planner.py -- RRT* motion planning for the fruit-searching robot (Milestone 3).
+path_planner.py -- motion planning for the fruit-searching robot (Milestone 3):
+A* on an occupancy grid (default) and RRT* (kept for comparison).
 
 Deliberately robot-independent: it works on plain (x, y) obstacle circles and
 arena bounds, and returns a list of (x, y) waypoints. That means it can be
@@ -14,6 +15,7 @@ collision radius, which is the standard simplification for this kind of planner.
 """
 
 import csv
+import heapq
 import math
 import random
 
@@ -252,6 +254,154 @@ def rrt_star(start, goal, obstacles, bounds=ARENA_BOUNDS, step_size=0.15, goal_b
 
 
 # ---------------------------------------------------------------------------
+# A* on an occupancy grid
+# ---------------------------------------------------------------------------
+
+class OccupancyGrid:
+    """
+    The arena cut into square cells, each marked blocked if its centre lies
+    inside any inflated obstacle circle (build_obstacles() already includes
+    the robot's own radius in those circles, so a free cell centre is a legal
+    place for the robot's centre to be).
+
+    Built once per obstacle set and reused for every re-plan against it. That
+    is the point of a grid here: auto_fruit_search.py re-plans after EVERY
+    waypoint, once it has a freshly measured pose, and a plan on a prebuilt
+    grid is a few milliseconds -- collision checks are array lookups, not
+    circle tests -- so re-planning that often costs nothing.
+    """
+
+    def __init__(self, obstacles, bounds=ARENA_BOUNDS, resolution=0.05):
+        (self.xmin, self.xmax), (self.ymin, self.ymax) = bounds
+        self.res = float(resolution)
+        self.nx = int(math.ceil((self.xmax - self.xmin) / self.res))
+        self.ny = int(math.ceil((self.ymax - self.ymin) / self.res))
+        xs = self.xmin + (np.arange(self.nx) + 0.5) * self.res
+        ys = self.ymin + (np.arange(self.ny) + 0.5) * self.res
+        gx, gy = np.meshgrid(xs, ys, indexing="ij")
+        self.blocked = np.zeros((self.nx, self.ny), dtype=bool)
+        for ox, oy, r in np.asarray(obstacles, dtype=float).reshape(-1, 3):
+            self.blocked |= (gx - ox) ** 2 + (gy - oy) ** 2 <= r ** 2
+
+    def to_cell(self, point):
+        return (int((point[0] - self.xmin) / self.res), int((point[1] - self.ymin) / self.res))
+
+    def to_world(self, cell):
+        return (self.xmin + (cell[0] + 0.5) * self.res, self.ymin + (cell[1] + 0.5) * self.res)
+
+    def free(self, cell):
+        i, j = cell
+        return 0 <= i < self.nx and 0 <= j < self.ny and not self.blocked[i, j]
+
+    def nearest_free(self, cell, max_radius_cells=10):
+        """The cell itself if free, else the nearest free cell in expanding
+        square rings around it, else None. Used to snap a start or goal that
+        sits a fraction of a cell inside a blocked one."""
+        if self.free(cell):
+            return cell
+        ci, cj = cell
+        for r in range(1, max_radius_cells + 1):
+            ring = [(ci + dx, cj + dy) for dx in range(-r, r + 1) for dy in (-r, r)]
+            ring += [(ci + dx, cj + dy) for dy in range(-r + 1, r) for dx in (-r, r)]
+            ring = [c for c in ring if self.free(c)]
+            if ring:
+                return min(ring, key=lambda c: (c[0] - ci) ** 2 + (c[1] - cj) ** 2)
+        return None
+
+
+_SQRT2 = math.sqrt(2.0)
+_NEIGHBOURS = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+               (1, 1, _SQRT2), (1, -1, _SQRT2), (-1, 1, _SQRT2), (-1, -1, _SQRT2)]
+
+
+def astar(start, goal, grid):
+    """
+    Shortest 8-connected path from `start` to `goal` over an OccupancyGrid.
+
+    Deterministic and optimal on the grid (Euclidean heuristic, which is
+    admissible for 8-connected moves), so two plans from nearly the same pose
+    give nearly the same route -- unlike RRT*, whose random sampling gave a
+    different wiggle every call, which mattered once the route was being
+    re-planned after every waypoint. Diagonal moves are refused when either
+    orthogonal neighbour is blocked, so the path never clips a corner.
+
+    @return: list of (x, y) waypoints from `start` to `goal` (both exact, with
+        grid-cell centres in between), or None if no path exists
+    """
+    start = (float(start[0]), float(start[1]))
+    goal = (float(goal[0]), float(goal[1]))
+    s0, g0 = grid.to_cell(start), grid.to_cell(goal)
+    s, g = grid.nearest_free(s0), grid.nearest_free(g0)
+    if s is None or g is None:
+        return None
+    if s == g:
+        return [start, goal]
+
+    def h(c):
+        return math.hypot(c[0] - g[0], c[1] - g[1])
+
+    open_heap = [(h(s), 0.0, s)]
+    came_from = {s: None}
+    g_cost = {s: 0.0}
+    closed = set()
+    while open_heap:
+        _, gc, c = heapq.heappop(open_heap)
+        if c in closed:
+            continue
+        closed.add(c)
+        if c == g:
+            break
+        for dx, dy, w in _NEIGHBOURS:
+            n = (c[0] + dx, c[1] + dy)
+            if not grid.free(n):
+                continue
+            if dx and dy and (not grid.free((c[0] + dx, c[1])) or not grid.free((c[0], c[1] + dy))):
+                continue  # no corner cutting
+            ng = gc + w
+            if ng < g_cost.get(n, math.inf):
+                g_cost[n] = ng
+                came_from[n] = c
+                heapq.heappush(open_heap, (ng + h(n), ng, n))
+
+    if g not in came_from:
+        return None
+    cells = []
+    c = g
+    while c is not None:
+        cells.append(c)
+        c = came_from[c]
+    cells.reverse()
+
+    # Exact endpoints; the snapped cells only if snapping actually moved them.
+    inner = cells[1:-1]
+    if s != s0:
+        inner = [s] + inner
+    if g != g0:
+        inner = inner + [g]
+    return [start] + [grid.to_world(c) for c in inner] + [goal]
+
+
+def plan(start, goal, obstacles, planner="astar", grid=None, bounds=ARENA_BOUNDS,
+         resolution=0.05, rng=None):
+    """
+    One entry point for both planners. Returns a raw (unsmoothed) waypoint
+    list start -> goal, or None. Pass a prebuilt OccupancyGrid as `grid` to
+    re-plan repeatedly against the same obstacles without rebuilding it.
+    """
+    if planner == "rrt":
+        try:
+            path = rrt_star(start, goal, obstacles, bounds=bounds, rng=rng)
+            if path is None:
+                path = rrt_star(start, goal, obstacles, bounds=bounds, max_iter=4000, rng=rng)
+        except ValueError:
+            return None
+        return path
+    if grid is None:
+        grid = OccupancyGrid(obstacles, bounds=bounds, resolution=resolution)
+    return astar(start, goal, grid)
+
+
+# ---------------------------------------------------------------------------
 # Path smoothing
 # ---------------------------------------------------------------------------
 
@@ -259,13 +409,28 @@ def smooth_path(path, obstacles, iterations=100, rng=None):
     """
     Shortcut-smooth a path: repeatedly try connecting two non-adjacent waypoints
     directly, keeping the shortcut if the straight line is collision-free. This
-    is what turns RRT*'s slightly wiggly output into a small number of straight
+    is what turns A*'s staircase (or RRT*'s wiggle) into a small number of straight
     segments the robot can actually execute cleanly -- fewer turns means less
     opportunity for encoder drift to compound (see M1 notes on swerving from
     stacked corrections).
     """
     rng = rng or random
     path = list(path)
+
+    # Greedy pass first: from each kept point, jump straight to the farthest
+    # later point reachable without a collision. Deterministic, and it
+    # collapses an A* staircase (dozens of cell centres) into a handful of
+    # segments in one sweep -- the random shortcutting below then only polishes.
+    greedy = [path[0]]
+    i = 0
+    while i < len(path) - 1:
+        j = len(path) - 1
+        while j > i + 1 and segment_in_collision(path[i], path[j], obstacles):
+            j -= 1
+        greedy.append(path[j])
+        i = j
+    path = greedy
+
     for _ in range(iterations):
         if len(path) <= 2:
             break
@@ -322,6 +487,7 @@ def standoff_point(target, obstacles, bounds=ARENA_BOUNDS, standoff_dist=0.3,
 if __name__ == "__main__":
     import argparse
     import json
+    import time
     import matplotlib.pyplot as plt
 
     parser = argparse.ArgumentParser(description="Off-robot RRT* planner test")
@@ -331,6 +497,8 @@ if __name__ == "__main__":
     parser.add_argument("--robot-radius", type=float, default=ROBOT_RADIUS,
                          help="PiBot footprint radius, centre to widest point (measured)")
     parser.add_argument("--out", type=str, default="lab_output/m3_planner_test.png")
+    parser.add_argument("--planner", choices=["astar", "rrt"], default="astar")
+    parser.add_argument("--grid-res", type=float, default=0.05, help="A* cell size (m)")
     args = parser.parse_args()
 
     with open(args.map, "r") as f:
@@ -346,7 +514,7 @@ if __name__ == "__main__":
     ax.set_xlim(*ARENA_BOUNDS[0])
     ax.set_ylim(*ARENA_BOUNDS[1])
     ax.set_aspect("equal")
-    ax.set_title(f"M3 Level 1 -- RRT* route (robot_radius={args.robot_radius}m)")
+    ax.set_title(f"M3 Level 1 -- {args.planner.upper()} route (robot_radius={args.robot_radius}m)")
 
     current = (0.0, 0.0)
     colors = plt.cm.tab10.colors
@@ -360,9 +528,11 @@ if __name__ == "__main__":
             print(f"[{target_name}] FAILED -- no collision-free standoff point found")
             all_ok = False
             continue
-        path = rrt_star(current, goal, obstacles)
+        t0 = time.perf_counter()
+        path = plan(current, goal, obstacles, planner=args.planner, resolution=args.grid_res)
+        plan_ms = (time.perf_counter() - t0) * 1000
         if path is None:
-            print(f"[{target_name}] FAILED -- RRT* found no path within the iteration budget")
+            print(f"[{target_name}] FAILED -- {args.planner} found no path")
             all_ok = False
             continue
         path = smooth_path(path, obstacles)
@@ -370,7 +540,7 @@ if __name__ == "__main__":
         xs, ys = zip(*path)
         ax.plot(xs, ys, "-o", color=colors[i % 10], label=f"{i+1}. {target_name}", markersize=3)
         ax.plot(*target, "*", color=colors[i % 10], markersize=15)
-        print(f"[{target_name}] OK -- {len(path)} waypoints after smoothing, "
+        print(f"[{target_name}] OK -- {len(path)} waypoints after smoothing ({plan_ms:.0f} ms to plan), "
               f"final point is {dist_between(path[-1], target):.3f}m from target")
         current = path[-1]
 
