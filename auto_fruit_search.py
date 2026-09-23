@@ -7,6 +7,7 @@ import json
 import time
 import math
 import argparse
+import contextlib
 import csv
 import numpy as np
 from botconnect import BotConnect # access the robot communication
@@ -201,9 +202,16 @@ class FruitMapper:
         drift under the robot while it is driving at them."""
         self.frozen = True
 
-    def observe(self, boxes, pose):
+    def observe(self, boxes, pose, only=None):
         """Fuse one frame's (label, xywh box) list taken at `pose`. Returns
-        how many sightings the filter accepted."""
+        how many sightings the filter accepted.
+
+        `only` restricts which labels are fused: None = every box, a set of
+        labels = just those, or 'new' = only fruits not yet on the map (a
+        first glimpse registers an obstacle; a fruit already mapped is left
+        exactly where it is). The targeted refinement after the centre scan
+        (Navigator.pan_at_fruit) uses a one-label set so a pan aimed at one
+        fruit cannot drag the others."""
         if not boxes or self.frozen:
             return 0
         robot_pose = np.array([[float(pose[0])], [float(pose[1])], [float(pose[2])]])
@@ -211,6 +219,11 @@ class FruitMapper:
         accepted = 0
         for label, box in boxes:
             if label not in self.dims:
+                continue
+            if only == 'new':
+                if label in self.fruit_ekf.estimates:
+                    continue
+            elif only is not None and label not in only:
                 continue
             x, y = estimate_pose(robot_pose, box, self.dims[label][2], self.f, self.cx)
             known = {l: (p[0, 0], p[1, 0]) for l, p in self.fruit_ekf.estimates.items()}
@@ -398,6 +411,16 @@ class Navigator:
         self.fruit_tags = {}                      # fruit name -> pseudo tag in ekf.taglist
         self.fruit_mapper = None                  # FruitMapper, Level 3 only: every frame's boxes go to it
         self._suppress_mapping = False            # scan_around() holds fruit boxes back until the pose has settled
+        # Which fruits a frame may update while the mapping is not suppressed:
+        # None = all, a set of labels = those only, 'new' = only fruits not
+        # on the map yet (see FruitMapper.observe / mapping_policy()).
+        self._map_only = None
+        # Targeted refinement (pan_at_fruit): half-width and step of the
+        # sweep about the fruit's estimated bearing. The camera FOV is
+        # ~31 deg, so +/-20 keeps the fruit in frame at every step while the
+        # pose is corrected by whatever markers share those frames.
+        self.refine_pan_half = np.deg2rad(20.0)
+        self.refine_pan_step = np.deg2rad(10.0)
         # 360 deg mapping scan (Level 3). Small steps, and a dwell of several
         # frames at each: markers correct the pose on every frame, fruit
         # boxes are only fused once the pose at that stop has converged.
@@ -688,10 +711,29 @@ class Navigator:
 
     def _map_fruits_from_last_frame(self):
         """Level 3: hand the frame's fruit boxes to the mapper, stamped with
-        the pose as corrected by that same frame's markers."""
+        the pose as corrected by that same frame's markers. Under the 'new'
+        policy the pose must also have converged: a first glimpse plotted
+        against a pose that is about to be corrected is a phantom obstacle."""
         if self.fruit_mapper is not None and self._last_boxes and not self._suppress_mapping:
+            if self._map_only == 'new' and not self.pose_converged():
+                return
             s = self.ekf.robot.state
-            self.fruit_mapper.observe(self._last_boxes, (s[0, 0], s[1, 0], s[2, 0]))
+            self.fruit_mapper.observe(self._last_boxes, (s[0, 0], s[1, 0], s[2, 0]), only=self._map_only)
+
+    @contextlib.contextmanager
+    def mapping_policy(self, only):
+        """Temporarily restrict which fruits the frames taken inside the block
+        may update -- see FruitMapper.observe(). `only=False` suppresses
+        mapping altogether (a pose check that must not move any fruit)."""
+        prev_only, prev_suppress = self._map_only, self._suppress_mapping
+        if only is False:
+            self._suppress_mapping = True
+        else:
+            self._map_only = only
+        try:
+            yield
+        finally:
+            self._map_only, self._suppress_mapping = prev_only, prev_suppress
 
     def _apply_measurements(self, aruco, fruits, allow_anchor=True):
         """
@@ -1070,6 +1112,97 @@ class Navigator:
             s = self.ekf.robot.state
             return np.array([s[0, 0], s[1, 0], s[2, 0]])
         return self.relocalise()
+
+    def check_pose(self):
+        """
+        Confirm where the robot is WITHOUT touching the fruit map. Used on
+        arrival at a viewpoint chosen for one fruit: the relocalise pans turn
+        the camera across whatever markers are handy, and other fruits drift
+        through those frames while the heading is still being corrected --
+        exactly the frames that must not move them. Same rule as
+        settle_pose(): only re-localise if the pose has not already converged.
+        @return: the pose afterwards, np.array([x, y, theta])
+        """
+        with self.mapping_policy(False):
+            return self.settle_pose()
+
+    def pan_at_fruit(self, name, target, half=None, step=None, frames=None):
+        """
+        Targeted refinement of ONE fruit's position (Level 3, after the
+        centre scan). Turn to face `target` (the fruit's current estimate),
+        then sweep +/- `half` about that bearing in `step` increments. Each
+        stop dwells like scan_around(): markers correct the pose on every
+        frame, and only once the dwell is over AND the pose has converged
+        are the consensus boxes for `name` -- and no other label -- handed
+        to the mapper. Fruits that happen to share the frame are ignored:
+        this pan was planned for one fruit's bearing, and it is the only
+        one whose geometry is right for it.
+
+        @return: dict(seen=bool, mapped_stops=int, skipped_stops=int,
+                      others=set of other labels that were in view)
+        """
+        half = self.refine_pan_half if half is None else abs(float(half))
+        step = self.refine_pan_step if step is None else abs(float(step))
+        frames = self.scan_frames if frames is None else int(frames)
+        n_steps = max(1, int(round(2 * half / step)))
+
+        s = self.ekf.robot.state
+        bearing = math.atan2(target[1] - s[1, 0], target[0] - s[0, 0])
+        theta = float(s[2, 0])
+        lo, hi = bearing - half, bearing + half
+        if abs(_normalize_angle(lo - theta)) <= abs(_normalize_angle(hi - theta)):
+            first, signed_step = lo, step
+        else:
+            first, signed_step = hi, -step
+        print("  [{}] refine: estimate [{:+.2f}, {:+.2f}] at {:+.0f}deg, {:.2f} m -- sweeping +/-{:.0f}deg".format(
+            name, target[0], target[1], math.degrees(_normalize_angle(bearing)),
+            math.hypot(target[0] - s[0, 0], target[1] - s[1, 0]), math.degrees(half)))
+        self.turn(_normalize_angle(first - theta))
+
+        seen = False
+        others = set()
+        mapped_stops = skipped_stops = 0
+        for k in range(n_steps + 1):
+            if k > 0:
+                self.turn(signed_step, speed=self.pan_turn_speed, noise_frac=self.scan_turn_noise_frac)
+            dwell = []
+            n_ar_last = 0
+            with self.mapping_policy(False):
+                for f in range(frames):
+                    if f > 0:
+                        self.display.idle(self.scan_frame_gap)
+                    img = self._latest_image()
+                    aruco, fruits = self._sense(img)
+                    _, n_ar_last, _ = self._apply_measurements(aruco, fruits)
+                    dwell.append(list(self._last_boxes))
+            boxes = self._consensus_boxes(dwell)
+            labels = [label for label, _ in boxes]
+            others.update(l for l in labels if l != name)
+            mine = [(l, b) for l, b in boxes if l == name]
+            status = "-"
+            if mine:
+                seen = True
+                if self.pose_converged():
+                    s = self.ekf.robot.state
+                    accepted = self.fruit_mapper.observe(mine, (s[0, 0], s[1, 0], s[2, 0]), only={name})
+                    mapped_stops += 1
+                    status = "mapped" if accepted else "rejected by the fruit filter's gate"
+                else:
+                    skipped_stops += 1
+                    sd_x, sd_y, sd_t, _, _ = self.pose_uncertainty()
+                    status = "NOT mapped: pose not converged (sd {:.0f}/{:.0f} cm, {:.0f} deg)".format(
+                        sd_x * 100, sd_y * 100, math.degrees(sd_t))
+            elif labels:
+                status = "target not in frame (ignored {})".format(", ".join(sorted(labels)))
+            s = self.ekf.robot.state
+            print("  [{}] refine {:2d}/{}: hdg {:+6.1f}deg, {} marker(s), fruits {} -> {}".format(
+                name, k + 1, n_steps + 1, math.degrees(_normalize_angle(float(s[2, 0]))),
+                n_ar_last, labels or "-", status))
+        if others:
+            print("  [{}] refine: {} were in view but left untouched".format(name, ", ".join(sorted(others))))
+        if not seen:
+            print("  [{}] refine: never in frame across the sweep".format(name))
+        return {'seen': seen, 'mapped_stops': mapped_stops, 'skipped_stops': skipped_stops, 'others': others}
 
     def _pan_about(self, centre_heading):
         """
@@ -1697,18 +1830,26 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
 
     Phase 1 -- explore. Scan 360 deg from the arena centre first (from there
     the 1.2-1.5 m detection range covers most of a 2.5 m arena) -- see
-    scan_around() for how each stop dwells and only maps from a settled pose. After that,
-    each next viewpoint is chosen FOR the weakest search-list fruit: a point
-    view_ring from its estimate along a bearing it has not yet been seen
-    from, because a fruit's depth is only pinned by rays crossing from
-    different directions (FruitEKF.bearing_spread). Fruits never seen at all
-    fall back to the fixed quadrant viewpoints. Every frame's markers keep
-    the pose anchored; every frame's fruit boxes go through the M2 pipeline
-    into the FruitEKF (see FruitMapper). The obstacle set grows as fruits
-    are mapped, so exploration never plans through a fruit it has already
-    seen, and a viewpoint that turns out to sit on a fruit is dropped. Stops
-    once every search_list fruit is well mapped, or at max_viewpoints. The
-    map is written to `map_out` in truemap.txt format.
+    scan_around() for how each stop dwells and only maps from a settled pose.
+    That is the ONLY full rotation. After it, each next viewpoint is chosen
+    FOR the weakest search-list fruit: a point view_ring from its estimate
+    along a bearing it has not yet been seen from, because a fruit's depth
+    is only pinned by rays crossing from different directions
+    (FruitEKF.bearing_spread). On arrival the robot (1) confirms its own pose
+    with the fruit map untouched (Navigator.check_pose) and then (2) turns to
+    that fruit and pans a narrow window across it, feeding only THAT fruit
+    to the mapper (Navigator.pan_at_fruit). A 360 here was doing harm: while
+    the heading was still being corrected, other fruits swept through the
+    frames and were re-plotted against a pose that was about to change.
+    While driving between viewpoints, frames may only REGISTER fruits not
+    yet on the map (as obstacles, and only from a converged pose); a fruit
+    already mapped is never moved by a drive-time frame. Fruits never seen
+    at all fall back to the fixed quadrant viewpoints, where a 360 scan is
+    still the only way to find them. The obstacle set grows as fruits are
+    mapped, so exploration never plans through a fruit it has already seen,
+    and a viewpoint that turns out to sit on a fruit is dropped. Stops once
+    every search_list fruit is well mapped, or at max_viewpoints. The map is
+    written to `map_out` in truemap.txt format.
 
     Phase 2 -- park. The map is LOCKED first (FruitMapper.freeze()): the
     positions the exploration produced are the ones the robot commits to,
@@ -1745,13 +1886,14 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
         obstacles, grid = current_obstacles()
         fixed = [v for v in fixed if not path_planner.point_in_collision(v, obstacles)]
 
+        focus = None   # the one fruit this viewpoint is for; None -> full 360 scan
         if visited == 0:
             vp, why = (fixed.pop(0) if fixed else tuple(pose[:2])), "centre scan"
         else:
             if mapper.all_expected_mapped():
                 print("[explore] every search-list fruit is well mapped -- stopping exploration")
                 break
-            vp, why = _next_viewpoint(mapper, search_list, pose, obstacles, view_ring)
+            vp, why, focus = _next_viewpoint(mapper, search_list, pose, obstacles, view_ring)
             if vp is None:
                 if not fixed:
                     print("[explore] nothing left to try -- stopping exploration")
@@ -1763,15 +1905,37 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
 
         visited += 1
         print(f"\n[explore] viewpoint {visited}: [{vp[0]:+.2f}, {vp[1]:+.2f}] -- {why}")
-        display.notify(f"Exploring: viewpoint {visited}")
+        display.notify(f"Exploring: viewpoint {visited}" + (f" ({focus})" if focus else ""))
         if path_planner.dist_between(vp, pose[:2]) > 0.10:
-            pose, failure = _go_to(nav, vp, current_obstacles, None, planner=planner,
-                                   max_leg_length=explore_leg_length, clearance_pref=clearance_pref,
-                                   label="explore", **level1_kwargs)
+            # Drive-time frames may register a fruit that is not on the map
+            # yet (it has to be an obstacle for the rest of this drive) but
+            # never move one that is: the pose mid-drive is exactly what the
+            # relocalise pans are still correcting.
+            with nav.mapping_policy('new'):
+                pose, failure = _go_to(nav, vp, current_obstacles, None, planner=planner,
+                                       max_leg_length=explore_leg_length, clearance_pref=clearance_pref,
+                                       label="explore", **level1_kwargs)
             if failure is not None:
-                print(f"[explore] could not reach viewpoint ({failure}) -- scanning from here instead")
-        seen = nav.scan_around(step=scan_step)
-        pose = nav.settle_pose()
+                print(f"[explore] could not reach viewpoint ({failure}) -- looking from here instead")
+
+        if focus is not None:
+            # 1. Where am I? -- confirmed against the markers, fruit map untouched.
+            pose = nav.check_pose()
+            # 2. Now the one fruit this viewpoint was chosen for.
+            target = mapper.positions().get(focus)
+            if target is None:
+                focus = None   # dropped from the map in the meantime: nothing to aim at
+            else:
+                display.notify(f"Refining {focus}")
+                result = nav.pan_at_fruit(focus, target)
+                seen = {focus} if result['seen'] else set()
+                if not result['seen']:
+                    print(f"[explore] {focus} was not where the map put it -- falling back to a 360 scan")
+                    seen = nav.scan_around(step=scan_step)
+                pose = nav.check_pose()
+        if focus is None:
+            seen = nav.scan_around(step=scan_step)
+            pose = nav.settle_pose()
         print("[explore] after viewpoint {}: saw {}; map so far:\n{}".format(
             visited, sorted(seen) or "nothing", mapper.report()))
 
@@ -1818,12 +1982,14 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=path_planner
     and for being out near the walls (fewer markers in view, worse
     localisation, and the mapper inherits every cm of pose error). Must be
     inside the arena and outside every safety circle.
-    @return: ((x, y), reason) or (None, reason) if no expected fruit needs it
+    @return: ((x, y), reason, focus_label) -- focus_label is the weak fruit
+        whose ring the point sits on, i.e. the one to pan at from there --
+        or (None, reason, None) if no expected fruit needs it
     """
     est = mapper.positions()
     weak = [l for l in expected if l in est and not mapper.well_mapped(l)]
     if not weak:
-        return None, "no mapped fruit needs another look"
+        return None, "no mapped fruit needs another look", None
     (xmin, xmax), (ymin, ymax) = bounds
     half = 0.5 * min(xmax - xmin, ymax - ymin)
 
@@ -1835,7 +2001,7 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=path_planner
         seen_from = mapper.fruit_ekf.view_bearings.get(label, [])
         return min(min((abs(_normalize_angle(b - sb)) for sb in seen_from), default=math.pi), math.pi / 2)
 
-    best, best_score, best_why = None, -math.inf, ""
+    best, best_score, best_why, best_label = None, -math.inf, "", None
     for label in weak:
         fx, fy = est[label]
         for k in range(12):
@@ -1851,12 +2017,12 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=path_planner
                      - 0.8 * max(0.0, math.hypot(p[0], p[1]) - 0.6 * half))
             if score > best_score:
                 helped = [l for l, g in gains.items() if g > 0.2]
-                best, best_score = p, score
+                best, best_score, best_label = p, score, label
                 best_why = "new bearing on {} ({} seen over only {:.0f} deg so far)".format(
                     ", ".join(helped) or label, label, mapper.fruit_ekf.bearing_spread(label))
     if best is None:
-        return None, "no reachable viewpoint around " + ", ".join(weak)
-    return best, best_why
+        return None, "no reachable viewpoint around " + ", ".join(weak), None
+    return best, best_why, best_label
 
 
 def _go_to(nav, goal, obstacles, grid, planner='astar', max_leg_length=0.25, clearance_pref=0.15,
@@ -1953,7 +2119,13 @@ if __name__ == "__main__":
                          help="Level 3: keep refining fruit positions while parking (default: lock the "
                               "map after the scanning phase)")
     parser.add_argument("--scan-step", type=float, default=10.0,
-                         help="Level 3: step of the 360 deg mapping scan at each viewpoint, deg")
+                         help="Level 3: step of the 360 deg mapping scan (centre viewpoint, and the "
+                              "fallback for a fruit never seen), deg")
+    parser.add_argument("--refine-half", type=float, default=20.0,
+                         help="Level 3: half-width of the targeted pan across one fruit at each later "
+                              "viewpoint, deg")
+    parser.add_argument("--refine-step", type=float, default=10.0,
+                         help="Level 3: step of that targeted pan, deg")
     parser.add_argument("--scan-frames", type=int, default=3,
                          help="Level 3: frames taken at each scan stop; fruits are mapped from their consensus, "
                               "and only once the pose at that stop has converged")
@@ -2007,6 +2179,8 @@ if __name__ == "__main__":
     nav.pan_half = np.deg2rad(args.pan_half)
     nav.pan_step = np.deg2rad(args.pan_step)
     nav.scan_frames = max(1, args.scan_frames)
+    nav.refine_pan_half = np.deg2rad(args.refine_half)
+    nav.refine_pan_step = np.deg2rad(args.refine_step)
 
     # read in the true map
     object_list, object_true_pos, aruco_true_pos = read_true_map(args.map)
