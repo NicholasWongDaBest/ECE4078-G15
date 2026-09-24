@@ -1,0 +1,11 @@
+train: ["images/train", "synthetic/train/images"]
+val: images/val
+nc: 7
+names:
+  0: "capsicum"
+  1: "greenapple"
+  2: "lemon"
+  3: "lime"
+  4: "mango"
+  5: "orange"
+  6: "redapple"
