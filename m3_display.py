@@ -570,19 +570,24 @@ class M3Display:
             lines.append(("YOLO {} frames  acc {}  rej {}{}".format(
                 getattr(self.nav, '_n_detect_frames', 0), mapper.n_accepted, mapper.n_rejected,
                 "  LOCKED" if locked else ""), GOOD if locked else DIM))
+            # Unseen search-list fruits first: the panel only has room for
+            # 13 lines, and with six fruits mapped a "not seen yet" line at
+            # the bottom was cut off -- the one line that says the run is
+            # about to skip a target.
+            for k, label in enumerate(self.search_list, start=1):
+                if label not in fe.estimates:
+                    lines.append(("{}:{:9s} not seen yet".format(k, label[:9]), BAD))
             ordered = sorted(fe.estimates, key=lambda l: (l not in self.search_list, l))
             for label in ordered:
                 pos = fe.estimates[label]
                 ok = mapper.well_mapped(label)
-                colour = GOOD if ok else WARN
+                provisional = getattr(mapper, 'is_provisional', lambda l: False)(label)
+                colour = BAD if provisional else (GOOD if ok else WARN)
                 idx = "{}:".format(self.search_list.index(label) + 1) if label in self.search_list else "  "
                 lines.append(("{}{:9s} {:+.2f} {:+.2f}".format(idx, label[:9], pos[0, 0], pos[1, 0]), colour))
                 lines.append(("   sd {:.0f}cm  {}v {:.0f}deg  {}".format(
                     mapper.sigma(label) * 100, fe.n_views(label), fe.bearing_spread(label),
-                    "ok" if ok else "weak"), colour))
-            for k, label in enumerate(self.search_list, start=1):
-                if label not in fe.estimates:
-                    lines.append(("{}:{:9s} not seen yet".format(k, label[:9]), BAD))
+                    "ROUGH" if provisional else ("ok" if ok else "weak")), colour))
 
         for k, (text, colour) in enumerate(lines[:13]):
             self.canvas.blit(self.panel_font.render(text, False, colour), (x + 8, y + 6 + 23 * k))
