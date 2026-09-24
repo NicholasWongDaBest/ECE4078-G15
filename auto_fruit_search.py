@@ -2438,8 +2438,8 @@ def _leg_cap(nav, start, next_wp, obstacles, base_cap, open_cap, open_clearance=
 
 
 def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
-               planner='astar', grid_resolution=0.05, max_legs=20, goal_tolerance=0.05,
-               max_leg_length=0.25, safety_margin=0.10, found_radius=0.35,
+               planner='astar', grid_resolution=0.05, max_legs=20, goal_tolerance=0.03,
+               max_leg_length=0.25, safety_margin=0.10, found_radius=0.28, park_rings=(0.25, 0.22),
                clearance_pref=0.15, stall_legs=4, live_positions=None, object_radii=None,
                fruit_margin=0.06, bounds=None, open_leg_length=0.60, refine_weak=None,
                object_uncertainty=None, target_margin=0.03, approach_gap=0.06, approach_overshoot=0.40):
@@ -2473,11 +2473,11 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
     scoring radius is a success; driving back out to the standoff point
     would only be another chance to overshoot.
 
-    goal_tolerance stacks with the 0.3 m standoff: a leg may end that far
-    short of the standoff point, so 0.05 caps the believed finish at 0.35 m
-    from the fruit -- the same as found_radius -- leaving 5 cm of the 0.4 m
-    scoring radius for pose error. (0.10 allowed a believed 0.40 m finish,
-    which a 1 cm pose error turned into a miss.)
+    goal_tolerance stacks with the parking ring (park_rings, 0.22-0.25 m):
+    a leg may end that far short of the parking spot, so 0.03 caps the
+    believed finish at 0.28 m from the fruit -- the same as found_radius --
+    so the robot ends within 0.30 m with 2 cm to spare for pose error, and
+    12 cm inside the 0.4 m scoring radius.
 
     A pose inside a safety circle is planned FROM, not escaped from: the
     planner shrinks that circle to the robot's current depth so the route
@@ -2573,7 +2573,8 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             nb = _standoff_neighbours(target_name, target,
                                       {n: p for n, p in object_positions.items() if n != target_name},
                                       aruco_true_pos, object_uncertainty)
-            g, g_risk, g_gap = choose_standoff(target, from_xy, obstacles, grid, bounds, nb, planner=planner)
+            g, g_risk, g_gap = choose_standoff(target, from_xy, obstacles, grid, bounds, nb, planner=planner,
+                                               rings=park_rings)
             if g is not None:
                 bearing = math.degrees(math.atan2(g[1] - target[1], g[0] - target[0]))
                 print(f"[{target_name}] parking spot [{g[0]:.2f}, {g[1]:.2f}] ({bearing:+.0f} deg side of the fruit): "
@@ -2883,8 +2884,12 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
     tried = []   # (robot position, label) of every targeted pan, whatever came of it -- never repeated
 
     def not_ok():
-        """Search-list fruits on the map that are not yet well_mapped."""
-        return [l for l in search_list if l in mapper.positions() and not mapper.well_mapped(l)]
+        """Fruits on the map that are not yet well_mapped: the search-list
+        ones first, then the rest. An obstacle fruit mapped from one far
+        glimpse can be 15 cm out, and the robot drove into those."""
+        pos = mapper.positions()
+        targets = [l for l in search_list if l in pos and not mapper.well_mapped(l)]
+        return targets + sorted(l for l in pos if l not in search_list and not mapper.well_mapped(l))
 
     visited = 0
     while visited < max_viewpoints or (not_ok() and visited < hard_cap):
@@ -3076,12 +3081,15 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
                     grid=None, planner='astar', min_clearance=0.08, close_bonus=0.5, rough=None,
                     min_route_clearance=0.05, per_label_tries=8, tried=(), min_new_bearing=np.deg2rad(25.0),
                     n_bearings=24, wall_penalty=0.4, start_free_radius=0.35, blind_dist=0.30,
-                    crowd_dist=0.45, max_crowd=2, sightline_extra=0.06, corner_inset=0.05):
+                    crowd_dist=0.45, max_crowd=2, sightline_extra=0.06, corner_inset=0.05,
+                    obstacle_weight=0.7, corner_bonus=0.35, edge_bonus=0.15):
     """
     Where to look from next, and at which fruit. Exploration is spent on the
     SEARCH-LIST fruits only -- the others just have to be on the map as
     obstacles, which the scans already see to. Focus candidates are the
-    targets not yet FruitMapper.target_ready(): one that is not even well
+    targets not yet FruitMapper.target_ready(), and then the OTHER fruits
+    not yet well_mapped (obstacle_weight, 0.7x: they are what the robot
+    hits when mapped wrong): a search-list one that is not even well
     mapped counts 1.3x, one that is well mapped but has never been seen
     from close up or across a wide enough arc 1.0x, and one only glimpsed
     from an unconverged pose -- on the map provisionally
@@ -3107,7 +3115,8 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
     another object sitting on the line of sight to the fruit (within its
     radius + sightline_extra of that line). The four corners of `bounds`
     and the four edge midpoints, corner_inset in from the line, are
-    candidates too, free of the wall penalty: from a corner the whole
+    candidates too, free of the wall penalty and with a bonus (corner_bonus
+    for a corner, edge_bonus for a midpoint): from a corner the whole
     arena is in front of the camera and nothing is behind the robot.
 
     A candidate is scored for its OWN fruit only, since the pan there maps
@@ -3138,16 +3147,26 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
     est = mapper.positions()
     rough = {l: p for l, p in (rough or {}).items() if l not in est}
     weak = [l for l in expected if l in est and not mapper.target_ready(l)] + list(rough)
+    # Obstacle fruits (not on the search list) only have to be well_mapped,
+    # not target_ready -- but they do have to be that: a badly placed one
+    # is what the robot drives into on the way to a target.
+    obstacles_weak = [l for l in est if l not in expected and l not in rough and not mapper.well_mapped(l)]
+    weak += obstacles_weak
     if not weak:
-        return None, "every mapped search-list fruit is pinned down", None
+        return None, "every mapped fruit is pinned down", None
     est.update(rough)
     failed = {}
     for _, l in avoid:
         failed[l] = failed.get(l, 0) + 1
     # A fruit not yet well mapped may have up to 4 failed pans, one that is
     # only chasing target_ready() 2: the first is what parking depends on.
-    weight = {l: (1.6 if l in rough or mapper.is_provisional(l) else 1.0 if mapper.well_mapped(l) else 1.3)
-              for l in weak if failed.get(l, 0) < (2 if mapper.well_mapped(l) else 4)}
+    def weight_of(l):
+        if l in obstacles_weak:
+            return obstacle_weight   # below every search-list fruit
+        return 1.6 if l in rough or mapper.is_provisional(l) else 1.0 if mapper.well_mapped(l) else 1.3
+
+    weight = {l: weight_of(l) for l in weak
+              if failed.get(l, 0) < (2 if (mapper.well_mapped(l) or l in obstacles_weak) else 4)}
     if not weight:
         return None, "no pan has worked on " + ", ".join(weak) + " (2 tries for a well-mapped fruit, 4 otherwise)", None
     (xmin, xmax), (ymin, ymax) = bounds
@@ -3226,7 +3245,7 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
         fx, fy = est[label]
         cands = [((fx + r * math.cos(2 * math.pi * k / n_bearings), fy + r * math.sin(2 * math.pi * k / n_bearings)), False)
                  for r in (ring, ring + 0.20, fallback_ring, 0.35) for k in range(n_bearings)]
-        cands += [(c, True) for c in corner_spots]
+        cands += [(c, 2 if i < 4 else 1) for i, c in enumerate(corner_spots)]   # 2 = corner, 1 = edge midpoint
         for p, at_edge in cands:
             if not usable(p, label):
                 continue
@@ -3243,7 +3262,8 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
             score = (weight[label] * (g + (close_bonus if close else 0.0)
                                       + 0.4 * min(n_mk, 2) - (0.5 if n_mk == 0 else 0.0))
                      - 0.4 * path_planner.dist_between(p, pose[:2])
-                     - (0.0 if at_edge else wall_penalty * max(0.0, math.hypot(p[0], p[1]) - 0.6 * half)))
+                     - (0.0 if at_edge else wall_penalty * max(0.0, math.hypot(p[0], p[1]) - 0.6 * half))
+                     + (corner_bonus if at_edge == 2 else edge_bonus if at_edge == 1 else 0.0))
             if label in rough or mapper.is_provisional(label):
                 why = "looking for {} at its {} position [{:+.2f}, {:+.2f}] (only glimpsed so far), {} marker(s) in the pan window".format(
                     label, "provisional" if mapper.is_provisional(label) else "rough", est[label][0], est[label][1], n_mk)
@@ -3251,7 +3271,8 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
                 why = "new {:.0f} deg bearing on {} (seen over only {:.0f} deg so far, closest {:.2f} m{}), {} marker(s) in the pan window{}".format(
                     math.degrees(g), label, mapper.fruit_ekf.bearing_spread(label),
                     mapper.fruit_ekf.min_view_dist.get(label, float('nan')),
-                    "; this spot is a close look" if close else "", n_mk, " -- from the edge of the arena" if at_edge else "")
+                    "; this spot is a close look" if close else "", n_mk,
+                    " -- from a corner of the arena" if at_edge == 2 else " -- from the edge of the arena" if at_edge else "")
             scored.append((score, p, why, label))
     scored.sort(key=lambda c: -c[0])
     start = (float(pose[0]), float(pose[1]))
@@ -3435,8 +3456,9 @@ if __name__ == "__main__":
                          help="extra clearance around every marker and fruit beyond robot+object radius, m")
     parser.add_argument("--fruit-margin", type=float, default=0.06,
                          help="extra clearance around every fruit beyond robot+fruit radius, m (markers use --safety-margin)")
-    parser.add_argument("--found-radius", type=float, default=0.35,
-                         help="stop a target as soon as the pose is this close to the fruit, m")
+    parser.add_argument("--found-radius", type=float, default=0.28,
+                         help="stop a target as soon as the pose is this close to the fruit, m "
+                              "(parking spots are 0.22-0.25 m out, so the robot ends within 0.30 m)")
     parser.add_argument("--clearance", type=float, default=0.15,
                          help="berth A* prefers to keep from every safety circle, m (priced, not forbidden)")
     parser.add_argument("--edge-margin", type=float, default=EDGE_MARGIN,
@@ -3445,7 +3467,7 @@ if __name__ == "__main__":
     parser.add_argument("--open-leg", type=float, default=0.60,
                          help="longest drive when the straight line ahead is clear and the pose is "
                               "trusted, m; 0 = always --max-leg")
-    parser.add_argument("--max-viewpoints", type=int, default=8,
+    parser.add_argument("--max-viewpoints", type=int, default=10,
                          help="Level 3: viewpoints the mapping phase may visit (incl. the centre scan) once every "
                               "search-list fruit is well mapped; while one is not, it carries on up to "
                               "--hard-max-viewpoints")
