@@ -66,7 +66,7 @@ from botconnect import BotConnect
 
 TURN_SPEED = 0.35                                  # Navigator.__init__'s turn_speed
 PID_GAINS = {'kp': 2, 'ki': 0.04, 'kd': 0.29}      # auto_fruit_search.py's __main__
-TICKS_PER_METER = 172.5                            # init_ekf()'s Robot(...) argument
+TICKS_PER_METER = 190.0                            # init_ekf()'s Robot(...) argument
 SETTLE_TIME = 0.4                                  # Navigator.__init__'s settle_time
 MOVE_TIMEOUT = 15.0                                # Navigator.__init__'s move_timeout
 MARKER_LENGTH = 0.06                               # ArucoSensor(...) in __main__

@@ -1,17 +1,17 @@
 """
 m3_display.py -- live window for M3 (auto_fruit_search.py), laid out like operate.py.
 
-    +-------------+---------------------------+
-    | Robot Cam   |                           |
-    | (markers    |   Map: arena, markers,    |
-    |  outlined)  |   fruits, safety circles, |
-    +-------------+   route, robot + camera   |
-    | Status      |   view, pose uncertainty  |
-    | (markers in |                           |
-    |  view, pose,|                           |
-    |  targets)   |                           |
-    +-------------+---------------------------+
-    | notification / key help                 |
+    +-------------+---------------------------+-------------+
+    | Robot Cam   |                           | Detector    |
+    | (markers    |   Map: arena, markers,    | (last YOLO  |
+    |  outlined)  |   fruits, safety circles, |  frame+boxes)|
+    +-------------+   route, robot + camera   +-------------+
+    | Status      |   view, pose uncertainty, | Fruit map   |
+    | (markers in |   fruit estimates with    | (estimate,  |
+    |  view, pose,|   their uncertainty       |  sigma,     |
+    |  targets)   |   ellipses (Level 3)      |  views)     |
+    +-------------+---------------------------+-------------+
+    | notification / key help                               |
 
 Phases:
     setup  -- before anything drives. <- / -> turn the robot on the spot (15 deg,
@@ -116,13 +116,17 @@ DIM = (140, 140, 140)
 class M3Display:
     active = True
 
-    WIDTH, HEIGHT = 900, 760
+    WIDTH, HEIGHT = 1180, 760
     MAP_RES = 520
     MAP_POS = (360, 40)
     CAM_POS = (20, 40)
     CAM_SIZE = (320, 240)
     INFO_POS = (20, 320)
     INFO_SIZE = (320, 240)
+    DET_POS = (900, 40)         # last frame the fruit detector ran on, boxes + labels
+    DET_SIZE = (260, 195)
+    FRUIT_POS = (900, 250)      # per-fruit estimate / uncertainty / coverage readout
+    FRUIT_SIZE = (260, 310)
     VIEW_HALF = 1.45            # metres shown either side of the arena centre
     TURN_STEP = math.radians(15)
     FINE_STEP = math.radians(5)
@@ -389,7 +393,7 @@ class M3Display:
 
         self.ghost = None
         n = len(self.visible_tags)
-        if self.phase in ('setup', 'wait', 'manual') and n >= 2:
+        if n >= 2:   # every phase: during the run this is the check that the pose still agrees with the markers
             try:
                 _, lm_new, lm_prev, _ = self.ekf._match_known_landmarks(measurement)
                 fit = self.ekf._fit_rigid_pose(lm_new, lm_prev)
@@ -450,10 +454,14 @@ class M3Display:
         self._draw_camera()
         self._draw_info()
         c.blit(self._draw_map(), self.MAP_POS)
+        self._draw_detector()
+        self._draw_fruit_panel()
 
         self._caption('Robot Cam', self.CAM_POS)
         self._caption('Status', self.INFO_POS)
         self._caption('Map  (+x right, +y up)', self.MAP_POS)
+        self._caption('Detector', self.DET_POS)
+        self._caption('Fruit map', self.FRUIT_POS)
 
         # notification + key help, in a bar across the whole window
         bar = pygame.Rect(self.CAM_POS[0], 578, self.WIDTH - 2 * self.CAM_POS[0], 166)
@@ -496,6 +504,89 @@ class M3Display:
         self.canvas.blit(box, (self.CAM_POS[0] + 4, self.CAM_POS[1] + 4))
         self.canvas.blit(text, (self.CAM_POS[0] + 10, self.CAM_POS[1] + 6))
 
+    def _draw_detector(self):
+        """The last frame the fruit detector ran on, with its boxes and class
+        labels drawn the way operate.py's detector view draws them. The
+        navigation code decides when YOLO runs (every pan step, scan step and
+        pose check); this panel only shows what it saw, and how long ago."""
+        x, y = self.DET_POS
+        w, h = self.DET_SIZE
+        nav = self.nav
+        img = getattr(nav, '_last_detect_img', None)
+        if img is None:
+            view = np.zeros((h, w, 3), dtype=np.uint8)
+            note = "no detector loaded" if getattr(nav, 'detector', None) is None else "detector not run yet"
+            colour = DIM
+        else:
+            frame = np.ascontiguousarray(np.asarray(img, dtype=np.uint8)).copy()
+            for label, box in getattr(nav, '_last_boxes', []):
+                xc, yc, bw, bh = [float(v) for v in box]
+                x1, y1 = int(round(xc - bw / 2)), int(round(yc - bh / 2))
+                x2, y2 = int(round(xc + bw / 2)), int(round(yc + bh / 2))
+                col = FRUIT_RGB.get(label, DEFAULT_FRUIT_RGB)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
+                cv2.putText(frame, label, (x1, max(14, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
+            view = cv2.resize(frame, (w, h))
+            age = time.time() - getattr(nav, '_last_detect_time', 0.0)
+            names = ", ".join(label for label, _ in nav._last_boxes) or "nothing"
+            note = "YOLO {:.1f}s ago: {}".format(age, names)
+            colour = GOOD if nav._last_boxes else DIM
+        view = np.ascontiguousarray(view)
+        surface = pygame.image.frombuffer(view.tobytes(), (w, h), 'RGB')
+        self.canvas.blit(surface, (x, y))
+        pygame.draw.rect(self.canvas, (90, 90, 110), (x, y, w, h), 1)
+        text = self.panel_font.render(note[:34], False, colour)
+        box = pygame.Surface((min(w - 8, text.get_width() + 12), text.get_height() + 4))
+        box.set_alpha(170)
+        box.fill((0, 0, 0))
+        self.canvas.blit(box, (x + 4, y + h - text.get_height() - 8))
+        self.canvas.blit(text, (x + 10, y + h - text.get_height() - 6))
+
+    def _draw_fruit_panel(self):
+        """Per-fruit readout, like M2's coverage view: estimate, sigma, how
+        many distinct bearings it has been seen from and over what arc, and
+        whether that is enough to trust it (see FruitMapper.well_mapped)."""
+        x, y = self.FRUIT_POS
+        w, h = self.FRUIT_SIZE
+        panel = pygame.Surface((w, h))
+        panel.fill((25, 25, 35))
+        self.canvas.blit(panel, (x, y))
+        pygame.draw.rect(self.canvas, (90, 90, 110), (x, y, w, h), 1)
+
+        lines = []
+        mapper = getattr(self.nav, 'fruit_mapper', None)
+        if mapper is None:
+            lines.append(("positions from the map file", DIM))
+            for k, name in enumerate(self.search_list, start=1):
+                if name in self.object_positions:
+                    ox, oy = self.object_positions[name]
+                    lines.append(("{}:{:9s} {:+.2f} {:+.2f}".format(k, name[:9], ox, oy), TEXT))
+            for name, (ox, oy) in self.object_positions.items():
+                if name not in self.search_list:
+                    lines.append(("  {:9s} {:+.2f} {:+.2f}".format(name[:9], ox, oy), DIM))
+        else:
+            fe = mapper.fruit_ekf
+            locked = getattr(mapper, 'frozen', False)
+            lines.append(("YOLO {} frames  acc {}  rej {}{}".format(
+                getattr(self.nav, '_n_detect_frames', 0), mapper.n_accepted, mapper.n_rejected,
+                "  LOCKED" if locked else ""), GOOD if locked else DIM))
+            ordered = sorted(fe.estimates, key=lambda l: (l not in self.search_list, l))
+            for label in ordered:
+                pos = fe.estimates[label]
+                ok = mapper.well_mapped(label)
+                colour = GOOD if ok else WARN
+                idx = "{}:".format(self.search_list.index(label) + 1) if label in self.search_list else "  "
+                lines.append(("{}{:9s} {:+.2f} {:+.2f}".format(idx, label[:9], pos[0, 0], pos[1, 0]), colour))
+                lines.append(("   sd {:.0f}cm  {}v {:.0f}deg  {}".format(
+                    mapper.sigma(label) * 100, fe.n_views(label), fe.bearing_spread(label),
+                    "ok" if ok else "weak"), colour))
+            for k, label in enumerate(self.search_list, start=1):
+                if label not in fe.estimates:
+                    lines.append(("{}:{:9s} not seen yet".format(k, label[:9]), BAD))
+
+        for k, (text, colour) in enumerate(lines[:13]):
+            self.canvas.blit(self.panel_font.render(text, False, colour), (x + 8, y + 6 + 23 * k))
+
     def _draw_info(self):
         x, y = self.INFO_POS
         w, h = self.INFO_SIZE
@@ -521,7 +612,13 @@ class M3Display:
         lines.append(("SD  {:.1f} cm   {:.1f} deg".format(100 * xy_sd, th_sd), sd_colour))
         if self.ghost is not None:
             gx, gy, gth, resid, gn = self.ghost
-            lines.append(("FIT  {:+.2f} {:+.2f} {:+.0f}deg".format(gx, gy, math.degrees(gth)), (110, 210, 210)))
+            hdg_off = abs(math.degrees(math.atan2(math.sin(gth - s[2, 0]), math.cos(gth - s[2, 0]))))
+            pos_off = math.hypot(gx - s[0, 0], gy - s[1, 0])
+            if locked and (hdg_off > 10 or pos_off > 0.15):
+                lines.append(("FIT  {:+.2f} {:+.2f} {:+.0f}deg  OFF {:.0f}deg {:.0f}cm".format(
+                    gx, gy, math.degrees(gth), hdg_off, pos_off * 100), BAD if hdg_off > 20 else WARN))
+            else:
+                lines.append(("FIT  {:+.2f} {:+.2f} {:+.0f}deg".format(gx, gy, math.degrees(gth)), (110, 210, 210)))
         else:
             lines.append(("", TEXT))
 
@@ -541,7 +638,12 @@ class M3Display:
 
         if self.run_start is not None:
             elapsed = int(time.time() - self.run_start)
-            lines.append(("TIME  {:02d}:{:02d}".format(elapsed // 60, elapsed % 60), DIM))
+            ts = getattr(self.nav, 'turn_scale', None)
+            ts0 = getattr(self.nav, 'turn_scale_initial', ts)
+            learned = getattr(self.nav, '_turn_scale_samples', 0)
+            lines.append(("TIME  {:02d}:{:02d}   TURN x{:.2f}{}".format(
+                elapsed // 60, elapsed % 60, ts if ts is not None else 1.0,
+                "  (was {:.2f})".format(ts0) if learned and abs(ts - ts0) > 0.01 else ""), DIM))
 
         for k, (text, colour) in enumerate(lines[:10]):
             self.canvas.blit(self.panel_font.render(text, False, colour), (x + 10, y + 8 + 23 * k))
@@ -604,6 +706,39 @@ class M3Display:
             if status is not None and status[1]:
                 cv2.circle(img, centre, r_px + 4, SEEN, 2, cv2.LINE_AA)
 
+        # Level 3: every FruitEKF estimate with its uncertainty ellipse -- the
+        # same diamond + ellipse operate.py's draw_slam_state() uses, so it
+        # reads like the M2 map. The ellipse shrinks as sightings from new
+        # bearings pin the fruit down; a green ring means "well mapped".
+        mapper = getattr(self.nav, 'fruit_mapper', None)
+        state = self.ekf.robot.state
+        r_px_robot = self._px(float(state[0, 0]), float(state[1, 0]))
+        if mapper is not None:
+            fe = mapper.fruit_ekf
+            recent = time.time() - getattr(self.nav, '_last_detect_time', 0.0) < 2.0
+            just_seen = {label for label, _ in getattr(self.nav, '_last_boxes', [])} if recent else set()
+            for label, pos in fe.estimates.items():
+                fx, fy = float(pos[0, 0]), float(pos[1, 0])
+                centre = self._px(fx, fy)
+                colour = FRUIT_RGB.get(label, DEFAULT_FRUIT_RGB)
+                try:
+                    axes_len, angle = self.ekf.make_ellipse(fe.P[label])
+                    axes = (max(2, int(axes_len[0] * s)), max(2, int(axes_len[1] * s)))
+                    cv2.ellipse(img, centre, axes, angle, 0, 360, colour, 1, cv2.LINE_AA)
+                except Exception:
+                    pass
+                if label in just_seen:
+                    cv2.line(img, r_px_robot, centre, colour, 1, cv2.LINE_AA)
+                cv2.drawMarker(img, centre, colour, cv2.MARKER_DIAMOND, 10, 2)
+                if mapper.well_mapped(label):
+                    cv2.circle(img, centre, 9, SEEN, 1, cv2.LINE_AA)
+                tag = label[:3]
+                if label in self.search_list:
+                    tag = "{}:{}".format(self.search_list.index(label) + 1, tag)
+                cv2.putText(img, "{} {:.0f}cm".format(tag, mapper.sigma(label) * 100),
+                            (centre[0] + 8, centre[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                            (30, 30, 30), 1, cv2.LINE_AA)
+
         # the current target's 0.4 m success zone
         if self.target_xy is not None and self.phase in ('run', 'wait'):
             cv2.circle(img, self._px(*self.target_xy), int(0.4 * s), ZONE, 1, cv2.LINE_AA)
@@ -647,12 +782,25 @@ class M3Display:
         # fit when there is one.
         r = self._px(rx, ry)
         locked = self.nav._localised or self.phase != 'setup'
-        vx, vy, vth = (rx, ry, rth) if (locked or self.ghost is None) else self.ghost[:3]
+        # The camera wedge ALWAYS comes from the EKF heading -- the same theta the
+        # robot sprite is rotated by -- so the two can never disagree. Before the
+        # pose is locked in setup that heading is only assumed (centre, facing
+        # +x, plus any turns made), so the wedge is drawn dimmer and labelled.
+        fov_colour = FOV if locked else (225, 205, 140)
         for side in (-1, 1):
-            a = vth + side * self.fov_half
-            cv2.line(img, self._px(vx, vy), self._px(vx + 1.6 * math.cos(a), vy + 1.6 * math.sin(a)), FOV, 1, cv2.LINE_AA)
+            a = rth + side * self.fov_half
+            cv2.line(img, r, self._px(rx + 1.6 * math.cos(a), ry + 1.6 * math.sin(a)), fov_colour, 1, cv2.LINE_AA)
         if not locked:
             cv2.putText(img, "assumed", (r[0] - 30, r[1] - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
+            # ...and the pose the visible markers imply gets its own wedge, in
+            # the ghost colour, so it is obvious when the two do not line up
+            # (that is what ENTER fixes). Once locked they are one and the same.
+            if self.ghost is not None:
+                gx, gy, gth = self.ghost[:3]
+                for side in (-1, 1):
+                    a = gth + side * self.fov_half
+                    cv2.line(img, self._px(gx, gy), self._px(gx + 1.2 * math.cos(a), gy + 1.2 * math.sin(a)),
+                             GHOST, 1, cv2.LINE_AA)
         cv2.circle(img, r, int(path_planner.ROBOT_RADIUS * s), ROBOT, 1, cv2.LINE_AA)
         try:
             axes_len, angle = self.ekf.make_ellipse(self.ekf.P[0:2, 0:2])
