@@ -1,152 +1,25 @@
 # estimate the pose of a detected object
 import os
+import sys
 import ast
 import json
 import csv
 import numpy as np
 
-# Camera frame resolution used by the detector (matches operate.py's self.img/self.cv_vis
-# shape, and the imgsz=480 passed to model.predict in detector.py).
-IMG_WIDTH = 640
-IMG_HEIGHT = 480
-
-# ---------------------------------------------------------------------------
-# Per-box quality gates, ported from the ekf.py-based pipeline:
-#   in_frame_fraction()/IN_FRAME_FRACTION_THRESHOLD -> is_box_clipped()
-#   is_box_shape_plausible()/EXPECTED_ASPECT_RANGE   -> is_box_malformed()
-# ---------------------------------------------------------------------------
-
-IN_FRAME_FRACTION_THRESHOLD = 0.90  # box must be >=90% inside the frame to be trusted
-
-
-def in_frame_fraction(box, img_width, img_height):
-    """Fraction of this detection's box's AREA that lies within the camera
-    frame, from 0.0 (fully outside/off-frame) to 1.0 (fully inside)."""
-    x_center, y_center, w, h = box
-    if w <= 0 or h <= 0:
-        return 0.0
-    x0, x1 = x_center - w / 2.0, x_center + w / 2.0
-    y0, y1 = y_center - h / 2.0, y_center + h / 2.0
-
-    vis_w = max(0.0, min(x1, img_width) - max(x0, 0.0))
-    vis_h = max(0.0, min(y1, img_height) - max(y0, 0.0))
-    return (vis_w * vis_h) / (w * h)
-
-
-def is_box_clipped(box, img_width, img_height, threshold=IN_FRAME_FRACTION_THRESHOLD):
-    """True if less than `threshold` fraction of the box's area lies inside
-    the frame -- a clipped box under-reports the object's true apparent
-    height/width, which throws off estimate_pose()'s pinhole depth calc."""
-    return in_frame_fraction(box, img_width, img_height) < threshold
-
-
-# Empirically measured (from training data) width/height aspect-ratio range
-# per class -- catches occlusion, merged/overlapping detections, or bad
-# reads that are fully inside the frame (so invisible to is_box_clipped).
-EXPECTED_ASPECT_RANGE = {
-    'orange':     (0.461, 1.869),
-    'capsicum':   (0.205, 1.067),
-    'greenapple': (0.410, 1.112),
-    'lemon':      (0.523, 1.033),
-    'mango':      (0.341, 3.230),
-    'lime':       (0.435, 2.016),
-    'redapple':   (0.250, 0.905),
-}
-
-
-def expected_aspect_ratio_range_from_dimensions(object_true_dims, slack=1.15):
-    """
-    Geometric aspect-ratio bound derived straight from a fruit's true
-    (length, width, height): modelling the fruit as roughly convex, its
-    projected aspect ratio from ANY viewing angle is bounded by
-    [smallest/largest, largest/smallest] (narrowest end-on, widest
-    broadside). `slack` widens this a bit to absorb non-ellipsoid shape
-    and imperfect box fitting.
-    """
-    if len(object_true_dims) != 3:
-        raise ValueError(f"expected (length, width, height), got {object_true_dims}")
-    largest = max(object_true_dims)
-    smallest = min(object_true_dims)
-    if smallest <= 0:
-        return (0.0, float('inf'))
-    base_ratio = largest / smallest
-    return (1.0 / (base_ratio * slack), base_ratio * slack)
-
-
-def plausible_aspect_ratio_range(predicted_class, object_dimensions=None, slack=1.15):
-    """Union (widest) of the empirical EXPECTED_ASPECT_RANGE and the
-    analytical range derived from object_dimensions, when both are
-    available -- narrower-than-geometric empirical data usually means an
-    undersampled training angle, not a real physical constraint."""
-    empirical = EXPECTED_ASPECT_RANGE.get(predicted_class)
-    analytical = (expected_aspect_ratio_range_from_dimensions(object_dimensions[predicted_class], slack)
-                  if object_dimensions is not None and predicted_class in object_dimensions else None)
-
-    if empirical is not None and analytical is not None:
-        return (min(empirical[0], analytical[0]), max(empirical[1], analytical[1]))
-    if empirical is not None:
-        return empirical
-    if analytical is not None:
-        return analytical
-    return (0.0, float('inf'))
-
-
-def is_box_malformed(box, predicted_class, object_dimensions=None, slack=1.15):
-    """True if `box`'s width/height aspect ratio falls OUTSIDE the
-    plausible range for `predicted_class` -- i.e. not a geometrically
-    intact, unoccluded view of this fruit at any angle."""
-    _, _, w, h = box
-    if w <= 0 or h <= 0:
-        return True
-    aspect = w / h
-    lo, hi = plausible_aspect_ratio_range(predicted_class, object_dimensions, slack)
-    return not (lo <= aspect <= hi)
-
-
-def load_object_ground_truth(fname):
-    """Load only the fruit/object entries from a truemap.txt-style file.
-    Returns {object_type: np.array([[x],[y]])}, or None if unavailable."""
-    if not os.path.exists(fname):
-        return None
-    try:
-        with open(fname, 'r') as f:
-            gt_dict = json.load(f)
-    except Exception as e:
-        print(f"Could not parse true map '{fname}': {e}")
-        return None
-    object_gt = {}
-    for key in gt_dict:
-        if not key.startswith('aruco'):
-            object_type = key.split('_')[0]
-            object_gt[object_type] = np.array([[gt_dict[key]['x']], [gt_dict[key]['y']]])
-    return object_gt if object_gt else None
-
-
-def compute_object_rmse(object_est_dict, object_gt_dict):
-    """
-    object_est_dict: merge_estimations() output, e.g. {'redapple_0': {'x':..,'y':..}}
-    object_gt_dict: load_object_ground_truth() output
-    Returns {'rmse':.., 'errors':{obj_type: err}, 'matched':[obj_types]},
-    or None if nothing has matched yet.
-    """
-    matched, errors, est_pts, gt_pts = [], {}, [], []
-    for key_0, est in object_est_dict.items():
-        obj_type = key_0.rsplit('_', 1)[0]
-        if obj_type not in object_gt_dict:
-            continue
-        est_xy = np.array([[est['x']], [est['y']]])
-        gt_xy = object_gt_dict[obj_type]
-        errors[obj_type] = round(float(np.linalg.norm(est_xy - gt_xy)), 5)
-        matched.append(obj_type)
-        est_pts.append(est_xy)
-        gt_pts.append(gt_xy)
-
-    if not matched:
-        return None
-
-    residual = (np.hstack(est_pts) - np.hstack(gt_pts)).ravel()
-    rmse = float(np.sqrt(np.mean(residual ** 2)))
-    return {'rmse': rmse, 'errors': errors, 'matched': matched}
+# Same per-box gates + class-confusion correction the live GUI pipeline
+# (operate.py's process_object_estimates()) uses, imported from the same
+# place (slam/ekf.py) so this script can't silently drift from that logic.
+# This matters more than it might look: operate.py's live path only ever
+# feeds self.fruit_ekf, which drives the GUI's live "Object RMSE" readout
+# -- it never writes lab_output/objects.txt. THIS script is what actually
+# writes objects.txt (lab manual step 4), and eval.py's --object-est
+# defaults straight to that file. So the gates below are what actually
+# protects the submitted grade -- the live GUI ones (on their own) don't
+# touch the graded file at all.
+sys.path.insert(0, "{}/slam".format(os.getcwd()))
+from slam.ekf import (in_frame_fraction, is_box_shape_plausible, resolve_confusable_class,
+                       IN_FRAME_FRACTION_THRESHOLD, FRAME_WIDTH, FRAME_HEIGHT,
+                       CONFUSABLE_DISTANCE_THRESHOLD)
 
 # estimate the pose (x,y) of a detected object given its bbox and the robot's pose
 def estimate_pose(robot_pose, box, object_true_height, focal_length, cx):
@@ -158,18 +31,22 @@ def estimate_pose(robot_pose, box, object_true_height, focal_length, cx):
     """
     x_center, y_center, box_width, box_height = box
 
+    ######### Replace with your codes #########
+    # TODO: compute pose of the object based on bounding box [x,y,width,height] and robot's pose [[x],[y],[theta]]
+    # You may want to use the true height of the object and the focal length also
+    # This is the default code which estimates every pose to be (0,0)
     if box_height <= 0:
         return 0.0, 0.0
     # Depth via the pinhole model: apparent_height/f = true_height/depth
     depth = (focal_length * object_true_height) / box_height
 
-    # Lateral offset in the camera frame from how far the box centre sits
+    # Lateral offset in the camera frame from how far the box centre sits 
     # from the image's principal point (approximated as image centre)
     x_camera = (x_center - cx) * depth / focal_length
 
     # Camera frame (forward=depth, image-right=x_camera) -> robot frame
-    # (forward, left). "Left" is positive by convention, so image-right
-    # flips sign to become lateral.
+    # (forward, left). "Left" is positive by convention (matches lm.position
+    # in ekf.py/aruco_sensor.py), so image-right flips sign to become lateral.
     forward = depth
     lateral = -x_camera
 
@@ -180,9 +57,10 @@ def estimate_pose(robot_pose, box, object_true_height, focal_length, cx):
 
     pose_x = robot_x + forward * np.cos(theta) - lateral * np.sin(theta)
     pose_y = robot_y + forward * np.sin(theta) + lateral * np.cos(theta)
-
+    ###########################################
+    
     return pose_x, pose_y
-
+    
 
 # merge the estimations of the objects so that there is only 1 final estimate for each object type
 def merge_estimations(object_pose_dict):
@@ -193,7 +71,7 @@ def merge_estimations(object_pose_dict):
             object_pose_dict_final[key + '_0'] = {'x': 0.0, 'y': 0.0}
             continue
 
-        arr = np.array(estimates)  # shape (N, 3) or (N, 4): x, y, dist[, theta]
+        arr = np.array(estimates)  # shape (N, 3): x, y, dist
         pts = arr[:, :2]
         dists = arr[:, 2]
 
@@ -248,37 +126,88 @@ if __name__ == "__main__":
     object_pose_dict = {}
     for object_name in object_list:
         object_pose_dict[object_name] = []
-    
+
+    # Running per-class mean of ACCEPTED (post-gate, post-relabel) positions
+    # seen so far in this pass -- the offline stand-in for
+    # "self.fruit_ekf.estimates" that resolve_confusable_class() needs as
+    # its known_positions argument. This script processes the whole of
+    # pred.txt in one pass rather than keeping a live EKF the way
+    # operate.py does, so a cheap running mean is enough to tell "a
+    # capsicum-labelled box has been landing suspiciously close to where
+    # we keep seeing lime" from "these are genuinely two different
+    # fruits", without needing to build a second EKF here.
+    known_positions = {}
+    known_counts = {}
+
+    def _update_known_position(label, x, y):
+        n = known_counts.get(label, 0) + 1
+        if n == 1:
+            known_positions[label] = (x, y)
+        else:
+            old_x, old_y = known_positions[label]
+            known_positions[label] = (old_x + (x - old_x) / n, old_y + (y - old_y) / n)
+        known_counts[label] = n
+
+    n_skipped_frame = 0   # boxes skipped: < IN_FRAME_FRACTION_THRESHOLD in frame
+    n_skipped_shape = 0   # boxes skipped: implausible width/height aspect ratio
+    n_relabelled = 0      # boxes relabelled by the class-confusion correction
+
     # Compute estimates
     with open('lab_output/pred.txt') as fp:
-        
+
         # for every line in pred.txt (every image taken)
         for line in fp.readlines():
             entry = ast.literal_eval(line)
             robotpose, bboxes = entry['robotpose'], entry['bboxes']
-            
+
             # for every bounding box detected
             for bbox in bboxes:
                 predicted_class = bbox[0]
                 box = bbox[1]
-                if is_box_clipped(box, img_width=IMG_WIDTH, img_height=IMG_HEIGHT):
-                    print(f"[FILTERED] {predicted_class} clipped: box={box}") # debug
+                if predicted_class not in object_dimensions:
+                    continue   # unexpected label -- nothing to size/gate it against
+
+                # Same two per-box gates operate.py's live pipeline uses --
+                # see slam/ekf.py for what each one catches. A box that
+                # fails either is just skipped; every other box in the
+                # same photo is unaffected (each box's pose comes from its
+                # own geometry alone).
+                if in_frame_fraction(box, FRAME_WIDTH, FRAME_HEIGHT) < IN_FRAME_FRACTION_THRESHOLD:
+                    n_skipped_frame += 1
                     continue
+                if not is_box_shape_plausible(predicted_class, box, object_dimensions):
+                    n_skipped_shape += 1
+                    continue
+
                 true_height = object_dimensions[predicted_class][2]
                 pose_x, pose_y = estimate_pose(robotpose, box, true_height, focal_length, cx)
-                
+
+                # Class-confusion correction -- may relabel predicted_class
+                # to its "victim" class and swap in a pose recomputed with
+                # the victim's true height. See resolve_confusable_class()'s
+                # docstring in slam/ekf.py for why the recompute is needed.
+                fuse_class, alt_pose = resolve_confusable_class(
+                    predicted_class, box, robotpose, object_dimensions,
+                    focal_length, cx, estimate_pose, known_positions)
+                if alt_pose is not None:
+                    n_relabelled += 1
+                    pose_x, pose_y = alt_pose
+
                 # distance from robot to this estimate, for weighting later
                 robot_x, robot_y = robotpose[0][0], robotpose[1][0]
-                robot_theta = robotpose[2][0]
                 dist = np.hypot(pose_x - robot_x, pose_y - robot_y)
-                
-                object_pose_dict[predicted_class].append((pose_x, pose_y, dist, robot_theta))
+
+                object_pose_dict[fuse_class].append((pose_x, pose_y, dist))
+                _update_known_position(fuse_class, pose_x, pose_y)
 
     # merge the estimations of the objects so that there are only one estimate for each object type
     object_pose_dict = merge_estimations(object_pose_dict)
-                     
+
     # save object pose estimations
     with open('lab_output/objects.txt', 'w') as fo:
         json.dump(object_pose_dict, fo, indent=4)
-    
-    print('Estimations saved!')
+
+    print(f'Estimations saved! {n_skipped_frame} box(es) skipped (<{IN_FRAME_FRACTION_THRESHOLD*100:.0f}% in frame), '
+          f'{n_skipped_shape} box(es) skipped (implausible shape), '
+          f'{n_relabelled} box(es) relabelled by class-confusion correction '
+          f'(<{CONFUSABLE_DISTANCE_THRESHOLD*100:.0f}cm from an existing victim-class estimate).')

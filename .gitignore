@@ -42,10 +42,13 @@ pip-delete-this-directory.txt
 !distCoeffs.txt
 !scale.txt
 !baseline.txt
-!truemap.txt
-!slam.txt
+!turn_scale.txt
 
 *.png
+
+# Robot ZIP
+*.ZIP
+
 
 # Unit test / coverage reports
 htmlcov/
@@ -228,3 +231,5 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 *.json
+lab_output/object_rmse_log.csv
+lab_output/slam_state.json

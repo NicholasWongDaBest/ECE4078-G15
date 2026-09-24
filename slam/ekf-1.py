@@ -606,13 +606,6 @@ class EKF:
         novelties = []
         for i in range(len(known_measurement)):
             depth_var, lateral_var = self.measurement_variance(known_measurement[i].position)
-            # Optional per-measurement noise scale. M3's auto_fruit_search.py
-            # tags fruit-landmark Markers with noise_scale > 1, because a range
-            # taken from a YOLO box's apparent height is far noisier than an
-            # ArUco PnP fix. Ordinary ArUco measurements don't carry it.
-            _noise_scale = float(getattr(known_measurement[i], 'noise_scale', 1.0))
-            depth_var *= _noise_scale ** 2
-            lateral_var *= _noise_scale ** 2
 
             # Remember the best single look this marker has ever had, for its
             # per-landmark covariance floor (see landmark_floor()). Uses the RAW
@@ -1536,7 +1529,7 @@ class FruitEKF:
     """
 
     def __init__(self, measurement_noise_fn=fruit_measurement_noise, init_cov=1e3,
-                 min_var=0.00082, innovation_gate=9.21, reject_radius_multiplier=2.0):
+                 min_var=0.0008, innovation_gate=9.21, reject_radius_multiplier=2.0):
         """
         measurement_noise_fn(distance) -> (depth_var, lateral_var), in the
             observation's own local [depth, lateral] frame. Defaults to

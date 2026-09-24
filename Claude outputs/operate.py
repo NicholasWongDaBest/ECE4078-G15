@@ -11,10 +11,9 @@ from botconnect import BotConnect # access the robot communication
 # import SLAM components (M1)
 sys.path.insert(0, "{}/slam".format(os.getcwd()))
 from slam.ekf import (DriveMeasurement, EKF, FruitEKF, in_frame_fraction,
-                       is_box_shape_plausible, resolve_confusable_class,
+                       is_box_shape_plausible,
                        load_object_ground_truth, compute_object_rmse,
-                       IN_FRAME_FRACTION_THRESHOLD, FRAME_WIDTH, FRAME_HEIGHT,
-                       CONFUSABLE_DISTANCE_THRESHOLD)
+                       IN_FRAME_FRACTION_THRESHOLD)
 from slam.robot import Robot
 from slam.aruco_sensor import ArucoSensor
 
@@ -25,10 +24,23 @@ from cv.detector import ObjectDetector
 import csv
 from object_pose_est import estimate_pose
 
-# FRAME_WIDTH/FRAME_HEIGHT now live in slam/ekf.py (see the comment there)
-# so the live GUI pipeline here and the offline object_pose_est.py
-# re-derivation pipeline can't drift apart on what the real camera frame
-# size is -- imported above, not redefined here.
+# Camera frame size -- the REAL resolution botconnect.get_image() delivers
+# once the camera thread has an actual frame (confirmed via
+# claude/calibrate.py's live "Live frame: {w}x{h}" printout, and
+# calibration/param/intrinsic.txt's principal point cx/cy sitting right at
+# 640/2, 480/2). This is NOT the same as the (360,480,3) placeholder shape
+# get_image() falls back to before the first real frame arrives (or after
+# a disconnect) -- that placeholder is what self.img/self.aruco_img/
+# self.cv_vis below are also initialised to, purely so they're a valid
+# array before take_pic() ever runs, not because it's the true frame size.
+# Using the placeholder's (smaller, wrong-aspect-ratio) dimensions here was
+# a real bug: in_frame_fraction() was clipping every box's x-extent past
+# 480px and y-extent past 360px, even on a real 640x480 frame where the
+# actual photo extends well past both -- i.e. it was flagging boxes as
+# "hanging off the edge" that were genuinely, fully captured, just because
+# they were farther right/down than the wrong assumed boundary.
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
 
 
 def load_true_map(fname):
@@ -88,30 +100,10 @@ class Operate:
         # on the robot side).
         self.botconnect.set_pid(use_pid=1, kp=2, ki=0.04, kd=0.29)
 
-        # Create a folder "lab_output" that stores the results of the lab.
-        # Wiped on every launch, same as raw_images/ below, so a run can never
-        # be scored against leftovers from a previous one (a stale objects.txt
-        # or slam.txt is easy to mistake for this run's output).
-        #
-        # Deliberately relative, not the absolute D:\... path: it resolves to
-        # the same folder when operate.py is launched from the project
-        # directory, and it keeps working on a teammate's machine and in the
-        # marking environment.
-        #
-        # This runs BEFORE load_state(), before the rmse log is created, and
-        # before ObjectDetector opens pred.txt -- deleting the folder out from
-        # under any of those would either lose the file or fail on Windows
-        # while the handle is still open.
-        #
-        # Two consequences worth knowing: the persisted SLAM map no longer
-        # survives a restart (load_state() below will always find nothing), and
-        # any ekf_calib_log_*.json you recorded for calibrate_ekf.py is gone the
-        # next time you launch -- copy those out before relaunching if you want
-        # to keep them.
+        # Create a folder "lab_output" that stores the results of the lab
         self.lab_output_dir = 'lab_output/'
-        if os.path.isdir(self.lab_output_dir):
-            shutil.rmtree(self.lab_output_dir)
-        os.makedirs(self.lab_output_dir, exist_ok=True)
+        if not os.path.exists(self.lab_output_dir):
+            os.makedirs(self.lab_output_dir)
 
         # Initialise SLAM parameters
         self.ekf = self.init_ekf(args.calib_dir, args.ip)
@@ -169,44 +161,9 @@ class Operate:
         # stationary, instead of requiring manual 'p' then 'n' -- see
         # auto_capture_fruit().
         self.is_stationary = True     # updated every tick in perform_slam(); starts at rest
-        self.stationary_since = time.time()   # time.time() of the most recent False->True
-                                                # transition of is_stationary -- see perform_slam()
-        self.capture_settle_time = 0.3   # s the robot must have been (commanded) stationary before
-                                           # a frame is trusted not to be blurred by residual motion
-                                           # or camera pipeline latency -- see auto_capture_fruit(); tune this
         self.auto_capture_enabled = True   # toggle with 'a'
         self.auto_capture_interval = 1.0 / 3.0   # s between auto-captures while stationary (~3/sec) -- tune this
         self.last_auto_capture_time = 0.0        # time.time() of the last auto-capture
-
-        # Per-pose capture cap. Auto-capture fires ~3/sec for as long as you
-        # sit still, but FruitEKF has no viewpoint-novelty penalty (unlike the
-        # ArUco filter), so 30 frames from one parking spot shrink a fruit's
-        # covariance as if they were 30 independent measurements when they all
-        # share the same viewing angle and therefore the same systematic error.
-        # That's how a fruit ends up looking confidently converged in the wrong
-        # place. Cap how many shots one pose can contribute; moving far enough
-        # (either threshold below) starts a fresh budget.
-        self.max_captures_per_pose = 5
-        self.capture_pose_pos_threshold = 0.15              # m of travel to re-arm
-        self.capture_pose_ang_threshold = np.deg2rad(15.0)  # or this much rotation
-        self.captures_at_pose = 0
-        self.capture_burst_pose = None    # (x, y, theta) the current burst started from
-
-        # Detector-health counters, per predicted class. These record the boxes
-        # process_object_estimates() throws away, which is information that was
-        # previously discarded entirely -- a class that keeps getting skipped
-        # for an implausible box shape is being occluded or merged with
-        # something, and a class that keeps getting relabelled is being
-        # confused with its CONFUSABLE_PAIRS partner. Neither shows up in any
-        # position metric, because a box that never fuses never moves an
-        # estimate. Toggle the readout with 'v'.
-        self.box_skip_frame = {}    # class -> boxes dropped for being clipped by the frame edge
-        self.box_skip_shape = {}    # class -> boxes dropped for an implausible aspect ratio
-        self.relabel_counts = {}    # 'predicted->fused' -> times the confusable fix fired
-        self.coverage_view = 0      # 0 = fruit coverage, 1 = detector health
-        self.last_marker_count = 0   # number of known (tag 1-10) ArUco markers seen in the most
-                                       # recent frame -- set in perform_slam(), read by
-                                       # auto_capture_fruit() so it can skip a marker-free frame
 
         # Initialise CV detector
         if args.yolo_path == "":
@@ -361,29 +318,12 @@ class Operate:
         # otherwise get added as a landmark and show up as "?" on the map.
         sensor_measurement = [lm for lm in sensor_measurement if 1 <= lm.tag <= 10]
 
-        # M2: remember how many known markers were actually visible in THIS
-        # frame (self.img, the same frame auto_capture_fruit() would use) --
-        # see auto_capture_fruit()'s marker guard.
-        self.last_marker_count = len(sensor_measurement)
-
         # M2: computed unconditionally every tick (not just while ekf_on) so
         # auto_capture_fruit() can also read it. Same test as before, just
         # pulled out of the elif branch below so it's available either way.
         v_l = drive_measurement.left_speed
         v_r = drive_measurement.right_speed
-        was_stationary = self.is_stationary
         self.is_stationary = abs(v_l) < 1e-3 and abs(v_r) < 1e-3
-        if self.is_stationary and not was_stationary:
-            # Just transitioned from moving to commanded-stopped. "Stationary"
-            # here only means the last commanded wheel speed is ~0 -- the
-            # physical robot (motor/wheel inertia) and the camera feed
-            # (self.img comes from BotConnect's background camera thread over
-            # a socket -- see take_pic()/BotConnect.get_image()) both lag
-            # behind that command by some real time. auto_capture_fruit()
-            # waits out capture_settle_time from this timestamp before
-            # trusting a frame, so a picture isn't taken the instant this
-            # flips True while the robot/frame may still reflect motion.
-            self.stationary_since = time.time()
 
         if self.request_recover_robot:
             is_success = self.ekf.recover_from_pause(sensor_measurement)
@@ -398,102 +338,13 @@ class Operate:
             if not self.is_stationary: #prevent predict to run when bot is not moving (prevent uncertainty to be added)
                 self.ekf.predict(drive_measurement)
             self.ekf.add_landmarks(sensor_measurement)
-            self.ekf.update(sensor_measurement, drive_measurement)  # pass drive_measurement so update() knows how much rotation is happening right now
-
-    def save_live_objects(self):
-        """Write the LIVE FruitEKF estimates to lab_output/objects.txt -- the
-        file eval.py grades (its --object-est default).
-
-        Until now the live fruit filter was display-only: the diamonds on the
-        minimap lived in self.fruit_ekf in RAM and died with the process, and
-        the only thing that ever produced objects.txt was running
-        object_pose_est.py separately afterwards. This makes 's' persist the
-        live estimate too, so a run is submittable the moment you stop driving.
-
-        The two pipelines are genuinely different estimators over the same raw
-        data, not two copies of one:
-
-          live FruitEKF        incremental 2D Kalman filter, one per fruit
-                               class, with a 3-tier innovation gate,
-                               per-sighting noise that scales with range, and
-                               the depth/lateral anisotropy fix
-                               (FRUIT_LATERAL_TO_DEPTH_VAR_RATIO). Sees each
-                               detection once, in the order it happened, using
-                               the SLAM pose as it was AT THAT MOMENT.
-
-          object_pose_est.py   re-derives every pose offline from pred.txt,
-                               then merges per class by median + outlier
-                               rejection + inverse-distance weighting. Sees
-                               every detection at once, but reuses the same
-                               logged robot poses, so a late loop closure that
-                               improved the live map is NOT reflected in them.
-
-        Neither dominates -- run both, score both with eval.py, keep whichever
-        is better. That is why an existing objects.txt is copied aside to
-        objects_prev.txt rather than quietly overwritten.
-
-        Returns a short string to append to the on-screen notification.
-        """
-        objects = self.fruit_ekf.to_objects_dict()
-        fname = os.path.join(self.lab_output_dir, 'objects.txt')
-
-        # Refuse to replace a real objects.txt with an empty one. Pressing 's'
-        # early in a run (or right after 'r') must not wipe a good estimate
-        # object_pose_est.py wrote earlier.
-        if not objects:
-            print("[save] No live fruit estimates yet -- objects.txt left untouched.")
-            return ' (no fruit yet)'
-
-        if os.path.exists(fname):
-            try:
-                shutil.copyfile(fname, os.path.join(self.lab_output_dir, 'objects_prev.txt'))
-            except OSError as e:
-                print(f"[save] Could not back up existing objects.txt: {e}")
-
-        with open(fname, 'w') as fo:
-            json.dump(objects, fo, indent=4)
-
-        # --- console report -------------------------------------------------
-        # eval.py's eval_object() seeds EVERY ground-truth fruit with
-        # MAX_ERROR = 1.0 m and only overwrites the ones present in the file.
-        # A fruit absent from objects.txt therefore costs a full metre of
-        # error -- it is never simply "not counted". So it's worth knowing, at
-        # the moment you save, exactly which fruits made it in and which of
-        # the saved ones are geometrically shaky.
-        print(f"\n[save] {len(objects)} fruit written to {fname}")
-        for key in sorted(objects):
-            label = key.rsplit('_', 1)[0]
-            est = objects[key]
-            spread = self.fruit_ekf.bearing_spread(label)   # already in degrees
-            n_v = self.fruit_ekf.n_views(label)
-            d = self.fruit_ekf.min_view_dist.get(label, float('nan'))
-            shots = self.fruit_ekf.n_shots.get(label, 0)
-            flag = '   <-- narrow arc, likely off' if spread < 40.0 else ''
-            print(f"       {label:<11} x={est['x']:+.3f} y={est['y']:+.3f}   "
-                  f"{spread:5.1f}deg arc, {n_v} viewpoint(s), {shots} shot(s), "
-                  f"nearest {d:.2f}m{flag}")
-
-        # object_list.csv lists every fruit the detector knows about (7),
-        # normally more than any single arena contains, so an absent label is
-        # a warning, not necessarily a miss.
-        unseen = [l for l in self.object_list if (l + '_0') not in objects]
-        if unseen:
-            print(f"       not seen this run: {', '.join(unseen)}  (fine if "
-                  f"they aren't in this arena; each one that IS costs 1.0 m)")
-        print()
-
-        return f' + {len(objects)} fruit'
+            self.ekf.update(sensor_measurement)
 
     def save_result(self):
         # save slam map after pressing "s"
         if self.command['save_slam']:
             self.ekf.save_map(fname=os.path.join(self.lab_output_dir, 'slam.txt'))
-            # 's' now saves BOTH halves of the submission: slam.txt (the ArUco
-            # map) and objects.txt (the live fruit estimates). See
-            # save_live_objects() for why the live estimate is worth keeping
-            # even though object_pose_est.py can regenerate one offline.
-            obj_msg = self.save_live_objects()
-            self.notification = f'Map is saved{obj_msg}'
+            self.notification = 'Map is saved'
             self.command['save_slam'] = False
 
         # load the true/ground-truth map and freeze it "l" (M2)
@@ -549,10 +400,7 @@ class Operate:
         tick in perform_slam() from the same test that gates ekf.predict()),
         not edge-triggered once per stop -- so it keeps sampling the whole
         time the robot is parked at a vantage point, not just the instant
-        it arrives. The first capture_settle_time seconds after arriving are
-        skipped (see the guard below) so the first frame(s) aren't still
-        blurred by residual motion or camera-pipeline lag from just before
-        the stop.
+        it arrives.
 
         Note: unlike ArUco landmarks, FruitEKF has no viewpoint-novelty
         penalty for a repeat look from the same spot (see slam/ekf.py's
@@ -575,116 +423,15 @@ class Operate:
                 and self.obj_detector is not None):
             return
 
-        # Settle guard: is_stationary going True only means the last commanded
-        # wheel speed hit ~0 this tick -- it says nothing about whether the
-        # physical robot has actually finished decelerating, or whether the
-        # camera frame we'd capture has caught up past that motion (camera
-        # pipeline latency -- see perform_slam()'s comment on
-        # stationary_since). Skip capturing until we've been stationary for
-        # at least capture_settle_time, so the first frame(s) right after a
-        # stop aren't still motion-blurred.
-        if time.time() - self.stationary_since < self.capture_settle_time:
-            return
-
-        # Marker guard: skip this frame if no known ArUco marker (tag 1-10)
-        # is currently visible (last_marker_count set in perform_slam() from
-        # the same detection run on this same self.img). Requested so a fruit
-        # shot only gets taken/fused while there's a landmark in view.
-        if self.last_marker_count <= 1:
-            return
-
-        # Per-pose cap: extra frames from a pose we've already sampled buy no
-        # new geometry, they just make the filter over-confident (see
-        # max_captures_per_pose in __init__). Reset the budget once the robot
-        # has actually moved to a new vantage point.
-        pose = (float(self.ekf.robot.state[0, 0]),
-                float(self.ekf.robot.state[1, 0]),
-                float(self.ekf.robot.state[2, 0]))
-        if self.capture_burst_pose is None:
-            self.capture_burst_pose = pose
-        else:
-            bx, by, bth = self.capture_burst_pose
-            moved = np.hypot(pose[0] - bx, pose[1] - by)
-            turned = abs((pose[2] - bth + np.pi) % (2 * np.pi) - np.pi)
-            if (moved >= self.capture_pose_pos_threshold
-                    or turned >= self.capture_pose_ang_threshold):
-                self.capture_burst_pose = pose
-                self.captures_at_pose = 0
-        if self.captures_at_pose >= self.max_captures_per_pose:
-            return
-
         now = time.time()
         if now - self.last_auto_capture_time < self.auto_capture_interval:
             return
         self.last_auto_capture_time = now
-        self.captures_at_pose += 1
 
         unique_detected = self._run_object_detector()
         self.pred_fname = self.obj_detector.write_output(*self.obj_detector_output, self.lab_output_dir)
         self.notification = f'[Auto] {unique_detected} object type(s) saved to {self.pred_fname}'
         self.process_object_estimates()
-
-    def fruit_coverage_line(self):
-        """One line of "where should I drive next", plus a colour for it.
-
-        Priority order is by what each case actually costs you. A fruit with no
-        sighting at all contributes nothing to objects.txt, so it's worth more
-        than any amount of polish on one already found. Next is a fruit seen
-        only through a narrow arc of bearings: depth is the sloppy axis of a
-        monocular estimate, so those look converged (small covariance) while
-        their distance is really just whatever the box-height model said --
-        the fix is a sighting from a different DIRECTION, not more photos from
-        here. Only after those does plain uncertainty rank.
-
-        Counts shown are distinct viewpoints, not frames, for the same reason
-        the per-pose cap exists: frames from one spot aren't independent looks.
-        """
-        if not self.object_list:
-            return "", (220, 220, 220)
-
-        cov = self.fruit_ekf.coverage_summary(self.object_list)
-
-        if cov['missing']:
-            return ("NOT SEEN: " + ", ".join(cov['missing'][:4]), (240, 90, 90))
-
-        if cov['narrow']:
-            label, spread, views = cov['narrow'][0]
-            more = f" +{len(cov['narrow'])-1}" if len(cov['narrow']) > 1 else ""
-            return (f"NARROW ARC: {label} {spread:.0f}deg ({views} views){more}"
-                    f" - view from another side", (240, 180, 60))
-
-        if cov['worst']:
-            # Ranked by risk() -- geometry, not covariance. Showing spread and
-            # closest range rather than +/-mm because those are the two things
-            # you can actually act on, and because sigma is pinned at
-            # sqrt(min_var) (~28mm) for every converged fruit, so it can't
-            # distinguish a good estimate from a bad one.
-            label, risk, spread, min_d, views = cov['worst'][0]
-            return (f"check: {label} {spread:.0f}deg arc, "
-                    f"nearest {min_d:.1f}m ({views} views)", (120, 220, 120))
-
-        return "No fruit fused yet", (220, 220, 220)
-
-    def detector_health_line(self):
-        """Second readout mode ('v'): what the DETECTOR is doing wrong, which no
-        position metric can see. A box dropped by the frame/shape gates never
-        fuses, so it never moves an estimate and never shows up as uncertainty
-        -- but a class being dropped repeatedly is being occluded, merged with
-        a neighbour, or misread, and that's usually why a fruit ends up in the
-        wrong place or missing entirely."""
-        parts = []
-        shape = sorted(self.box_skip_shape.items(), key=lambda kv: -kv[1])[:2]
-        frame = sorted(self.box_skip_frame.items(), key=lambda kv: -kv[1])[:1]
-        rel = sorted(self.relabel_counts.items(), key=lambda kv: -kv[1])[:1]
-        for cls, n in shape:
-            parts.append(f"{cls} {n} bad-shape")
-        for cls, n in frame:
-            parts.append(f"{cls} {n} clipped")
-        for key, n in rel:
-            parts.append(f"{key} x{n}")
-        if not parts:
-            return "detector: no boxes dropped", (120, 220, 120)
-        return ("dropped: " + ", ".join(parts), (240, 180, 60))
 
     # paint the GUI
     def draw(self, canvas):
@@ -732,17 +479,6 @@ class Operate:
                             f"({len(info['matched'])}/{len(self.true_map_objects)} objects)")
         obj_rmse_surface = TEXT_FONT.render(obj_rmse_line, False, text_colour)
         canvas.blit(obj_rmse_surface, (h_pad+10, 652))
-
-        # Fruit coverage: what still needs driving to, worst first. Ordered by
-        # how much it costs to leave alone -- a fruit never seen scores nothing
-        # at all, a fruit seen only through a narrow arc has an unverified
-        # depth (see FruitEKF.bearing_spread), and only then plain uncertainty.
-        if self.coverage_view == 1:
-            cov_line, cov_colour = self.detector_health_line()
-        else:
-            cov_line, cov_colour = self.fruit_coverage_line()
-        cov_surface = TEXT_FONT.render(cov_line[:55], False, cov_colour)
-        canvas.blit(cov_surface, (h_pad+10, 624))
 
         time_remain = self.count_down - time.time() + self.start_time
         if time_remain > 0:
@@ -816,11 +552,6 @@ class Operate:
                 self.show_live_rmse = not self.show_live_rmse
                 state = 'ON' if self.show_live_rmse else 'OFF'
                 self.notification = f'Live RMSE tracking {state}'
-            # toggle the bottom readout: fruit coverage <-> detector health
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_v:
-                self.coverage_view = 1 - self.coverage_view
-                self.notification = ('Readout: detector health' if self.coverage_view
-                                      else 'Readout: fruit coverage')
             # M2: toggle automatic fruit capture-on-stop
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_a:
                 self.auto_capture_enabled = not self.auto_capture_enabled
@@ -841,11 +572,6 @@ class Operate:
                     self.live_object_rmse_info = None
                     self.live_object_estimates = None
                     self.obj_shot_id = 0
-                    self.captures_at_pose = 0
-                    self.capture_burst_pose = None
-                    self.box_skip_frame = {}
-                    self.box_skip_shape = {}
-                    self.relabel_counts = {}
 
                     # pred.txt is held open by ObjectDetector for the whole session, so it
                     # must be closed/reopened by the class itself rather than deleted here
@@ -999,17 +725,6 @@ class Operate:
              1. Both checks are shape-agnostic vs. shape-aware; neither can
              see what the other is checking for.
 
-        A box that clears both gates above still goes through ONE more
-        step before fusion: resolve_confusable_class() (slam/ekf.py) may
-        relabel it. This is a correction, not a gate -- it never drops a
-        box, only possibly changes which class's EKF track it's fused
-        into, for the two one-directional confusions Nicholas identified
-        (a real lime sometimes read as 'capsicum', a real orange
-        sometimes read as 'mango', never the reverse). See that
-        function's own docstring for the full mechanics (why it needs to
-        RECOMPUTE the pose with the victim class's true height rather
-        than just comparing the box's already-computed position).
-
         There is no separate ArUco-marker-count / fruit-count gate any
         more. Boxes that clear both checks get fused into self.fruit_ekf
         -- a per-class Kalman filter (see FruitEKF in slam/ekf.py) that
@@ -1052,54 +767,28 @@ class Operate:
             # rest of the shot.
             if in_frame_fraction(box, FRAME_WIDTH, FRAME_HEIGHT) < IN_FRAME_FRACTION_THRESHOLD:
                 notes.append(f'{predicted_class} skipped (<{IN_FRAME_FRACTION_THRESHOLD * 100:.0f}% in frame)')
-                self.box_skip_frame[predicted_class] = self.box_skip_frame.get(predicted_class, 0) + 1
                 continue
             if not is_box_shape_plausible(predicted_class, box, self.object_dimensions):
                 notes.append(f'{predicted_class} skipped (implausible box shape)')
-                self.box_skip_shape[predicted_class] = self.box_skip_shape.get(predicted_class, 0) + 1
                 continue
 
             true_height = self.object_dimensions[predicted_class][2]
             pose_x, pose_y = estimate_pose(robot_pose, box, true_height, self.obj_focal_length, self.obj_cx)
-
-            # Class-confusion correction -- may relabel predicted_class to
-            # its "victim" class and swap in a pose recomputed with the
-            # victim's true height. See resolve_confusable_class()'s
-            # docstring in slam/ekf.py. known_positions is built fresh each
-            # shot from self.fruit_ekf's CURRENT estimates (cheap -- at
-            # most 7 fruit classes), so it reflects every earlier shot's
-            # fusions, including relabels from earlier in this same shot.
-            known_positions = {label: (pos[0, 0], pos[1, 0])
-                                for label, pos in self.fruit_ekf.estimates.items()}
-            fuse_class, alt_pose = resolve_confusable_class(
-                predicted_class, box, robot_pose, self.object_dimensions,
-                self.obj_focal_length, self.obj_cx, estimate_pose, known_positions)
-            if alt_pose is not None:
-                notes.append(f'{predicted_class} relabelled as {fuse_class} '
-                             f'(within {CONFUSABLE_DISTANCE_THRESHOLD * 100:.0f}cm of existing {fuse_class})')
-                key = f'{predicted_class}->{fuse_class}'
-                self.relabel_counts[key] = self.relabel_counts.get(key, 0) + 1
-                pose_x, pose_y = alt_pose
-
             dist = float(np.hypot(pose_x - robot_x, pose_y - robot_y))
 
-            # robot_x/robot_y are for coverage bookkeeping only (which
-            # direction this sighting came FROM -- see FruitEKF._record_view);
-            # they don't enter the filter maths.
-            fusion_status = self.fruit_ekf.update(fuse_class, pose_x, pose_y, dist, heading,
-                                                   robot_x=robot_x, robot_y=robot_y)
+            fusion_status = self.fruit_ekf.update(predicted_class, pose_x, pose_y, dist, heading)
             if fusion_status == 'rejected':
-                notes.append(f'{fuse_class} rejected (inconsistent with existing estimate)')
+                notes.append(f'{predicted_class} rejected (inconsistent with existing estimate)')
             elif fusion_status == 'capped':
-                notes.append(f'{fuse_class} capped (large jump from current estimate)')
+                notes.append(f'{predicted_class} capped (large jump from current estimate)')
 
             raw_error = ''
-            if self.true_map_objects is not None and fuse_class in self.true_map_objects:
-                gt = self.true_map_objects[fuse_class]
+            if self.true_map_objects is not None and predicted_class in self.true_map_objects:
+                gt = self.true_map_objects[predicted_class]
                 raw_error = float(np.hypot(pose_x - gt[0][0], pose_y - gt[1][0]))
 
             self.obj_shot_id += 1
-            shot_rows.append([self.obj_shot_id, fuse_class, robot_x, robot_y,
+            shot_rows.append([self.obj_shot_id, predicted_class, robot_x, robot_y,
                             robot_theta_deg, pose_x, pose_y, raw_error])
 
         if notes:

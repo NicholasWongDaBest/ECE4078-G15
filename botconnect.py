@@ -172,7 +172,7 @@ class BotConnect:
                         
                         # Autonomous mode, based on encoder count. Count is monitored on the robot/server side.
                         if mode == 2:
-                            data_send = struct.pack("!Bffii", mode, l_speed, r_speed, t_left_enc, t_left_enc)
+                            data_send = struct.pack("!Bffii", mode, l_speed, r_speed, t_left_enc, t_right_enc)
                             wheel_socket.sendall(data_send)
                             
                             # Receive encoder counts

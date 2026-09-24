@@ -35,16 +35,16 @@ class calibration:
             
             # drive forward
             if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
-                self.command['wheel_speed'] = [0.65, 0.6]
+                pass # TODO:
             # drive backward
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
-                self.command['wheel_speed'] = [-0.65, -0.6]
+                pass # TODO:
             # turn left
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.command['wheel_speed'] = [-0.65, 0.65]
+                pass # TODO:
             # drive right
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.command['wheel_speed'] = [0.65, -0.65]
+                pass # TODO:
             elif event.type == pygame.KEYUP or (event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE):
                 self.command['wheel_speed'] = [0, 0]
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
@@ -61,12 +61,11 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
 
     currentDir = os.getcwd()
-    # dataDir = os.path.join(currentDir,'calib_pics')
-    dataDir = "cv/images/fruits_real"
+    dataDir = os.path.join(currentDir,'calib_pics')
     if not os.path.exists(dataDir):
         os.makedirs(dataDir)
     
-    images_to_collect = 40 # feel free to change this
+    images_to_collect = 80 # feel free to change this
 
     calib = calibration(args)
 
