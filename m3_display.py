@@ -22,6 +22,13 @@ Phases:
     wait   -- after each fruit: ENTER or SPACE in this window continues.
     manual -- (--manual) click anywhere on the map to drive there.
 ESC or closing the window stops the robot and quits, in any phase.
+T (any phase) shows / hides the TRUE map's fruits (--compare-map, default
+truemap.txt) over the estimates: actual position, a line to the estimate and
+the error in cm, also printed to the console. Display only -- nothing from that
+file ever reaches the robot's map, planning or driving.
+The run clock starts when ENTER locks the pose in setup (or, without the
+window's setup, when the run starts) and is shown large in the bottom bar;
+the end of scanning and every fruit found are stamped on it and printed.
 
 Everything here is display and keyboard handling only -- the pose estimate,
 planning and driving all stay in auto_fruit_search.py / path_planner.py.
@@ -29,7 +36,10 @@ Single-threaded on purpose: the navigation code calls idle()/refresh() while it
 waits, so pygame never runs alongside the EKF in another thread.
 """
 
+import ast
+import json
 import math
+import os
 import time
 
 import cv2
@@ -48,7 +58,55 @@ class M3Abort(Exception):
     """Raised when the user presses ESC or closes the window."""
 
 
-class NullDisplay:
+def _fmt_clock(seconds):
+    seconds = max(0, int(seconds))
+    return "{:02d}:{:02d}".format(seconds // 60, seconds % 60)
+
+
+def load_true_fruits(fname):
+    """{fruit: (x, y)} from a truemap.txt-style file (keys like 'lemon_0'),
+    markers skipped. Raises OSError / ValueError if it cannot be read."""
+    with open(fname, 'r') as f:
+        text = f.read()
+    try:
+        gt = json.loads(text)
+    except ValueError:
+        gt = ast.literal_eval(text.strip().splitlines()[0])
+    fruits = {}
+    for key, val in gt.items():
+        if key.startswith('aruco'):
+            continue
+        fruits[key.split('_')[0]] = (float(val['x']), float(val['y']))
+    return fruits
+
+
+class _RunClock:
+    """Run timer shared by both displays: started once (ENTER in setup, or
+    the start of the run), laps stamped and printed."""
+    run_start = None
+
+    def start_timer(self):
+        if self.run_start is None:
+            self.run_start = time.time()
+            self.laps = []
+            print("[time] clock started")
+
+    def elapsed(self):
+        return None if self.run_start is None else time.time() - self.run_start
+
+    def lap(self, label):
+        if self.run_start is None:
+            return
+        t = self.elapsed()
+        laps = getattr(self, 'laps', None)
+        if laps is None:
+            laps = self.laps = []
+        since = t - laps[-1][1] if laps else t
+        laps.append((label, t))
+        print("[time] {} at {} (+{})".format(label, _fmt_clock(t), _fmt_clock(since)))
+
+
+class NullDisplay(_RunClock):
     """Used with --no-display: same calls as M3Display, terminal behaviour."""
     active = False
 
@@ -71,7 +129,8 @@ class NullDisplay:
         pass
 
     def target_done(self, name, distance, ok):
-        pass
+        if distance is not None:
+            self.lap("{} found".format(name))
 
     def wait_for_key(self, prompt):
         input(prompt)
@@ -113,7 +172,7 @@ BAD = (240, 90, 80)
 DIM = (140, 140, 140)
 
 
-class M3Display:
+class M3Display(_RunClock):
     active = True
 
     WIDTH, HEIGHT = 1180, 760
@@ -132,7 +191,7 @@ class M3Display:
     FINE_STEP = math.radians(5)
 
     def __init__(self, nav, aruco_true_pos, object_positions, search_list,
-                 object_radii=None, fps=15):
+                 object_radii=None, fps=15, compare_map='truemap.txt'):
         self.nav = nav
         self.ekf = nav.ekf
         self.aruco_true_pos = np.asarray(aruco_true_pos, dtype=float)
@@ -156,6 +215,7 @@ class M3Display:
         self.text_font = self._font(40)
         self.small_font = self._font(30)
         self.panel_font = self._font(26)
+        self.clock_font = self._font(84)
 
         self.scale = self.MAP_RES / (2 * self.VIEW_HALF)   # pixels per metre
         K = self.ekf.robot.camera_matrix
@@ -167,6 +227,11 @@ class M3Display:
         self._events = []
         self._last_draw = 0.0
         self.run_start = None
+        self.laps = []                 # (label, seconds since start)
+        # T: the true map's fruits over the estimates (display only).
+        self.compare_path = compare_map
+        self.compare_on = False
+        self.compare_truth = {}
 
         self.cam_img = None
         self.visible_tags = []
@@ -199,8 +264,7 @@ class M3Display:
 
     def begin_target(self, index, name, target_xy, obstacles):
         self.phase = 'run'
-        if self.run_start is None:
-            self.run_start = time.time()
+        self.start_timer()
         self.target_index = index
         self.current_target = name
         self.target_xy = tuple(target_xy)
@@ -220,6 +284,8 @@ class M3Display:
     def target_done(self, name, distance, ok):
         self.target_status[name] = (distance, ok)
         self.active_wp = None
+        if distance is not None:
+            self.lap("{} found".format(name))
 
     def idle(self, seconds):
         """Keep the window alive for `seconds` (used while the robot moves)."""
@@ -265,6 +331,62 @@ class M3Display:
                 time.sleep(0.02)
         except M3Abort:
             return
+
+    # ------------------------------------------------------------------
+    # True-map comparison (T)
+    # ------------------------------------------------------------------
+
+    def _estimates(self):
+        """What the robot believes: the Level 3 fruit map, else the map file's fruits."""
+        mapper = getattr(self.nav, 'fruit_mapper', None)
+        if mapper is not None and mapper.fruit_ekf.estimates:
+            return {l: (float(p[0, 0]), float(p[1, 0])) for l, p in mapper.fruit_ekf.estimates.items()}
+        return dict(self.object_positions)
+
+    def compare_errors(self):
+        """{fruit: error_m or None if not on the robot's map} for every fruit in the true map."""
+        est = self._estimates()
+        return {name: (math.hypot(est[name][0] - tx, est[name][1] - ty) if name in est else None)
+                for name, (tx, ty) in self.compare_truth.items()}
+
+    def toggle_compare(self):
+        """T: show / hide the true map's fruits. Re-read on every show, so an
+        edited file is picked up. Display only."""
+        if self.compare_on:
+            self.compare_on = False
+            self.notification = "True map hidden"
+            return
+        try:
+            truth = load_true_fruits(self.compare_path)
+        except (OSError, ValueError, SyntaxError, KeyError, TypeError) as e:
+            self.notification = "Could not read {} ({})".format(self.compare_path, type(e).__name__)
+            print("[compare] could not read {}: {}".format(self.compare_path, e))
+            return
+        if not truth:
+            self.notification = "{} has no fruits in it (markers-only map?)".format(os.path.basename(self.compare_path))
+            return
+        self.compare_truth = truth
+        self.compare_on = True
+        errors = self.compare_errors()
+        found = [e for e in errors.values() if e is not None]
+        print("\n[compare] estimate vs {} (display only):".format(self.compare_path))
+        est = self._estimates()
+        for name in sorted(truth, key=lambda n: (n not in self.search_list, n)):
+            tx, ty = truth[name]
+            e = errors[name]
+            tag = "target" if name in self.search_list else "      "
+            if e is None:
+                print("  {:10s} {}  true [{:+.2f}, {:+.2f}]  NOT ON THE ROBOT'S MAP".format(name, tag, tx, ty))
+            else:
+                print("  {:10s} {}  true [{:+.2f}, {:+.2f}]  est [{:+.2f}, {:+.2f}]  error {:5.1f} cm".format(
+                    name, tag, tx, ty, est[name][0], est[name][1], e * 100))
+        if found:
+            print("  mean {:.1f} cm, worst {:.1f} cm over {} fruit(s)".format(
+                100 * sum(found) / len(found), 100 * max(found), len(found)))
+            self.notification = "True map: mean error {:.1f} cm, worst {:.1f} cm ({} fruits)".format(
+                100 * sum(found) / len(found), 100 * max(found), len(found))
+        else:
+            self.notification = "True map loaded -- no fruit estimates to compare yet"
 
     # ------------------------------------------------------------------
     # Interactive phases
@@ -317,6 +439,7 @@ class M3Display:
         return "No markers in view: turn with <- -> to find one"
 
     def _locked(self, what):
+        self.start_timer()   # the run clock starts on the ENTER that locks the pose
         self.nav._localised = True
         s = self.ekf.robot.state
         msg = "{}: [{:.2f}, {:.2f}, {:.0f} deg]".format(what, s[0, 0], s[1, 0], _wrap_deg(s[2, 0]))
@@ -381,6 +504,9 @@ class M3Display:
                 raise M3Abort()
             if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
                 raise M3Abort()
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_t:
+                self.toggle_compare()
+                continue   # handled here, in every phase: never queued for the phase loops
             if ev.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
                 self._events.append(ev)
 
@@ -463,14 +589,40 @@ class M3Display:
         self._caption('Detector', self.DET_POS)
         self._caption('Fruit map', self.FRUIT_POS)
 
-        # notification + key help, in a bar across the whole window
+        # notification + key help, in a bar across the whole window; the run
+        # clock takes its right-hand end
         bar = pygame.Rect(self.CAM_POS[0], 578, self.WIDTH - 2 * self.CAM_POS[0], 166)
         pygame.draw.rect(c, (55, 55, 62), bar)
         pygame.draw.rect(c, (90, 90, 110), bar, 1)
+        clock_w = 250
+        text_w = bar.w - 24 - clock_w
         x0 = bar.x + 12
-        c.blit(self._fit_text(self.notification, bar.w - 24, TEXT), (x0, bar.y + 12))
-        for k, line in enumerate(self.help_lines[:3]):
-            c.blit(self._fit_text(line, bar.w - 24, (170, 170, 170), small=True), (x0, bar.y + 58 + 30 * k))
+        c.blit(self._fit_text(self.notification, text_w, TEXT), (x0, bar.y + 12))
+        help_lines = list(self.help_lines[:2]) + ["T  show / hide the true map ({})".format(
+            "on" if self.compare_on else os.path.basename(self.compare_path or 'none'))]
+        for k, line in enumerate(help_lines[:3]):
+            c.blit(self._fit_text(line, text_w, (170, 170, 170), small=True), (x0, bar.y + 58 + 30 * k))
+        self._draw_clock(pygame.Rect(bar.right - clock_w, bar.y, clock_w, bar.h))
+
+    def _draw_clock(self, rect):
+        """The run clock, large, with the last stamp (end of scanning / fruit
+        found) under it. Amber from 12:00, red from 15:00 (the demo slot)."""
+        c = self.canvas
+        pygame.draw.line(c, (90, 90, 110), (rect.x, rect.y + 8), (rect.x, rect.bottom - 8), 1)
+        t = self.elapsed()
+        if t is None:
+            big, colour, sub = "--:--", DIM, "starts on ENTER"
+        else:
+            big = _fmt_clock(t)
+            colour = BAD if t >= 15 * 60 else (WARN if t >= 12 * 60 else TEXT)
+            sub = "run time"
+            if self.laps:
+                label, lt = self.laps[-1]
+                sub = "{} {}".format(label.replace(" found", "").replace("scanning done", "scan"), _fmt_clock(lt))
+        surf = self.clock_font.render(big, False, colour)
+        c.blit(surf, (rect.centerx - surf.get_width() // 2, rect.y + 14))
+        small = self._fit_text(sub, rect.w - 16, DIM, small=True)
+        c.blit(small, (rect.centerx - small.get_width() // 2, rect.bottom - small.get_height() - 14))
 
     def _fit_text(self, text, max_width, colour, small=False):
         """Render with the 8-bit font, dropping to smaller sizes if it would overflow."""
@@ -567,9 +719,14 @@ class M3Display:
         else:
             fe = mapper.fruit_ekf
             locked = getattr(mapper, 'frozen', False)
-            lines.append(("YOLO {} frames  acc {}  rej {}{}".format(
-                getattr(self.nav, '_n_detect_frames', 0), mapper.n_accepted, mapper.n_rejected,
-                "  LOCKED" if locked else ""), GOOD if locked else DIM))
+            found_err = [e for e in self.compare_errors().values() if e is not None] if self.compare_on else []
+            if found_err:
+                lines.append(("TRUE mean {:.1f} max {:.1f}cm".format(
+                    100 * sum(found_err) / len(found_err), 100 * max(found_err)), (110, 210, 210)))
+            else:
+                lines.append(("YOLO {} frames  acc {}  rej {}{}".format(
+                    getattr(self.nav, '_n_detect_frames', 0), mapper.n_accepted, mapper.n_rejected,
+                    "  LOCKED" if locked else ""), GOOD if locked else DIM))
             # Unseen search-list fruits first: the panel only has room for
             # 13 lines, and with six fruits mapped a "not seen yet" line at
             # the bottom was cut off -- the one line that says the run is
@@ -585,9 +742,15 @@ class M3Display:
                 colour = BAD if provisional else (GOOD if ok else WARN)
                 idx = "{}:".format(self.search_list.index(label) + 1) if label in self.search_list else "  "
                 lines.append(("{}{:9s} {:+.2f} {:+.2f}".format(idx, label[:9], pos[0, 0], pos[1, 0]), colour))
-                lines.append(("   sd {:.0f}cm  {}v {:.0f}deg  {}".format(
-                    mapper.sigma(label) * 100, fe.n_views(label), fe.bearing_spread(label),
-                    "ROUGH" if provisional else ("ok" if ok else "weak")), colour))
+                err = self.compare_errors().get(label) if self.compare_on else None
+                if err is not None:
+                    lines.append(("   ERR {:.1f}cm  sd {:.0f}cm {}v".format(
+                        err * 100, mapper.sigma(label) * 100, fe.n_views(label)),
+                        GOOD if err < 0.05 else (WARN if err < 0.10 else BAD)))
+                else:
+                    lines.append(("   sd {:.0f}cm  {}v {:.0f}deg  {}".format(
+                        mapper.sigma(label) * 100, fe.n_views(label), fe.bearing_spread(label),
+                        "ROUGH" if provisional else ("ok" if ok else "weak")), colour))
 
         for k, (text, colour) in enumerate(lines[:13]):
             self.canvas.blit(self.panel_font.render(text, False, colour), (x + 8, y + 6 + 23 * k))
@@ -634,7 +797,9 @@ class M3Display:
                 if dist is None:
                     lines.append(("{} {}  skipped".format(k, name), BAD))
                 else:
-                    lines.append(("{} {}  {:.2f} m {}".format(k, name, dist, "OK" if ok else "FAR"),
+                    at = [lt for label, lt in self.laps if label == "{} found".format(name)]
+                    lines.append(("{} {}  {:.2f} m {}{}".format(k, name, dist, "OK" if ok else "FAR",
+                                                              "  " + _fmt_clock(at[-1]) if at else ""),
                                   GOOD if ok else BAD))
             elif name == self.current_target and self.phase in ('run', 'wait'):
                 lines.append(("{} {}  <- now".format(k, name), WARN))
@@ -646,8 +811,11 @@ class M3Display:
             ts = getattr(self.nav, 'turn_scale', None)
             ts0 = getattr(self.nav, 'turn_scale_initial', ts)
             learned = getattr(self.nav, '_turn_scale_samples', 0)
-            lines.append(("TIME  {:02d}:{:02d}   TURN x{:.2f}{}".format(
-                elapsed // 60, elapsed % 60, ts if ts is not None else 1.0,
+            scan = [lt for label, lt in self.laps if label == "scanning done"]
+            lines.append(("TIME  {:02d}:{:02d}{}".format(
+                elapsed // 60, elapsed % 60, "   SCAN DONE " + _fmt_clock(scan[0]) if scan else ""), DIM))
+            lines.append(("TURN x{:.2f}{}".format(
+                ts if ts is not None else 1.0,
                 "  (was {:.2f})".format(ts0) if learned and abs(ts - ts0) > 0.01 else ""), DIM))
 
         for k, (text, colour) in enumerate(lines[:10]):
@@ -743,6 +911,29 @@ class M3Display:
                 cv2.putText(img, "{} {:.0f}cm".format(tag, mapper.sigma(label) * 100),
                             (centre[0] + 8, centre[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                             (30, 30, 30), 1, cv2.LINE_AA)
+
+        # T: the true map's fruits -- a ring in the fruit's colour at the
+        # actual position, a line to the estimate, and the error in cm
+        if self.compare_on and self.compare_truth:
+            est = self._estimates()
+            for name, (tx, ty) in self.compare_truth.items():
+                colour = FRUIT_RGB.get(name, DEFAULT_FRUIT_RGB)
+                t_px = self._px(tx, ty)
+                r_true = max(6, int(0.04 * s))
+                if name in est:
+                    e_px = self._px(*est[name])
+                    cv2.line(img, e_px, t_px, (40, 40, 40), 1, cv2.LINE_AA)
+                    err = math.hypot(est[name][0] - tx, est[name][1] - ty)
+                    txt = "{:.0f}cm".format(err * 100)
+                else:
+                    txt = "missed"
+                cv2.circle(img, t_px, r_true + 2, (20, 20, 20), 3, cv2.LINE_AA)
+                cv2.circle(img, t_px, r_true + 2, colour, 2, cv2.LINE_AA)
+                cv2.drawMarker(img, t_px, (20, 20, 20), cv2.MARKER_CROSS, 6, 1)
+                cv2.putText(img, txt, (t_px[0] - 14, t_px[1] + r_true + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                            (150, 20, 20), 1, cv2.LINE_AA)
+            cv2.putText(img, "TRUE MAP: ring = actual, diamond = estimate, red = error", (8, res - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 20, 20), 1, cv2.LINE_AA)
 
         # the current target's 0.4 m success zone
         if self.target_xy is not None and self.phase in ('run', 'wait'):
