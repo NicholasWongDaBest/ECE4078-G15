@@ -18,10 +18,10 @@ import cv2
 from ultralytics import YOLO
 
 # ============================ CONFIG ============================
-OLD = "model/old_best.pt"           # model the robot currently runs
-NEW = "model/new_best.pt"           # downloaded from Colab
-IMG_DIR = "new_pics/images"            # held-out frames (NOT used in training)
-LBL_DIR = "new_pics/labels"            # their YOLO labels from label_tool.py
+OLD = "model/new_best.pt"           # model the robot currently runs
+NEW = "model/new_new_best.pt"           # downloaded from Colab
+IMG_DIR = "new_test/images"            # held-out frames (NOT used in training)
+LBL_DIR = "new_test/labels"            # their YOLO labels from label_tool.py
 OUT_DIR = "compare_out"
 CONF = 0.75                            # match detector.py
 IOU = 0.5                              # match detector.py
