@@ -19,13 +19,13 @@ from pathlib import Path
 from ultralytics import YOLO
 
 # ============================ CONFIG ============================
-LABELED_DIR = "real_dataset"           # OUT_DIR from label_tool.py
-OUT_DIR = "real_split"
-WEIGHTS = "model/best.pt"        # for class names
+LABELED_DIR = "datasets/merged/merged_dataset"           # OUT_DIR from label_tool.py
+OUT_DIR = "datasets/merged/merged_split"
+WEIGHTS = "model/new_best.pt"        # for class names
 VAL_FRACTION = 0.2
-BLOCK = 10                             # consecutive frames kept together
+BLOCK = 5                             # consecutive frames kept together
 SEED = 0
-SYNTH_SRC = "dataset_split/train"      # local synthetic train folder (must contain images/ and labels/);
+SYNTH_SRC = "datasets/synthetic/synthetic_dataset"      # local synthetic train folder (must contain images/ and labels/);
                                        # copied into OUT_DIR/synthetic/train. "" = real only
 # ================================================================
 

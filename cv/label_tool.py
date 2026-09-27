@@ -28,9 +28,9 @@ import numpy as np
 from ultralytics import YOLO
 
 # ============================ CONFIG ============================
-IMAGES_DIR = "images/fruits_real"              # folder of raw (unannotated) frames to label
+IMAGES_DIR = "images/extra_half"              # folder of raw (unannotated) frames to label
 WEIGHTS = "model/new_best.pt"        # current model, used for pre-labels
-OUT_DIR = "new_pics"               # writes OUT_DIR/images and OUT_DIR/labels
+OUT_DIR = "new_pics_half"               # writes OUT_DIR/images and OUT_DIR/labels
 CONF = 0.25                            # pre-label confidence (low on purpose)
 IMGSZ = 480                            # match detector.py inference size
 SCALE = 1.5                            # display scale

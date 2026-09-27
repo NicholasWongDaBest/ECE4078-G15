@@ -1126,7 +1126,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.
     parser.add_argument("--calib_dir", type=str, default="calibration/param/") # calibration directory
-    parser.add_argument("--yolo_path", default='cv/model/yolo26n.pt') # directory for your trained AI model
+    parser.add_argument("--yolo_path", default='cv/model/new_best.pt') # directory for your trained AI model
     parser.add_argument("--truemap", type=str, default='truemap.txt', help="ground-truth map for live RMSE practice tracking (optional)")
     args, _ = parser.parse_known_args()
 
