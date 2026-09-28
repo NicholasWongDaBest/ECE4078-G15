@@ -134,7 +134,7 @@ def init_ekf(calib_dir):
     baseline = np.loadtxt(os.path.join(calib_dir, 'baseline.txt'), delimiter=',')
     # ticks_per_meter: same value operate.py's init_ekf() currently uses (marked
     # there as "##change this value" -- if you recalibrate it, update BOTH places).
-    robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=190)
+    robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=196.1)
     return EKF(robot), float(baseline)
 
 
@@ -201,8 +201,13 @@ class FruitMapper:
 
     def __init__(self, camera_matrix, object_dimensions, expected_labels=(),
                  min_views=2, min_spread_deg=30.0, arena_half=None, max_pullback=0.35,
-                 min_sightings=4, target_min_sightings=6):
-        self.fruit_ekf = FruitEKF()
+                 min_sightings=4, target_min_sightings=6, min_sd=0.035):
+        # min_sd: the fruit filter's covariance floor (FruitEKF min_var, as a
+        # std dev). No fruit's sd goes below it, so every new sighting keeps a
+        # gain of at least P/(P+R) on the estimate: a floor of 3.5 cm (up from
+        # the filter's default 2.9 cm) lets later, better sightings move an
+        # early wrong estimate a little more readily.
+        self.fruit_ekf = FruitEKF(min_var=float(min_sd) ** 2)
         # Every fruit sits inside the tape. A sighting that lands outside it
         # has its depth (the unreliable axis: box height -> range) too long,
         # while its bearing is still good -- so it is pulled back ALONG ITS
@@ -2969,7 +2974,8 @@ def _leg_cap(nav, start, next_wp, obstacles, base_cap, open_cap, open_clearance=
 
 def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                planner='astar', grid_resolution=0.05, max_legs=20, goal_tolerance=0.03,
-               max_leg_length=0.25, safety_margin=0.10, found_radius=0.325, park_rings=(0.30, 0.27),
+               max_leg_length=0.25, safety_margin=0.10, found_radius=0.33, park_rings=(0.31, 0.27),
+               close_zone=0.40, close_step=0.05,
                clearance_pref=0.15, stall_legs=4, live_positions=None, object_radii=None,
                fruit_margin=0.06, bounds=None, open_leg_length=0.60, refine_weak=None,
                object_uncertainty=None, target_margin=0.03, approach_gap=0.06, approach_overshoot=0.40):
@@ -3003,12 +3009,19 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
     scoring radius is a success; driving back out to the standoff point
     would only be another chance to overshoot.
 
-    Parking spots sit on park_rings (0.30 m from the fruit, 0.27 m when the
-    0.30 m ring is boxed in) and the target ends as soon as the converged pose
-    is within found_radius (0.325 m): aiming at 0.30 m and accepting up to
-    0.325 m leaves 7-10 cm inside the 0.4 m scoring radius for the fruit's
+    Parking spots sit on park_rings (0.31 m from the fruit, 0.27 m when the
+    0.31 m ring is boxed in) and the target ends as soon as the converged pose
+    is within found_radius (0.33 m): aiming at 0.31 m and accepting up to
+    0.33 m leaves 7-9 cm inside the 0.4 m scoring radius for the fruit's
     map error and the pose error, and keeps the body further off the fruit
     than the old 0.22-0.28 m (a corner orange mapped 9 cm off was hit).
+
+    close_zone / close_step: once the robot believes it is within close_zone
+    (0.40 m, the scoring radius) of the fruit, every drive is at most
+    close_step (5 cm), never an open leg and never backwards, and the parking
+    spot is re-picked once from where it is (so it does not drive round the
+    fruit): that close, one drive that runs long is a hit, and a few short
+    ones with a pose check after each cannot run far.
 
     A pose inside a safety circle is planned FROM, not escaped from: the
     planner shrinks that circle to the robot's current depth so the route
@@ -3112,6 +3125,7 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
         refined = refine_weak is None or not getattr(refine_weak, 'needed', lambda n: True)(target_name)
         planned_positions = dict(object_positions)
         goal_risk = None
+        repicked_close = False   # the parking spot is re-picked once, on entering close_zone
 
         def pick_goal(from_xy):
             nb = _standoff_neighbours(target_name, target,
@@ -3200,6 +3214,14 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                 print(f"[{target_name}] pose is inside {len(inside)} safety circle(s), deepest by {deepest * 100:.0f} cm "
                       f"-- planning a route that leaves it, not an escape hop")
 
+            in_close = d_target <= close_zone
+            if in_close and not repicked_close and goal is not None:
+                # Close to the fruit now: park on THIS side of it rather than
+                # drive round it to the spot picked from far away.
+                repicked_close = True
+                new_goal, new_risk, new_nb = pick_goal(start)
+                if new_goal is not None:
+                    goal, goal_risk, neighbours = new_goal, new_risk, new_nb
             if goal is None:
                 goal, goal_risk, neighbours = pick_goal(start)
                 if goal is None and not tight:
@@ -3276,6 +3298,13 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             # The overshoot check below then makes sure a drive running long
             # still ends clear of the fruit.
             leg_cap = min(leg_cap, max(0.10, d_target - (found_radius - 0.05)))
+            if in_close:
+                # Within the scoring radius already (by the pose): small steps only.
+                if min(leg_cap, leg_len) > close_step + 1e-6:
+                    print(f"[{target_name}] {d_target:.2f} m from the fruit -- inside {close_zone:.2f} m, so this "
+                          f"drive is capped at {close_step * 100:.0f} cm")
+                leg_cap = min(leg_cap, close_step)
+                open_leg = False
             guarded = _overshoot_cap(start, next_wp, min(leg_cap, leg_len), obstacles)
             # The drive toward the fruit itself: even if it runs
             # approach_overshoot (40%) long -- this robot's worst measured --
@@ -3327,8 +3356,8 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             # Backwards allowed: every obstacle is on the map in this phase.
             # (obstacles[:-1]: the target's own body is the last row; how close a
             # drive may run at IT is already settled by the approach check above.)
-            pose = drive_to_point(next_wp, nav, max_distance=leg_cap, relocalise=reloc_mode, allow_reverse=True,
-                                  obstacles=obstacles[:-1],
+            pose = drive_to_point(next_wp, nav, max_distance=leg_cap, relocalise=reloc_mode,
+                                  allow_reverse=not in_close, obstacles=obstacles[:-1],
                                   between_markers=nav.avoid_gap_stops and _between_markers(start, aruco_true_pos) is not None)
             nav.gap_skip_last = reloc_mode == 'confirm'
         else:
@@ -4488,10 +4517,15 @@ if __name__ == "__main__":
                          help="extra clearance around every marker and fruit beyond robot+object radius, m")
     parser.add_argument("--fruit-margin", type=float, default=0.06,
                          help="extra clearance around every fruit beyond robot+fruit radius, m (markers use --safety-margin)")
-    parser.add_argument("--found-radius", type=float, default=0.325,
+    parser.add_argument("--found-radius", type=float, default=0.33,
                          help="stop a target as soon as the pose is this close to the fruit, m "
                               "(the scoring radius is 0.40 m)")
-    parser.add_argument("--park-rings", type=float, nargs=2, default=[0.30, 0.27], metavar=("RING", "TIGHT_RING"),
+    parser.add_argument("--fruit-min-sd", type=float, default=0.035,
+                         help="Level 3: lowest std dev (m) a fruit's position estimate may reach (the fruit filter's "
+                              "covariance floor; FruitEKF's own default is 0.029)")
+    parser.add_argument("--close-step", type=float, default=0.05,
+                         help="longest drive allowed once the robot is within 0.40 m of the fruit it is parking at, m")
+    parser.add_argument("--park-rings", type=float, nargs=2, default=[0.31, 0.27], metavar=("RING", "TIGHT_RING"),
                          help="distance of the parking spot from the fruit, m, and the closer one used when that "
                               "ring is boxed in")
     parser.add_argument("--clearance", type=float, default=0.15,
@@ -4574,7 +4608,7 @@ if __name__ == "__main__":
         # and targets, but not as localisation landmarks -- an estimate
         # with 10 cm of error would pull the pose the wrong way.
         nav.fruit_mapper = FruitMapper(ekf.robot.camera_matrix, object_dimensions,
-                                       expected_labels=search_list)
+                                       expected_labels=search_list, min_sd=args.fruit_min_sd)
         nav.fruit_mapper.target_min_spread_deg = args.target_spread
         nav.fruit_mapper.target_close_dist = args.target_close
         nav.fruit_mapper.target_min_views = max(1, args.target_views)
@@ -4616,7 +4650,7 @@ if __name__ == "__main__":
                        planner=args.planner, grid_resolution=args.grid_res,
                        max_leg_length=args.max_leg, safety_margin=args.safety_margin,
                        clearance_pref=args.clearance, scan_step=np.deg2rad(args.scan_step),
-                       found_radius=args.found_radius, park_rings=tuple(args.park_rings),
+                       found_radius=args.found_radius, park_rings=tuple(args.park_rings), close_step=args.close_step,
                        live_map=args.live_fruit_map,
                        fruit_margin=args.fruit_margin, edge_margin=args.edge_margin,
                        open_leg_length=args.open_leg, max_viewpoints=args.max_viewpoints,
@@ -4629,7 +4663,7 @@ if __name__ == "__main__":
             run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                        planner=args.planner, grid_resolution=args.grid_res,
                        max_leg_length=args.max_leg, safety_margin=args.safety_margin,
-                       found_radius=args.found_radius, park_rings=tuple(args.park_rings),
+                       found_radius=args.found_radius, park_rings=tuple(args.park_rings), close_step=args.close_step,
                        clearance_pref=args.clearance,
                        fruit_margin=args.fruit_margin, bounds=planning_bounds(args.edge_margin),
                        open_leg_length=args.open_leg)
