@@ -59,6 +59,11 @@ TURN_MODES = ('l', 'r')
 PID_GAINS = {'kp': 2, 'ki': 0.04, 'kd': 0.29}   # same as operate.py and M3
 MOVE_TIMEOUT = 15.0                              # s, same as M3's Navigator
 
+# How long to keep watching the counts after the Pi says a move is done, to
+# catch the ticks from the robot rolling on after the brake (it took up to
+# ~0.4 s on the robot). Only possible with the no-reset listen.py.
+ROLL_WATCH = 1.0       # s
+
 # Timed mode only
 RAMP_DURATION = 0.15   # s, as operate.py
 RAMP_FLOOR = 0.5       # ramp starts at 50% of commanded speed, not 0
@@ -72,17 +77,20 @@ def drive_auto(botconnect, wheel_speed, ticks):
     """Exactly M3's move: one move_auto_encoder() call, then wait for the Pi
     to finish.
 
-    How botconnect reports counts in this mode: its wheel thread sends the
-    command and then BLOCKS in recv() until the Pi replies at the END of the
-    move, so get_encoder_counts() doesn't change while the robot is moving.
-    The reply carries the Pi's final counts; the thread stores them and sets
-    autonomous_done. About 10 ms later it drops back to manual mode, whose
-    next reply overwrites them (and the Pi zeroes its counters once stopped).
-    So: poll the flag every 1 ms, read the counts the instant it flips (= what
-    the Pi counted when it declared the move done), then keep watching for
-    0.3 s and record the largest count seen, which also catches ticks from
-    the coast after the motors were cut, if any arrive before the reset.
-    @return: (completed, (done_left, done_right), (max_left, max_right))"""
+    The no-reset listen.py reports running encoder TOTALS that are never
+    reset, so this move's ticks are differences from the totals just before
+    the command. botconnect's wheel thread BLOCKS in recv() until the Pi
+    replies at the END of the move, then stores the Pi's totals and sets
+    autonomous_done; after that it polls every 10 ms again. So: read the
+    totals before sending, poll the flag every 1 ms, read the totals the
+    instant it flips (= what the Pi had counted when it cut the motors), then
+    keep watching for ROLL_WATCH s to catch the ticks from the robot rolling
+    on after the brake. (The encoders can't tell direction, so any rocking
+    back as the robot settles counts too.)
+    @return: (completed, (done_left, done_right), (settled_left, settled_right),
+              went_down) -- per-move ticks; went_down = the totals dropped,
+              i.e. the old listen.py that resets its counters is still running"""
+    before_l, before_r = botconnect.get_encoder_counts()
     botconnect.move_auto_encoder(wheel_speed, ticks, ticks)
     start = time.time()
     completed = True
@@ -94,21 +102,25 @@ def drive_auto(botconnect, wheel_speed, ticks):
             break
         time.sleep(0.001)
     done_l, done_r = botconnect.get_encoder_counts()
-    max_l, max_r = abs(done_l), abs(done_r)
-    t_end = time.time() + 0.3
+    last_l, last_r = done_l, done_r
+    went_down = False
+    t_end = time.time() + ROLL_WATCH
     while time.time() < t_end:
         l, r = botconnect.get_encoder_counts()
-        max_l = max(max_l, abs(l))
-        max_r = max(max_r, abs(r))
+        if l < last_l or r < last_r:
+            went_down = True
+        last_l, last_r = l, r
         time.sleep(0.001)
-    return completed, (done_l, done_r), (max_l, max_r)
+    return (completed, (done_l - before_l, done_r - before_r),
+            (last_l - before_l, last_r - before_r), went_down)
 
 
 def drive_timed(botconnect, wheel_speed, duration):
     """Old behaviour: stream move_manual() for `duration` s, ramping from
-    RAMP_FLOOR to full speed. Encoders are read BEFORE stop() because the Pi
-    zeroes them when it stops. Note the coast after stop() is in your tape
-    measurement but not in these ticks -- the line fit's intercept absorbs it.
+    RAMP_FLOOR to full speed. Encoders are read just before stop(), so the
+    coast after stop() is in your tape measurement but not in these ticks --
+    the line fit's intercept absorbs it. (Differences of the Pi's totals, so
+    this works with the old resetting listen.py and the no-reset one alike.)
     @return: (delta_left, delta_right)"""
     left_start, right_start = botconnect.get_encoder_counts()
     start = time.time()
@@ -275,11 +287,15 @@ if __name__ == "__main__":
             print(f"  [{name}] left {dl}, right {dr} -> using {n_ticks:.1f} ticks")
         else:
             n_ticks = int(round(amount))
-            completed, (dl, dr), (ml, mr) = drive_auto(botconnect, wheel_speed, n_ticks)
-            print(f"  [{name}] commanded {n_ticks} ticks; Pi reported at finish: left {dl}, right {dr};"
-                  f" max within 0.3 s after: left {ml}, right {mr}"
+            completed, (dl, dr), (ml, mr), went_down = drive_auto(botconnect, wheel_speed, n_ticks)
+            print(f"  [{name}] commanded {n_ticks} ticks; counted when the Pi stopped: left {dl}, right {dr};"
+                  f" after {ROLL_WATCH:.1f} s: left {ml}, right {mr}"
+                  f" (rolled on +{ml - dl} / +{mr - dr})"
                   + ("" if completed else "  (TIMED OUT -- discard this trial)"))
-            if abs(ml - mr) > max(3, 0.1 * n_ticks):
+            if went_down:
+                print("  WARNING: the Pi's counts went DOWN -- the old listen.py (which resets its "
+                      "counters) is still running, so the tick numbers above are not valid")
+            elif abs(ml - mr) > max(3, 0.1 * n_ticks):
                 print("  note: wheels counted quite differently -- check the robot drove straight")
 
         prompt = "  measured angle (deg): " if key in TURN_MODES else "  measured distance (m): "

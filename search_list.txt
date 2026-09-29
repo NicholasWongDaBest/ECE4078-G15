@@ -1,4 +1,4 @@
+lemon
+capsicum
 redapple
-greenapple
-orange
-lime
+mango

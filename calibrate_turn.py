@@ -310,7 +310,11 @@ def measure_trial(rig, requested_deg, turn_scale, heading_source):
     if move['enc_before'] is not None:
         el, er = move['enc_before']
         al, ar = move['enc_after']
-        print(f"  encoder counts reported: before ({el}, {er}) after ({al}, {ar})")
+        # The no-reset listen.py reports running totals, so the difference is
+        # what this turn counted, including the roll after the brake (read
+        # after settle_time). With the old resetting listen.py it means nothing.
+        print(f"  encoder counts reported: before ({el}, {er}) after ({al}, {ar}) "
+              f"-> this turn {al - el} / {ar - er} ticks incl. roll (sent {move['ticks']})")
 
     # Signed ticks: positive for a left turn, negative for a right turn, so a
     # single least-squares fit covers both directions at once.
