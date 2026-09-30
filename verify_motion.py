@@ -8,9 +8,10 @@
 #
 # Values used (printed at start):
 #   ticks_per_meter  read from auto_fruit_search.py's init_ekf() (or --tpm)
-#   turn_scale       calibration/param/turn_scale.txt            (or --turn-scale)
+#   turn_scale       calibration/param/turn_scale.txt       turns <= 20 deg, at 0.25  (or --turn-scale)
+#   turn_scale_fast  calibration/param/turn_scale_fast.txt  bigger turns, at 0.35    (or --turn-scale-fast)
 #   wheel separation |calibration/param/baseline.txt|
-#   speeds           drive 0.4; turns 0.25 if <= 3 ticks, else 0.35 (same as M3)
+#   speeds           drive 0.4; turns as above (same as M3)
 #
 # Usage:
 #   python verify_motion.py --ip <robot_ip>
@@ -45,7 +46,7 @@ PID_GAINS = {'kp': 2, 'ki': 0.04, 'kd': 0.29}   # auto_fruit_search.py __main__
 DRIVE_SPEED = 0.4                               # Navigator drive_speed
 TURN_SPEED = 0.35                               # Navigator turn_speed
 SMALL_TURN_SPEED = 0.25                         # Navigator small_turn_speed
-SMALL_TURN_MAX_TICKS = 3                        # Navigator small_turn_max_ticks
+SMALL_TURN_MAX_DEG = 25.0                       # Navigator small_turn_max_deg
 MOVE_TIMEOUT = 15.0
 ROLL_WATCH = 1.0                                # s of watching the counts after the Pi says done
 
@@ -96,16 +97,20 @@ def ask(prompt):
         return None
 
 
-def summary(trials, tpm, sep, ts):
+def summary(trials, tpm, sep, ts, ts_fast):
     if not trials:
         print("  no trials saved yet")
         return
-    for kind in ('d', 't'):
-        rows = [t for t in trials if t['kind'] == kind]
+    groups = [('d', None, "DRIVES"), ('t', False, "SLOW TURNS (<= {:.0f} deg, {}, turn_scale.txt)".format(
+        SMALL_TURN_MAX_DEG, SMALL_TURN_SPEED)), ('t', True, "FAST TURNS (> {:.0f} deg, {}, turn_scale_fast.txt)".format(
+        SMALL_TURN_MAX_DEG, TURN_SPEED))]
+    for kind, fast, title in groups:
+        rows = [t for t in trials if t['kind'] == kind and (fast is None or t['fast'] == fast)]
         if not rows:
             continue
         unit, conv = ("m", 1.0) if kind == 'd' else ("deg", 180 / math.pi)
-        print("\n  {}: {} trial(s)".format("DRIVES" if kind == 'd' else "TURNS", len(rows)))
+        cur_ts = ts_fast if fast else ts
+        print("\n  {}: {} trial(s)".format(title, len(rows)))
         print("    asked     ticks   believed   measured   error")
         for t in rows:
             print("    {:+8.3f}  {:5d}   {:+8.3f}   {:+8.3f}   {:+6.1f}%".format(
@@ -122,8 +127,8 @@ def summary(trials, tpm, sep, ts):
         else:
             s0 = float(np.sum(n * m) / np.sum(n * n))   # rad per tick, coast included
             new_ts = 2.0 / (sep * tpm * s0)
-            print("    -> {:.2f} deg per tick incl. coast; turn_scale that fits these: {:.4f} (now {:.4f})".format(
-                math.degrees(s0), new_ts, ts))
+            print("    -> {:.2f} deg per tick incl. coast; {} that fits these: {:.4f} (now {:.4f})".format(
+                math.degrees(s0), "turn_scale_fast" if fast else "turn_scale", new_ts, cur_ts))
             by = {}
             for t in rows:
                 by.setdefault(t['ticks'], []).append(abs(t['measured']))
@@ -140,7 +145,9 @@ def main():
     ap.add_argument("--tpm", type=float, default=None,
                     help="ticks_per_meter (default: read from auto_fruit_search.py)")
     ap.add_argument("--turn-scale", type=float, default=None,
-                    help="turn_scale (default: calibration/param/turn_scale.txt)")
+                    help="slow-turn scale (default: calibration/param/turn_scale.txt)")
+    ap.add_argument("--turn-scale-fast", type=float, default=None,
+                    help="fast-turn scale (default: calibration/param/turn_scale_fast.txt, else the slow one)")
     ap.add_argument("--no-pid", action="store_true")
     args = ap.parse_args()
 
@@ -153,11 +160,22 @@ def main():
             ts = float(np.loadtxt(os.path.join(args.calib_dir, 'turn_scale.txt'), delimiter=','))
         except Exception:
             ts = 1.0
+    if args.turn_scale_fast is not None:
+        ts_fast = args.turn_scale_fast
+    else:
+        try:
+            ts_fast = float(np.loadtxt(os.path.join(args.calib_dir, 'turn_scale_fast.txt'), delimiter=','))
+        except Exception:
+            ts_fast = ts
+            print("(no turn_scale_fast.txt -- fast turns use the slow scale too)")
     tick_deg = math.degrees(2.0 / (tpm * sep * ts))
+    tick_deg_fast = math.degrees(2.0 / (tpm * sep * ts_fast))
     print("ticks_per_meter {:.1f}  ->  1 tick = {:.1f} mm".format(tpm, 1000.0 / tpm))
-    print("turn_scale {:.4f}, wheel separation {:.4f} m  ->  1 turn tick = {:.2f} deg".format(ts, sep, tick_deg))
-    print("speeds: drive {}, turns {} (<= {} ticks) / {}".format(DRIVE_SPEED, SMALL_TURN_SPEED,
-                                                              SMALL_TURN_MAX_TICKS, TURN_SPEED))
+    print("wheel separation {:.4f} m".format(sep))
+    print("turns <= {:.0f} deg: speed {}, turn_scale {:.4f}  ->  1 tick = {:.2f} deg".format(
+        SMALL_TURN_MAX_DEG, SMALL_TURN_SPEED, ts, tick_deg))
+    print("bigger turns:     speed {}, turn_scale_fast {:.4f}  ->  1 tick = {:.2f} deg".format(
+        TURN_SPEED, ts_fast, tick_deg_fast))
 
     bot = BotConnect(args.ip)
     time.sleep(1)
@@ -174,7 +192,7 @@ def main():
         if raw in ('q', 'quit', 'exit'):
             break
         if raw == 'sum':
-            summary(trials, tpm, sep, ts)
+            summary(trials, tpm, sep, ts, ts_fast)
             continue
         if raw == 'undo':
             print("  removed" if trials and trials.pop() else "  nothing to undo")
@@ -191,6 +209,7 @@ def main():
         last_cmd = raw
         kind = parts[0]
 
+        fast = None
         if kind == 'd':
             # Navigator.drive_forward / drive_backward
             ticks = int(round(abs(val) * tpm))
@@ -204,12 +223,14 @@ def main():
         else:
             # Navigator.turn
             dtheta = math.radians(val)
-            ticks = int(round((sep / 2.0) * abs(dtheta) * tpm * ts))
+            fast = abs(val) > SMALL_TURN_MAX_DEG + 1e-6
+            scale = ts_fast if fast else ts
+            ticks = int(round((sep / 2.0) * abs(dtheta) * tpm * scale))
             if ticks < 1:
                 print("  under half a tick ({:.1f} deg) -- turn() would skip it".format(tick_deg / 2))
                 continue
-            believed = math.copysign(2.0 * ticks / (tpm * sep * ts), dtheta)
-            mag = SMALL_TURN_SPEED if ticks <= SMALL_TURN_MAX_TICKS else TURN_SPEED
+            believed = math.copysign(2.0 * ticks / (tpm * sep * scale), dtheta)
+            mag = TURN_SPEED if fast else SMALL_TURN_SPEED
             speeds = [-mag, mag] if val > 0 else [mag, -mag]
             print("  {} ticks at speed {} -> the EKF would be told {:+.1f} deg".format(ticks, mag, math.degrees(believed)))
             asked = dtheta
@@ -237,11 +258,12 @@ def main():
         print("  error {:+.1f}% ({:+.1f} {})".format(
             err, (meas - believed) * (1 if kind == 'd' else 180 / math.pi) * (100 if kind == 'd' else 1),
             "cm" if kind == 'd' else "deg"))
-        trials.append({'kind': kind, 'asked': asked, 'ticks': ticks, 'believed': believed, 'measured': meas})
+        trials.append({'kind': kind, 'asked': asked, 'ticks': ticks, 'believed': believed, 'measured': meas,
+                       'fast': fast})
 
     bot.stop()
     print("\nSummary:")
-    summary(trials, tpm, sep, ts)
+    summary(trials, tpm, sep, ts, ts_fast)
 
 
 if __name__ == "__main__":

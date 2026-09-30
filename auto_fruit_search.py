@@ -134,11 +134,15 @@ def init_ekf(calib_dir):
     baseline = np.loadtxt(os.path.join(calib_dir, 'baseline.txt'), delimiter=',')
     # ticks_per_meter: same value operate.py's init_ekf() currently uses (marked
     # there as "##change this value" -- if you recalibrate it, update BOTH places).
-    robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=171.6)
+    robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=193.3)
     return EKF(robot), float(baseline)
 
 
-def load_turn_scale(fname=os.path.join('calibration', 'param', 'turn_scale.txt')):
+TURN_SCALE_FILE = os.path.join('calibration', 'param', 'turn_scale.txt')            # slow turns (0.25)
+TURN_SCALE_FAST_FILE = os.path.join('calibration', 'param', 'turn_scale_fast.txt')  # fast turns (0.35)
+
+
+def load_turn_scale(fname=TURN_SCALE_FILE):
     """
     Rotation correction factor, as measured by calibrate_turn.py.
 
@@ -680,9 +684,9 @@ class Navigator:
     """
 
     def __init__(self, botconnect, ekf, aruco_sensor, baseline,
-                 drive_speed=0.4, turn_speed=0.25, move_timeout=15.0,
+                 drive_speed=0.4, turn_speed=0.35, move_timeout=15.0,
                  settle_time=0.4, turn_noise_frac=0.10, drive_noise_frac=0.05,
-                 marker_noise=(0.03, 0.03), turn_scale=1.0):
+                 marker_noise=(0.03, 0.03), turn_scale=1.0, turn_scale_fast=None):
         self.botconnect = botconnect
         self.ekf = ekf
         self.aruco_sensor = aruco_sensor
@@ -695,12 +699,16 @@ class Navigator:
         self.wheel_separation = abs(float(baseline))
         self.drive_speed = drive_speed
         self.turn_speed = turn_speed
-        # Small turns -- the few ticks left before a drive once direction
-        # planning has done the rest -- go slower: less coast after the brake,
-        # so each one lands closer to the same angle. turn_scale should then be
-        # calibrated on small turns at this speed (calibrate_turn.py --speed).
+        # Two kinds of turn, each with its own turn_scale: a turn of up to
+        # small_turn_max_deg goes at small_turn_speed and uses turn_scale
+        # (turn_scale.txt); a bigger one goes at turn_speed and uses
+        # turn_scale_fast (turn_scale_fast.txt). One scale could not fit
+        # both: calibrated on small turns it was right below ~20 deg and off
+        # above. Calibrate each at its own speed (calibrate_encoder.py
+        # --turn-speed 0.25 / 0.35). A turn with an explicit `speed` uses
+        # the scale of whichever of the two speeds that is closer to.
         self.small_turn_speed = 0.25
-        self.small_turn_max_ticks = 3
+        self.small_turn_max_deg = 20.0
         self.move_timeout = move_timeout
         self.settle_time = settle_time            # s to wait after a move before the next camera frame
         self.turn_noise_frac = turn_noise_frac    # heading std dev added per turn, as a fraction of the turn
@@ -709,7 +717,8 @@ class Navigator:
         # though the wheels turned exactly the ticks asked for. If the robot
         # consistently turns e.g. 80 deg when asked for 90, set turn_scale to
         # 90/80 = 1.125 and it will send proportionally more ticks per turn.
-        self.turn_scale = turn_scale
+        self.turn_scale = turn_scale                  # slow turns (small_turn_speed)
+        self.turn_scale_fast = turn_scale if turn_scale_fast is None else turn_scale_fast   # fast turns
 
         self.min_move = 0.02                      # m; closer than this counts as "already there"
         self.heading_tolerance = np.deg2rad(5.0)  # re-turn before driving if still off by more than this
@@ -832,7 +841,7 @@ class Navigator:
         # pan_at_fruit(): largest turn of one approach step, and how far the
         # re-localisation after a pan may move the pose for sightings held
         # from unconverged stops to still be mapped.
-        self.approach_step = np.deg2rad(30.0)
+        self.approach_step = np.deg2rad(20.0)   # <= small_turn_max_deg: approach steps are slow turns
         self.cmd_rot_total = 0.0   # sum of every commanded turn, rad (turn() adds to it)
         # confirm_in_place(): arrival frames whose markers are further than
         # confirm_gate from the prediction go straight to relocalise(); the
@@ -964,12 +973,15 @@ class Navigator:
         # a handful of turns. Learned scale is clamped to [0.5, 2.0].
         self.learn_turn_scale = True
         self.turn_scale_initial = turn_scale
+        self.turn_scale_fast_initial = self.turn_scale_fast
+        self._turn_scale_fast_samples = 0
         self._last_fit_theta = None        # heading from the last 2+ marker fit
         self._last_fit_sigma = None        # and how good that heading was, rad
         self.learn_min_turn = np.deg2rad(20.0)
         self.learn_max_fit_sigma = np.deg2rad(25.0)  # a fit worse than this teaches nothing at all...
         self.learn_max_noise_frac = 0.40             # ...and the two fits' noise must be under this fraction of the turn
         self._cmd_rot_since_fit = 0.0      # commanded rotation since that fit, rad
+        self._cmd_rot_fast_since_fit = 0.0 # ...of which in fast turns (turn_scale_fast)
         self._turn_scale_samples = 0
         self._last_boxes = []
         # For the display's detector panel: the last frame YOLO actually ran
@@ -1511,10 +1523,12 @@ class Navigator:
         bracket's start if it is good.
         """
         prev, prev_sigma, cmd = self._last_fit_theta, self._last_fit_sigma, self._cmd_rot_since_fit
+        cmd_fast = self._cmd_rot_fast_since_fit
         good = fit_sigma is not None and fit_sigma <= self.learn_max_fit_sigma
         self._last_fit_theta = theta_fit if good else None
         self._last_fit_sigma = fit_sigma if good else None
         self._cmd_rot_since_fit = 0.0
+        self._cmd_rot_fast_since_fit = 0.0
         if not self.learn_turn_scale or prev is None or not good:
             return
         if not (self.learn_min_turn <= abs(cmd) <= np.deg2rad(150.0)):
@@ -1525,17 +1539,36 @@ class Navigator:
         ratio = measured / cmd
         if not (0.4 <= ratio <= 2.5):
             return
+        # Two scales: only learn from a bracket made (almost) all of one kind
+        # of turn, and update that kind's scale. A mix cannot say which of
+        # the two was off.
+        share_fast = abs(cmd_fast) / max(abs(cmd), 1e-9)
+        if share_fast >= 0.85:
+            which = 'fast'
+        elif share_fast <= 0.15:
+            which = 'slow'
+        else:
+            return
+        cur = self.turn_scale_fast if which == 'fast' else self.turn_scale
         # The robot turned `measured` for ticks meant to give `cmd`: it needs
         # cmd/measured times as many ticks per radian as it is sending now.
-        target = min(2.0, max(0.5, self.turn_scale * cmd / measured))
-        self._turn_scale_samples += 1
-        alpha = max(0.15, 1.0 / (self._turn_scale_samples + 1))   # fast at first, then a running average
-        new_scale = (1.0 - alpha) * self.turn_scale + alpha * target
-        if abs(new_scale - self.turn_scale) / self.turn_scale >= 0.02:
-            print("  turn_scale learned: {:.3f} -> {:.3f} (commanded {:+.0f} deg, markers measured {:+.0f} deg, "
-                  "sample {})".format(self.turn_scale, new_scale, math.degrees(cmd), math.degrees(measured),
-                                      self._turn_scale_samples))
-        self.turn_scale = new_scale
+        target = min(2.0, max(0.5, cur * cmd / measured))
+        if which == 'fast':
+            self._turn_scale_fast_samples += 1
+            n = self._turn_scale_fast_samples
+        else:
+            self._turn_scale_samples += 1
+            n = self._turn_scale_samples
+        alpha = max(0.15, 1.0 / (n + 1))   # fast at first, then a running average
+        new_scale = (1.0 - alpha) * cur + alpha * target
+        if abs(new_scale - cur) / cur >= 0.02:
+            print("  turn_scale{} learned: {:.3f} -> {:.3f} (commanded {:+.0f} deg, markers measured {:+.0f} deg, "
+                  "sample {})".format('_fast' if which == 'fast' else '', cur, new_scale, math.degrees(cmd),
+                                      math.degrees(measured), n))
+        if which == 'fast':
+            self.turn_scale_fast = new_scale
+        else:
+            self.turn_scale = new_scale
 
     def _recover_if_all_gated(self, measurement):
         """See gated_recovery in __init__."""
@@ -1753,7 +1786,8 @@ class Navigator:
         # of them only came to 266 deg). Keep stepping until the rotation
         # actually commanded adds up to a full turn; n_steps is only the
         # estimate printed with each stop.
-        tick_rad = 2.0 / (self.ticks_per_meter * self.wheel_separation * self.turn_scale)
+        step_scale = self.turn_scale_fast if abs(step) > math.radians(self.small_turn_max_deg) else self.turn_scale
+        tick_rad = 2.0 / (self.ticks_per_meter * self.wheel_separation * step_scale)
         per_step = max(1, int(round(abs(step) / tick_rad))) * tick_rad
         n_steps = max(1, int(math.ceil(2 * math.pi / per_step - 1e-6)))
         turned = 0.0
@@ -2696,18 +2730,23 @@ class Navigator:
         matching robot.py's state[2] convention and operate.py's K_LEFT
         binding of [-0.35, 0.35]). One tick is the smallest possible turn
         (about 4.8 deg), so anything under half a tick is skipped. Turns of
-        small_turn_max_ticks or fewer go at small_turn_speed, bigger ones at
-        turn_speed. `speed` overrides both (relocalise() pans slowly with it); `noise_frac`
+        small_turn_max_deg or less go at small_turn_speed with turn_scale,
+        bigger ones at turn_speed with turn_scale_fast. `speed` overrides the
+        speed (relocalise() pans slowly with it) and then picks the scale of
+        the nearer of the two speeds; `noise_frac`
         overrides turn_noise_frac (scan_around() trusts its small steps more).
         @return: the rotation the EKF was told happened (0.0 if skipped)"""
-        arc_length = (self.wheel_separation / 2.0) * abs(dtheta)
-        ticks = int(round(arc_length * self.ticks_per_meter * self.turn_scale))
-        if ticks < 1:
-            return 0.0
         if speed is None:
-            magnitude = self.small_turn_speed if ticks <= self.small_turn_max_ticks else self.turn_speed
+            small = abs(dtheta) <= math.radians(self.small_turn_max_deg) + 1e-6
+            magnitude = self.small_turn_speed if small else self.turn_speed
         else:
             magnitude = abs(float(speed))
+        fast = self._is_fast(magnitude)
+        scale = self.turn_scale_fast if fast else self.turn_scale
+        arc_length = (self.wheel_separation / 2.0) * abs(dtheta)
+        ticks = int(round(arc_length * self.ticks_per_meter * scale))
+        if ticks < 1:
+            return 0.0
         signed = magnitude if dtheta > 0 else -magnitude
         wheel_speeds = [-signed, signed]
         start = time.time()
@@ -2715,15 +2754,22 @@ class Navigator:
         completed = self._wait_for_move()
         # the rotation those whole ticks are expected to produce
         commanded = math.copysign(
-            2.0 * ticks / (self.ticks_per_meter * self.wheel_separation * self.turn_scale), dtheta)
+            2.0 * ticks / (self.ticks_per_meter * self.wheel_separation * scale), dtheta)
         self._predict_commanded_motion(wheel_speeds, time.time() - start,
                                        dtheta=commanded, completed=completed, turn_noise_frac=noise_frac)
         self._cmd_rot_since_fit += commanded if completed else 0.0
+        if fast:
+            self._cmd_rot_fast_since_fit += commanded if completed else 0.0
         self.cmd_rot_total += commanded
         if not completed:
             self._last_fit_theta = None   # a timed-out turn is of unknown size: don't learn from it
         self._settle()
         return commanded
+
+    def _is_fast(self, magnitude):
+        """True if a turn at wheel speed `magnitude` should use turn_scale_fast:
+        it is nearer turn_speed than small_turn_speed."""
+        return abs(abs(magnitude) - abs(self.turn_speed)) < abs(abs(magnitude) - abs(self.small_turn_speed))
 
     def drive_backward(self, distance):
         """Drive straight BACKWARD by `distance` metres (>= 0): the same
@@ -5004,17 +5050,22 @@ if __name__ == "__main__":
     parser.add_argument("--no-display", action="store_true",
                          help="terminal only: no camera/map window and no setup phase")
     parser.add_argument("--turn-scale", type=float, default=None,
-                         help="override the measured turn_scale from "
-                              "calibration/param/turn_scale.txt (see calibrate_turn.py)")
+                         help="override the slow-turn scale (turns of --small-turn-deg or less, at "
+                              "--small-turn-speed) from calibration/param/turn_scale.txt")
+    parser.add_argument("--turn-scale-fast", type=float, default=None,
+                         help="override the fast-turn scale (bigger turns, at --turn-speed) from "
+                              "calibration/param/turn_scale_fast.txt")
+    parser.add_argument("--turn-speed", type=float, default=0.35,
+                         help="wheel speed for turns bigger than --small-turn-deg")
     parser.add_argument("--no-learn-turn-scale", action="store_true",
                          help="don't adjust turn_scale online from marker-measured rotations")
     parser.add_argument("--no-relocalise", action="store_true",
                          help="don't turn-and-pan to re-anchor the pose after each waypoint "
                               "(faster, but errors accumulate)")
     parser.add_argument("--small-turn-speed", type=float, default=0.25,
-                         help="wheel speed for turns of --small-turn-ticks or fewer (bigger turns use 0.35)")
-    parser.add_argument("--small-turn-ticks", type=int, default=3,
-                         help="turns of this many encoder ticks or fewer count as small")
+                         help="wheel speed for turns of --small-turn-deg or less (bigger turns use --turn-speed)")
+    parser.add_argument("--small-turn-deg", type=float, default=20.0,
+                         help="turns of this many degrees or less are small turns (slow speed, turn_scale.txt)")
     parser.add_argument("--no-straight-skip", action="store_true",
                          help="re-localise at every stop, even in the middle of a straight run")
     parser.add_argument("--tiny-hop", type=float, default=0.10,
@@ -5118,14 +5169,25 @@ if __name__ == "__main__":
     aruco_sensor = ArucoSensor(ekf.robot, marker_length=0.06)
 
     turn_scale = args.turn_scale if args.turn_scale is not None else load_turn_scale()
-    nav = Navigator(botconnect, ekf, aruco_sensor, baseline, turn_scale=turn_scale)
+    if args.turn_scale_fast is not None:
+        turn_scale_fast = args.turn_scale_fast
+    elif os.path.exists(TURN_SCALE_FAST_FILE):
+        turn_scale_fast = load_turn_scale(TURN_SCALE_FAST_FILE)
+    else:
+        turn_scale_fast = turn_scale
+        print(f"No {TURN_SCALE_FAST_FILE} -- fast turns use the slow-turn scale {turn_scale:.4f} too. "
+              f"Calibrate it: calibrate_encoder.py --turn-speed {args.turn_speed}")
+    nav = Navigator(botconnect, ekf, aruco_sensor, baseline, turn_scale=turn_scale,
+                    turn_scale_fast=turn_scale_fast, turn_speed=args.turn_speed)
     nav.relocalise_enabled = not args.no_relocalise
     nav.allow_reverse = not args.no_reverse
     nav.face_planning = not args.no_face_planning
     nav.straight_skip = not args.no_straight_skip
     nav.tiny_hop = max(0.0, args.tiny_hop)
     nav.small_turn_speed = args.small_turn_speed
-    nav.small_turn_max_ticks = max(0, args.small_turn_ticks)
+    nav.small_turn_max_deg = max(0.0, args.small_turn_deg)
+    print("Turns: <= {:.0f} deg at {:.2f} with turn_scale {:.4f}; bigger at {:.2f} with turn_scale_fast {:.4f}".format(
+        nav.small_turn_max_deg, nav.small_turn_speed, nav.turn_scale, nav.turn_speed, nav.turn_scale_fast))
     nav.one_marker_heading = not args.no_one_marker_heading
     nav.heading_fix_use_range = not args.one_marker_no_range
     nav.learn_turn_scale = not args.no_learn_turn_scale
@@ -5228,9 +5290,14 @@ if __name__ == "__main__":
             print("direction planning: turn left before the next leg after {} re-localisation(s) -- median {:.0f} deg, "
                   "{:.0f}% under 25 deg, max {:.0f} deg".format(len(r), np.median(r), 100 * np.mean(r <= 25), r.max()))
         if 'nav' in dir() and nav._turn_scale_samples:
-            print("turn_scale: started at {:.3f}, learned {:.3f} from {} marker-measured turn(s). To keep it: "
-                  "--turn-scale {:.3f}, or write it to calibration/param/turn_scale.txt".format(
-                      nav.turn_scale_initial, nav.turn_scale, nav._turn_scale_samples, nav.turn_scale))
+            print("turn_scale (slow turns): started at {:.3f}, learned {:.3f} from {} marker-measured turn(s). To keep it: "
+                  "--turn-scale {:.3f}, or write it to {}".format(
+                      nav.turn_scale_initial, nav.turn_scale, nav._turn_scale_samples, nav.turn_scale, TURN_SCALE_FILE))
+        if 'nav' in dir() and nav._turn_scale_fast_samples:
+            print("turn_scale_fast (fast turns): started at {:.3f}, learned {:.3f} from {} marker-measured turn(s). "
+                  "To keep it: --turn-scale-fast {:.3f}, or write it to {}".format(
+                      nav.turn_scale_fast_initial, nav.turn_scale_fast, nav._turn_scale_fast_samples,
+                      nav.turn_scale_fast, TURN_SCALE_FAST_FILE))
         if display is not None:
             import pygame
             pygame.quit()

@@ -27,15 +27,18 @@
 # equal to the measured s gives
 #     turn_scale = 2 / (b * k * s)
 #
-# SMALL TURNS. auto_fruit_search.py turns at 0.25 for turns of 3 ticks or
-# fewer (the turn left before each drive) and 0.35 above that, so turn trials
-# here run at --turn-speed, 0.25 by default. For 1-3 tick turns the coast is a
+# TWO TURN SCALES. auto_fruit_search.py turns at 0.25 for turns of 20 deg or
+# less (the turn left before each drive) using turn_scale.txt, and at 0.35 for
+# bigger turns using turn_scale_fast.txt. Turn trials here run at
+# --turn-speed, 0.25 by default, and 'save' writes the file for that speed:
+#     --turn-speed 0.25  ->  turn_scale.txt       (trials: 1-3 ticks, i.e. 5-20 deg)
+#     --turn-speed 0.35  ->  turn_scale_fast.txt  (trials: the sizes you use, e.g. 4, 8, 13, 20, 25 ticks) For 1-3 tick turns the coast is a
 # big share of the whole turn, and Navigator.turn() has no coast term -- so
 # the number it needs is not the slope s but the average angle per tick
 # INCLUDING the coast, i.e. a fit through the origin:
 #     s0 = sum(N * theta) / sum(N^2),    turn_scale = 2 / (b * k * s0)
 # 'fit' prints both; 'save' writes the through-origin one (left and right
-# turns together) to calibration/param/turn_scale.txt. For the small turns:
+# turns together) to the file for this turn speed. For the small turns:
 #     r 1, r 2, r 3, l 1, l 2, l 3 -- 4-5 of each -- then 'fit' and 'save'.
 #
 # 'timed' mode (--timed) keeps the old move_manual() behaviour for comparison,
@@ -218,7 +221,7 @@ def report_fits(samples, baseline, tpm_ref):
     if both:
         s0 = through_origin(both)
         scale = 2.0 / (baseline * tpm_ref * s0)
-        print(f"  -> small-turn turn_scale, left and right together: {scale:.4f} "
+        print(f"  -> turn_scale for this turn speed, left and right together: {scale:.4f} "
               f"(ticks {sorted({n for n, _ in both})}, {len(both)} trials) -- 'save' writes this")
         return scale
     return None
@@ -259,12 +262,15 @@ if __name__ == "__main__":
                              "turn_scale until you've fitted your own")
     parser.add_argument("--turn-speed", type=float, default=SMALL_TURN_SPEED,
                         help="wheel speed for the l/r turn trials. Default %.2f = the speed "
-                             "auto_fruit_search.py uses for turns of 3 ticks or fewer; use 0.35 "
-                             "to calibrate the bigger turns instead" % SMALL_TURN_SPEED)
+                             "auto_fruit_search.py uses for turns of 20 deg or less (saved to "
+                             "turn_scale.txt); 0.35 calibrates the bigger turns (saved to "
+                             "turn_scale_fast.txt)" % SMALL_TURN_SPEED)
     args, _ = parser.parse_known_args()
 
     baseline = load_baseline(args.calib_dir)
     ts = abs(args.turn_speed)
+    # which file 'save' writes: the slow-turn scale, or the fast-turn one
+    scale_file = 'turn_scale.txt' if ts < 0.30 else 'turn_scale_fast.txt'
     MODES['l'] = ('Turn left', [-ts, ts])
     MODES['r'] = ('Turn right', [ts, -ts])
     scale_to_save = None
@@ -283,8 +289,12 @@ if __name__ == "__main__":
     print(f"\nEnter '<mode> <{unit}>', e.g. 'f {'2' if args.timed else '100'}'.")
     print("After each trial, type the distance (m) or angle (deg) you measured; blank = discard.")
     print("'fit' = fit the trials so far, 'list' = show them, 'undo' = remove the last saved trial,")
-    print("'save' = write the small-turn turn_scale to turn_scale.txt, 'q' = quit (fits first).")
-    print(f"Small turns: r 1, r 2, r 3, l 1, l 2, l 3 -- 4-5 of each at turn speed {ts:.2f} -- then fit, save.\n")
+    print(f"'save' = write the turn_scale for turn speed {ts:.2f} to {scale_file}, 'q' = quit (fits first).")
+    if scale_file == 'turn_scale.txt':
+        print(f"Small turns: r 1, r 2, r 3, l 1, l 2, l 3 -- 4-5 of each at turn speed {ts:.2f} -- then fit, save.\n")
+    else:
+        print(f"Big turns at {ts:.2f}: e.g. r 4, r 8, r 13, r 20, r 25 and the same with l -- 3-4 of each -- "
+              f"then fit, save.\n")
 
     samples = {key: [] for key in MODES}
     last_key = None   # mode of the most recently saved trial, for 'undo'
@@ -306,7 +316,7 @@ if __name__ == "__main__":
             elif not (0.3 <= scale_to_save <= 2.0):
                 print(f"  {scale_to_save:.4f} is outside 0.3-2.0 -- not saving; check the trials\n")
             else:
-                path = os.path.join(args.calib_dir, 'turn_scale.txt')
+                path = os.path.join(args.calib_dir, scale_file)
                 if os.path.exists(path):
                     try:
                         print(f"  (was {float(np.loadtxt(path, delimiter=',')):.4f})")
