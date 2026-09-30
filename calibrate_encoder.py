@@ -27,14 +27,26 @@
 # equal to the measured s gives
 #     turn_scale = 2 / (b * k * s)
 #
+# SMALL TURNS. auto_fruit_search.py turns at 0.25 for turns of 3 ticks or
+# fewer (the turn left before each drive) and 0.35 above that, so turn trials
+# here run at --turn-speed, 0.25 by default. For 1-3 tick turns the coast is a
+# big share of the whole turn, and Navigator.turn() has no coast term -- so
+# the number it needs is not the slope s but the average angle per tick
+# INCLUDING the coast, i.e. a fit through the origin:
+#     s0 = sum(N * theta) / sum(N^2),    turn_scale = 2 / (b * k * s0)
+# 'fit' prints both; 'save' writes the through-origin one (left and right
+# turns together) to calibration/param/turn_scale.txt. For the small turns:
+#     r 1, r 2, r 3, l 1, l 2, l 3 -- 4-5 of each -- then 'fit' and 'save'.
+#
 # 'timed' mode (--timed) keeps the old move_manual() behaviour for comparison,
 # but its ramp now starts at RAMP_FLOOR instead of 0: the old ramp's first
 # commands were [0, 0] and then speeds below the PWM threshold, where the weak
 # left wheel could stay stalled while the right one moved.
 #
 # Usage:
-#   python drive_timed.py --ip <robot_ip>              # auto mode (like M3)
-#   python drive_timed.py --ip <robot_ip> --timed      # old timed mode
+#   python calibrate_encoder.py --ip <robot_ip>                     # auto mode (like M3)
+#   python calibrate_encoder.py --ip <robot_ip> --turn-speed 0.35   # turn trials at the big-turn speed
+#   python calibrate_encoder.py --ip <robot_ip> --timed             # old timed mode
 #   then enter e.g. 'f 100' (auto: 100 ticks) or 'f 2' (timed: 2 s),
 #   type in what you measured, repeat, and enter 'fit'.
 #   Bad trial? Press Enter at the measurement prompt to discard it, or type
@@ -55,6 +67,7 @@ MODES = {
     'r': ('Turn right', [0.35, -0.35]),
 }
 TURN_MODES = ('l', 'r')
+SMALL_TURN_SPEED = 0.25    # auto_fruit_search.py's Navigator.small_turn_speed
 
 PID_GAINS = {'kp': 2, 'ki': 0.04, 'kd': 0.29}   # same as operate.py and M3
 MOVE_TIMEOUT = 15.0                              # s, same as M3's Navigator
@@ -174,20 +187,49 @@ def report_fits(samples, baseline, tpm_ref):
         print(f"  -> ticks_per_meter to use: {k_use:.1f} "
               f"(currently {tpm_ref:.1f} in operate.py / M3's init_ekf)")
     else:
-        k_use = tpm_ref
-        print(f"  (no straight-line fit yet -- turn_scale below uses k = {k_use:.1f})")
+        print(f"  (no straight-line fit yet)")
 
+    # turn_scale is always relative to the ticks_per_meter auto_fruit_search.py
+    # actually uses (tpm_ref), not a new straight-line fit: Navigator.turn()
+    # multiplies the two together, so a scale fitted against a different k
+    # would be off by the ratio of the two.
     for key in TURN_MODES:
         pts = samples[key]
         name = MODES[key][0]
-        if len({n for n, _ in pts}) < 2:
-            print(f"  {name}: need trials at >= 2 different tick counts ({len(pts)} so far)")
+        if not pts:
             continue
         n, th = zip(*pts)
-        s, th0, rms = line_fit(n, th)
-        turn_scale = 2.0 / (baseline * k_use * s)
-        print(f"  {name}: {np.degrees(s):.2f} deg/tick, coast {np.degrees(th0):+.1f} deg "
-              f"(rms {np.degrees(rms):.1f} deg) -> turn_scale = {turn_scale:.3f}")
+        if len(set(n)) >= 2:
+            s, th0, rms = line_fit(n, th)
+            print(f"  {name}: slope {np.degrees(s):.2f} deg/tick, coast {np.degrees(th0):+.1f} deg "
+                  f"(rms {np.degrees(rms):.1f} deg) -> turn_scale from the slope alone = "
+                  f"{2.0 / (baseline * tpm_ref * s):.3f}")
+        else:
+            print(f"  {name}: only one tick count so far -- no slope/coast split")
+        for ni in sorted(set(n)):
+            a = np.degrees([t for nj, t in pts if nj == ni])
+            print(f"      {ni} tick(s): mean {a.mean():.1f} deg, spread +/-{a.std():.1f} deg "
+                  f"({len(a)} trial(s))")
+        s0 = through_origin(pts)
+        print(f"      through the origin (coast included): {np.degrees(s0):.2f} deg/tick "
+              f"-> turn_scale = {2.0 / (baseline * tpm_ref * s0):.3f}")
+
+    both = samples['l'] + samples['r']
+    if both:
+        s0 = through_origin(both)
+        scale = 2.0 / (baseline * tpm_ref * s0)
+        print(f"  -> small-turn turn_scale, left and right together: {scale:.4f} "
+              f"(ticks {sorted({n for n, _ in both})}, {len(both)} trials) -- 'save' writes this")
+        return scale
+    return None
+
+
+def through_origin(pts):
+    """Least-squares theta = s0 * N with no intercept: the average angle per
+    tick, coast included -- what Navigator.turn()'s one-number model needs."""
+    n = np.array([p[0] for p in pts], dtype=float)
+    th = np.array([p[1] for p in pts], dtype=float)
+    return float(np.sum(n * th) / np.sum(n * n))
 
 
 # ----------------------------------------------------------------------
@@ -212,12 +254,20 @@ if __name__ == "__main__":
     parser.add_argument("--no-pid", action="store_true",
                         help="don't enable the robot's PID speed control")
     parser.add_argument("--calib-dir", type=str, default='calibration/param/')
-    parser.add_argument("--tpm", type=float, default=172.5,
-                        help="current ticks_per_meter, used for turn_scale until you've "
-                             "fitted your own")
+    parser.add_argument("--tpm", type=float, default=193.3,
+                        help="current ticks_per_meter (auto_fruit_search.py's init_ekf), used for "
+                             "turn_scale until you've fitted your own")
+    parser.add_argument("--turn-speed", type=float, default=SMALL_TURN_SPEED,
+                        help="wheel speed for the l/r turn trials. Default %.2f = the speed "
+                             "auto_fruit_search.py uses for turns of 3 ticks or fewer; use 0.35 "
+                             "to calibrate the bigger turns instead" % SMALL_TURN_SPEED)
     args, _ = parser.parse_known_args()
 
     baseline = load_baseline(args.calib_dir)
+    ts = abs(args.turn_speed)
+    MODES['l'] = ('Turn left', [-ts, ts])
+    MODES['r'] = ('Turn right', [ts, -ts])
+    scale_to_save = None
 
     botconnect = BotConnect(args.ip)
     time.sleep(1)
@@ -233,7 +283,8 @@ if __name__ == "__main__":
     print(f"\nEnter '<mode> <{unit}>', e.g. 'f {'2' if args.timed else '100'}'.")
     print("After each trial, type the distance (m) or angle (deg) you measured; blank = discard.")
     print("'fit' = fit the trials so far, 'list' = show them, 'undo' = remove the last saved trial,")
-    print("'q' = quit (fits first).\n")
+    print("'save' = write the small-turn turn_scale to turn_scale.txt, 'q' = quit (fits first).")
+    print(f"Small turns: r 1, r 2, r 3, l 1, l 2, l 3 -- 4-5 of each at turn speed {ts:.2f} -- then fit, save.\n")
 
     samples = {key: [] for key in MODES}
     last_key = None   # mode of the most recently saved trial, for 'undo'
@@ -245,8 +296,25 @@ if __name__ == "__main__":
         if user_input == 'fit':
             if baseline is None:
                 print("  (no baseline -- turn fits will fail)")
-            report_fits(samples, baseline or float('nan'), args.tpm)
+            scale_to_save = report_fits(samples, baseline or float('nan'), args.tpm)
             print()
+            continue
+        if user_input == 'save':
+            scale_to_save = report_fits(samples, baseline or float('nan'), args.tpm)
+            if scale_to_save is None or not np.isfinite(scale_to_save):
+                print("  nothing to save -- no turn trials yet (or no baseline)\n")
+            elif not (0.3 <= scale_to_save <= 2.0):
+                print(f"  {scale_to_save:.4f} is outside 0.3-2.0 -- not saving; check the trials\n")
+            else:
+                path = os.path.join(args.calib_dir, 'turn_scale.txt')
+                if os.path.exists(path):
+                    try:
+                        print(f"  (was {float(np.loadtxt(path, delimiter=',')):.4f})")
+                    except Exception:
+                        pass
+                np.savetxt(path, np.array([scale_to_save]), delimiter=',')
+                print(f"  wrote turn_scale = {scale_to_save:.4f} to {path} "
+                      f"(measured at turn speed {ts:.2f}, ticks_per_meter {args.tpm:.1f})\n")
             continue
         if user_input == 'undo':
             if last_key is None or not samples[last_key]:

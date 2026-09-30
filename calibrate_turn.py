@@ -42,6 +42,11 @@
 #   python calibrate_turn.py --ip <robot_ip> --measure manual       # protractor
 #   python calibrate_turn.py --dry-run                              # maths only, no robot
 #
+#   Small turns (<= 3 ticks) run at 0.25 in auto_fruit_search.py, big ones at
+#   0.35. To calibrate for the small turns made before each drive:
+#   python calibrate_turn.py --ip <robot_ip> --map truemap.txt --speed 0.25 \
+#       --trials 5,-5,10,-10,15,-15,5,-5,10,-10,15,-15
+#
 # Place the robot near the centre of the arena with at least two markers in
 # view, and keep them in view throughout -- in aruco mode the heading is solved
 # from whichever known markers are visible, so it's fine if they're different
@@ -64,9 +69,11 @@ from botconnect import BotConnect
 # run, or the number it produces describes a regime the robot never drives in.
 # If you change any of these there, change them here too.
 
-TURN_SPEED = 0.35                                  # Navigator.__init__'s turn_speed
+TURN_SPEED = 0.35                                  # Navigator.__init__'s turn_speed (big turns)
+SMALL_TURN_SPEED = 0.25                            # Navigator.small_turn_speed: turns of <= 3 ticks --
+                                                   # calibrate those with --speed 0.25
 PID_GAINS = {'kp': 2, 'ki': 0.04, 'kd': 0.29}      # auto_fruit_search.py's __main__
-TICKS_PER_METER = 190.0                            # init_ekf()'s Robot(...) argument
+TICKS_PER_METER = 193.3                            # init_ekf()'s Robot(...) argument
 SETTLE_TIME = 0.4                                  # Navigator.__init__'s settle_time
 MOVE_TIMEOUT = 15.0                                # Navigator.__init__'s move_timeout
 MARKER_LENGTH = 0.06                               # ArucoSensor(...) in __main__
@@ -544,9 +551,17 @@ if __name__ == "__main__":
                         help="comma-separated signed angles in degrees, e.g. '90,-90,135,-135'. "
                              "Default: " + ",".join(str(t) for t in DEFAULT_TRIALS))
     parser.add_argument("--turn-scale", type=float, default=1.0,
-                        help="scale to drive the trials at. Leave at 1.0 for a fresh "
+                        help="scale used to pick each trial's tick count. Leave at 1.0 for a fresh "
                              "calibration; set it to a previous result to VERIFY that result "
-                             "(a good one gives a new scale near 1.0).")
+                             "(a good one measures a scale close to it).")
+    parser.add_argument("--speed", type=float, default=TURN_SPEED,
+                        help="wheel speed to turn at. auto_fruit_search.py turns at %.2f for "
+                             "small turns (<= small_turn_max_ticks, 3 by default) and %.2f for "
+                             "bigger ones, and the two do not turn the same per tick -- "
+                             "calibrate at the speed of the turns you care about. For the small "
+                             "turns before each drive: --speed %.2f --trials "
+                             "5,-5,10,-10,15,-15,5,-5,10,-10,15,-15" % (SMALL_TURN_SPEED, TURN_SPEED,
+                                                                       SMALL_TURN_SPEED))
     parser.add_argument("--no-pid", action="store_true",
                         help="don't enable the robot's PID speed control (M3 runs with it on)")
     parser.add_argument("--no-save", action="store_true",
@@ -576,7 +591,7 @@ if __name__ == "__main__":
     if not args.no_pid:
         botconnect.set_pid(use_pid=1, **PID_GAINS)
 
-    rig = TurnRig(botconnect, baseline)
+    rig = TurnRig(botconnect, baseline, turn_speed=args.speed)
     print_nominal_table(rig)
 
     heading_source = None
@@ -601,7 +616,7 @@ if __name__ == "__main__":
         print("the mark it finished.")
 
     print(f"\nRunning {len(trial_angles)} trials at turn_scale = {args.turn_scale}, "
-          f"turn speed {TURN_SPEED}.")
+          f"turn speed {rig.turn_speed}.")
     print("Keep hands clear; the robot will turn on the spot.")
     input("Press ENTER to start...")
 
@@ -627,13 +642,14 @@ if __name__ == "__main__":
 
     report(trials, rig, k_all)
 
-    # Trials driven at a non-unity scale measure the residual error on top of
-    # that scale, so the scale to save is the product, not the new fit alone.
-    final_scale = (k_all / rig.nominal_ticks_per_radian()) * args.turn_scale
+    # The fit is of the ticks actually SENT against the angle actually turned,
+    # so k_all / nominal is already the absolute scale, whatever --turn-scale
+    # picked the tick counts. (This used to multiply by --turn-scale again,
+    # which double-counted it on any run not at 1.0.)
+    final_scale = k_all / rig.nominal_ticks_per_radian()
     if args.turn_scale != 1.0:
-        print(f"\n  Trials ran at turn_scale = {args.turn_scale}, so the scale to use from "
-              f"here is\n  {k_all / rig.nominal_ticks_per_radian():.4f} x {args.turn_scale} "
-              f"= {final_scale:.4f}.")
+        print(f"\n  Trials ran at turn_scale = {args.turn_scale}; the measured scale is "
+              f"{final_scale:.4f}\n  (a good existing calibration measures close to what it was run at).")
 
     if args.no_save:
         print("\n(--no-save: nothing written)")
@@ -641,5 +657,5 @@ if __name__ == "__main__":
         save_results(final_scale, trials, rig, k_all,
                      f"turn_calibration_{int(time.time())}.json")
 
-    print("\nNext: re-run with --turn-scale {:.4f} to verify. A good calibration comes back "
-          "with a\nnew scale within a couple of percent of 1.0.".format(final_scale))
+    print("\nNext: re-run with --turn-scale {:.4f} --speed {:.2f} to verify. A good calibration "
+          "measures\na scale within a couple of percent of that.".format(final_scale, rig.turn_speed))
