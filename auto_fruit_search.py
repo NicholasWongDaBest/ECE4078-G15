@@ -134,7 +134,7 @@ def init_ekf(calib_dir):
     baseline = np.loadtxt(os.path.join(calib_dir, 'baseline.txt'), delimiter=',')
     # ticks_per_meter: same value operate.py's init_ekf() currently uses (marked
     # there as "##change this value" -- if you recalibrate it, update BOTH places).
-    robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=193.3)
+    robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=171.6)
     return EKF(robot), float(baseline)
 
 
@@ -680,7 +680,7 @@ class Navigator:
     """
 
     def __init__(self, botconnect, ekf, aruco_sensor, baseline,
-                 drive_speed=0.4, turn_speed=0.35, move_timeout=15.0,
+                 drive_speed=0.4, turn_speed=0.25, move_timeout=15.0,
                  settle_time=0.4, turn_noise_frac=0.10, drive_noise_frac=0.05,
                  marker_noise=(0.03, 0.03), turn_scale=1.0):
         self.botconnect = botconnect
