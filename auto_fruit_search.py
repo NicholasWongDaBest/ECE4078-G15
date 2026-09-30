@@ -204,7 +204,7 @@ class FruitMapper:
     """
 
     def __init__(self, camera_matrix, object_dimensions, expected_labels=(),
-                 min_views=2, min_spread_deg=30.0, arena_half=None, max_pullback=0.35,
+                 min_views=3, min_spread_deg=30.0, arena_half=None, max_pullback=0.35,
                  min_sightings=4, target_min_sightings=6, min_sd=0.035):
         # min_sd: the fruit filter's covariance floor (FruitEKF min_var, as a
         # std dev). No fruit's sd goes below it, so every new sighting keeps a
@@ -869,6 +869,15 @@ class Navigator:
         self.straight_max_dist = 0.60
         self.straight_blind_max = 0.30
         self.max_straight_skips = 1
+        # Tight legs: a leg that passes within tight_clearance of a safety
+        # circle (a gap between two objects -- markers or fruits -- or a
+        # squeeze past one) is only started from a properly checked pose:
+        # the stop before it is never let off its check (_straight_on), and
+        # if the last stop was not checked (a straight-run skip, a stop
+        # between markers, or an unconverged re-localisation), drive_to_point
+        # re-localises in full -- position as well as heading -- before it.
+        self.tight_clearance = 0.08
+        self.n_tight_prechecks = 0
         # _skip_tiny_hop(): a first waypoint closer than this is skipped when
         # the line to the next one is clear. 0 turns it off.
         self.tiny_hop = 0.10
@@ -2916,10 +2925,30 @@ def drive_to_point(waypoint, nav, max_distance=None, relocalise=True, allow_reve
     """
     nav.display.set_waypoint(waypoint)
     trusted_at_start = nav.last_relocalise_converged and not nav.gap_skip_last
+    skipped_before = nav.last_check_skipped   # the stop we are starting from went without its check
     nav.last_check_skipped = False
     pose = nav.get_robot_pose()
     if math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1]) < nav.min_move:
         return pose  # already there -- and atan2 of a ~zero vector is a random heading
+
+    if obstacles is not None and len(obstacles) and nav.relocalise_enabled and not between_markers \
+            and (skipped_before or nav.gap_skip_last or not nav.last_relocalise_converged):
+        # A tight leg (within tight_clearance of a safety circle -- a gap
+        # between two objects, markers or fruits) from a pose the last stop
+        # did not properly check: re-localise in full first, position as
+        # well as heading. (Not when standing between two markers: a pan
+        # there goes wrong -- the leg drives out first.)
+        room = path_planner.segment_clearance((float(pose[0]), float(pose[1])), tuple(waypoint), obstacles)
+        if room < nav.tight_clearance:
+            why = ("the last stop's check was skipped" if skipped_before else
+                   "the last stop was between markers" if nav.gap_skip_last else
+                   "the last re-localisation did not converge")
+            print("  tight leg ({:.0f} cm of room) and {} -- re-localising before it".format(max(room, 0.0) * 100, why))
+            nav.n_tight_prechecks += 1
+            nav.gap_skip_last = False
+            pose = nav.relocalise(face_point=waypoint)
+            if math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1]) < nav.min_move:
+                return pose
 
     planned = math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1])
     if max_distance is not None:
@@ -3667,6 +3696,7 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                 waypoints = [next_wp] + list(waypoints)
 
             reloc_mode = 'auto'
+            gap_stop = False
             if nav.avoid_gap_stops:
                 d_wp = path_planner.dist_between(start, next_wp)
                 capped = min(leg_cap, d_wp)
@@ -3681,6 +3711,7 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                     if note:
                         print(f"[{target_name}] {note}")
                         if cap2 < capped - 1e-6:
+                            gap_stop = True
                             f = cap2 / max(d_wp, 1e-9)
                             next_wp = (start[0] + f * (next_wp[0] - start[0]), start[1] + f * (next_wp[1] - start[1]))
                             waypoints = [next_wp] + list(waypoints)
@@ -3699,7 +3730,8 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             # stop may be spared its re-localise pan (see _straight_on).
             reloc_mode = _straight_on(nav, reloc_mode, start, waypoints,
                                       keep_checking_near=(float(target[0]), float(target[1])),
-                                      near_radius=close_zone + 0.15)
+                                      near_radius=close_zone + 0.15, obstacles=obstacles[:-1],
+                                      gap_stop=gap_stop)
             # Direction planning: where the leg AFTER this one will head, so the
             # re-localise pan on arrival ends up roughly facing it. The rest of
             # this plan is the best guess (the route is re-planned from the
@@ -3759,7 +3791,8 @@ def _skip_tiny_hop(nav, start, waypoints, obstacles, clearance=0.02):
     return waypoints
 
 
-def _straight_on(nav, reloc_mode, start, waypoints, keep_checking_near=None, near_radius=0.0):
+def _straight_on(nav, reloc_mode, start, waypoints, keep_checking_near=None, near_radius=0.0,
+                 obstacles=None, gap_stop=False):
     """
     'straight' instead of 'auto' when the leg start -> waypoints[0] is the
     middle of a straight run: the next leg (to waypoints[1]) carries on
@@ -3767,10 +3800,13 @@ def _straight_on(nav, reloc_mode, start, waypoints, keep_checking_near=None, nea
     cut a longer segment short. drive_to_point() may then spare the stop
     its re-localise pan (Navigator.straight_check()). Never within
     near_radius of `keep_checking_near` (the fruit being parked at: the
-    final approach is checked at every stop), and never for the last leg
-    of a route (no waypoints[1]).
+    final approach is checked at every stop), never for the last leg of a
+    route (no waypoints[1]), never at a stop made short of a gap between
+    markers (`gap_stop`: that stop exists FOR the check), and never when
+    the leg after this stop is tight (within nav.tight_clearance of a
+    safety circle in `obstacles`).
     """
-    if reloc_mode != 'auto' or not nav.straight_skip or len(waypoints) < 2:
+    if reloc_mode != 'auto' or not nav.straight_skip or len(waypoints) < 2 or gap_stop:
         return reloc_mode
     a, b, c = start, waypoints[0], waypoints[1]
     if path_planner.dist_between(a, b) < nav.min_move or path_planner.dist_between(b, c) < nav.min_move:
@@ -3780,6 +3816,9 @@ def _straight_on(nav, reloc_mode, start, waypoints, keep_checking_near=None, nea
         return reloc_mode
     if keep_checking_near is not None and path_planner.dist_between(b, keep_checking_near) <= near_radius:
         return reloc_mode
+    if obstacles is not None and len(obstacles) and \
+            path_planner.segment_clearance(tuple(b), tuple(c), obstacles) < nav.tight_clearance:
+        return reloc_mode   # the next leg squeezes past something: check the pose before it
     return 'straight'
 
 
@@ -4953,6 +4992,7 @@ def _go_to(nav, goal, obstacles, grid, planner='astar', max_leg_length=0.25, cle
             f = leg_cap / leg_len
             next_wp = (start[0] + f * (next_wp[0] - start[0]), start[1] + f * (next_wp[1] - start[1]))
         reloc_mode = 'auto'
+        gap_stop = False
         if markers is not None and nav.avoid_gap_stops:
             capped = min(leg_cap, path_planner.dist_between(start, next_wp))
             cap2, reloc_mode, note = _legs_around_gaps(start, next_wp, capped, markers)
@@ -4962,6 +5002,7 @@ def _go_to(nav, goal, obstacles, grid, planner='astar', max_leg_length=0.25, cle
             if note:
                 print(f"[{label}] {note}")
                 if cap2 < capped - 1e-6:
+                    gap_stop = True
                     f = cap2 / max(path_planner.dist_between(start, next_wp), 1e-9)
                     next_wp = (start[0] + f * (next_wp[0] - start[0]), start[1] + f * (next_wp[1] - start[1]))
                 leg_cap = cap2
@@ -4972,7 +5013,7 @@ def _go_to(nav, goal, obstacles, grid, planner='astar', max_leg_length=0.25, cle
         if path_planner.dist_between(next_wp, goal) > goal_tolerance + 0.05:
             # not the last stop before the goal: a stop mid-way along a
             # straight run may go without its re-localise pan (_straight_on)
-            reloc_mode = _straight_on(nav, reloc_mode, start, seq)
+            reloc_mode = _straight_on(nav, reloc_mode, start, seq, obstacles=obstacles, gap_stop=gap_stop)
             face_next = seq[1] if len(seq) > 1 else None
         else:
             face_next = face_at_goal
