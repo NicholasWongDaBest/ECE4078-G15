@@ -1748,11 +1748,21 @@ class Navigator:
         @return: set of fruit labels seen at least once during the scan
         """
         frames = self.scan_frames if frames is None else int(frames)
-        n_steps = max(1, int(round(2 * math.pi / abs(step))))
+        # A step is whole encoder ticks, so it is rarely exactly `step`
+        # (with turn_scale 0.578 a 10 deg step is 1 tick = 7.4 deg, and 36
+        # of them only came to 266 deg). Keep stepping until the rotation
+        # actually commanded adds up to a full turn; n_steps is only the
+        # estimate printed with each stop.
+        tick_rad = 2.0 / (self.ticks_per_meter * self.wheel_separation * self.turn_scale)
+        per_step = max(1, int(round(abs(step) / tick_rad))) * tick_rad
+        n_steps = max(1, int(math.ceil(2 * math.pi / per_step - 1e-6)))
+        turned = 0.0
         seen = set()
         mapped_stops = skipped_stops = 0
         held = []   # (boxes, pose, cmd_rot_total) from unconverged stops -- see _map_held_sightings()
-        for k in range(n_steps):
+        k = -1
+        while turned < 2 * math.pi - 1e-6 and k < 3 * n_steps:
+            k += 1
             dwell = []
             n_ar_last = 0
             self._suppress_mapping = True
@@ -1813,7 +1823,8 @@ class Navigator:
             s = self.ekf.robot.state
             print("  scan {:2d}/{}: hdg {:+6.1f}deg, {} marker(s), fruits {} -> {}".format(
                 k + 1, n_steps, math.degrees(_normalize_angle(float(s[2, 0]))), n_ar_last, labels or "-", status))
-            self.turn(step, noise_frac=self.scan_turn_noise_frac)
+            turned += abs(self.turn(step, noise_frac=self.scan_turn_noise_frac))
+        print("  scan: {} stops, {:.0f} deg turned".format(k + 1, math.degrees(turned)))
         if skipped_stops:
             print("  scan: {} stop(s) mapped, {} held because the pose had not converged there".format(
                 mapped_stops, skipped_stops))
