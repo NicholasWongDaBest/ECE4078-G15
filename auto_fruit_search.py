@@ -205,7 +205,7 @@ class FruitMapper:
 
     def __init__(self, camera_matrix, object_dimensions, expected_labels=(),
                  min_views=3, min_spread_deg=30.0, arena_half=None, max_pullback=0.35,
-                 min_sightings=4, target_min_sightings=6, min_sd=0.035):
+                 min_sightings=3, target_min_sightings=5, min_sd=0.035):
         # min_sd: the fruit filter's covariance floor (FruitEKF min_var, as a
         # std dev). No fruit's sd goes below it, so every new sighting keeps a
         # gain of at least P/(P+R) on the estimate: a floor of 3.5 cm (up from
