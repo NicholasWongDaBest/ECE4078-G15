@@ -4144,6 +4144,7 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
         fixed = kept
 
         focus = None   # the one fruit this viewpoint is for; None -> full 360 scan
+        scan_for = None   # a fixed viewpoint chosen only to FIND these search-list fruits
         tight_route = False   # this viewpoint is only reachable with the tighter margins
         if visited == 0:
             vp, why = (fixed.pop(0) if fixed else tuple(pose[:2])), "centre scan"
@@ -4164,6 +4165,7 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                 fixed.sort(key=lambda v: path_planner.dist_between(v, pose[:2]))
                 vp, why, focus = fixed.pop(0), "fixed viewpoint ({} not seen yet -- finding it comes first)".format(
                     ", ".join(unseen)), None
+                scan_for = list(unseen)
             else:
                 vp, why, focus = _next_viewpoint(mapper, search_list, pose, obstacles, view_ring, bounds=bounds,
                                                  markers=markers_xy, look_half=look_half, half_fov=half_fov,
@@ -4218,6 +4220,7 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                 else:
                     fixed.sort(key=lambda v: path_planner.dist_between(v, pose[:2]))
                     vp, why = fixed.pop(0), "fixed viewpoint ({} not seen yet)".format(", ".join(unseen))
+                    scan_for = list(unseen)
             elif vp in fixed:
                 fixed.remove(vp)
 
@@ -4232,6 +4235,13 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
             budget = [int(looks_on_the_way)]
             way = (lambda p, _f=focus, _v=vp: look_on_the_way(p, _f, _v, budget)) if looks_on_the_way else None
             face_goal = (mapper.positions().get(focus) or nav.rough_position(focus)) if focus is not None else None
+
+            def found_on_the_way(_labels=scan_for):
+                """This viewpoint is only for finding _labels: once every one
+                of them is on the map (seen on the way here), stop driving."""
+                if _labels and all(l in mapper.positions() for l in _labels):
+                    return "{} found on the way -- this viewpoint's 360 is not needed".format(", ".join(_labels))
+                return None
             with nav.mapping_policy('new'):
                 # A route only the tighter margins allow squeezes past things:
                 # short legs, no open ones, so a drive that runs long or
@@ -4243,7 +4253,8 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                                        clearance_pref=clearance_pref,
                                        label="explore", bounds=bounds,
                                        open_leg_length=(0.0 if tight_route else open_leg_length),
-                                       after_leg=way, markers=markers_xy, face_at_goal=face_goal, **level1_kwargs)
+                                       after_leg=way, markers=markers_xy, face_at_goal=face_goal,
+                                       stop_when=found_on_the_way, **level1_kwargs)
             if failure is not None and failure.endswith("found no route") and not tight_route:
                 # Boxed in by the exploring margins (a corner pocket the robot
                 # drove into before the fruit beside it was mapped with its
@@ -4256,7 +4267,7 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                                            clearance_pref=clearance_pref,
                                            label="explore", bounds=bounds, open_leg_length=0.0,
                                            after_leg=way, markers=markers_xy, face_at_goal=face_goal,
-                                           **level1_kwargs)
+                                           stop_when=found_on_the_way, **level1_kwargs)
             if failure is not None:
                 print(f"[explore] could not reach viewpoint ({failure}) -- looking from here instead")
                 if focus is not None:
@@ -4309,7 +4320,13 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                 if viewpoint_looks:
                     pose, seen_more = looks_from_viewpoint(pose, {focus})
                     seen = set(seen) | seen_more
-        if focus is None:
+        if focus is None and scan_for and all(l in mapper.positions() for l in scan_for):
+            # The fruit(s) this 360 was for turned up on the way: no scan.
+            # The next viewpoint is chosen for them like any other fruit.
+            print("[explore] {} already on the map -- skipping the 360 here".format(", ".join(scan_for)))
+            seen = set()
+            pose = nav.check_pose()
+        elif focus is None:
             seen = nav.scan_around(step=scan_step)
             pose = nav.settle_pose()
         print("[explore] after viewpoint {}: saw {}; map so far:\n{}".format(
@@ -4918,7 +4935,7 @@ def _fixed_views_for(fixed, labels, mapper, pose, detect_range=1.3, min_new=np.d
 
 def _go_to(nav, goal, obstacles, grid, planner='astar', max_leg_length=0.25, clearance_pref=0.15,
            goal_tolerance=0.15, max_legs=12, stall_legs=4, label="", bounds=None, open_leg_length=0.60,
-           after_leg=None, markers=None, face_at_goal=None, **_ignored):
+           after_leg=None, markers=None, face_at_goal=None, stop_when=None, **_ignored):
     """
     Drive to a plain (x, y) point with the same leg-by-leg re-plan +
     relocalise loop run_level1() uses, minus the fruit-specific parts. The
@@ -4950,6 +4967,11 @@ def _go_to(nav, goal, obstacles, grid, planner='astar', max_leg_length=0.25, cle
     obstacles_src = obstacles if callable(obstacles) else None
     n_known = None
     for leg in range(1, max_legs + 1):
+        if stop_when is not None and leg > 1:
+            why = stop_when()
+            if why:
+                print(f"[{label}] {why} -- not driving on to [{goal[0]:.2f}, {goal[1]:.2f}]")
+                return pose, None
         if obstacles_src is not None:
             obstacles, grid = obstacles_src()
             if n_known is not None and len(obstacles) != n_known:
