@@ -35,6 +35,24 @@ left_pwm, right_pwm = 0, 0
 left_count, right_count = 0, 0
 prev_left_state, prev_right_state = None, None
 MIN_PWM_THRESHOLD = 20
+
+# Encoder noise filter. Electrical noise from the motors (worse at a higher
+# motor voltage) shows up on the encoder lines as bursts of extra edges. Each
+# one counts as a tick, so a mode-2 move reaches its tick target early and
+# stops short -- while the laptop is told the full move happened, which is how
+# the robot loses its position. An edge only counts if
+#   1. the pin reads the new level ENCODER_STABLE_READS times in a row (a
+#      noise spike is microseconds long and gone by the second read; a real
+#      slot edge stays), and
+#   2. it comes at least MIN_EDGE_INTERVAL after the last counted edge on that
+#      wheel. One tick is ~5 mm of wheel travel, so even 1 m/s is ~5 ms
+#      between edges; 2 ms leaves plenty of margin.
+# A rejected edge does not change the remembered level, so the next real edge
+# is still counted. --min-edge-ms 0 --stable-reads 1 turns the filter off.
+MIN_EDGE_INTERVAL = 0.002     # s
+ENCODER_STABLE_READS = 3
+left_last_edge, right_last_edge = 0.0, 0.0
+left_rejected, right_rejected = 0, 0
 current_movement, prev_movement = 'stop', 'stop'
 motion_wake_event = threading.Event()  # wakes pid_control() when a new drive command arrives
 
@@ -79,28 +97,48 @@ def setup_gpio():
     right_motor_pwm.start(0)
 
 
-def left_encoder_callback(channel):
-    global left_count, prev_left_state
-    current_state = GPIO.input(LEFT_ENCODER)
+def _stable_level(pin, level):
+    """True if `pin` still reads `level` on ENCODER_STABLE_READS - 1 more reads."""
+    for _ in range(ENCODER_STABLE_READS - 1):
+        if GPIO.input(pin) != level:
+            return False
+    return True
 
-    # Check for actual state change. Without this, false positive happens due to electrical noise
-    # After testing, debouncing not needed
-    if prev_left_state is not None and current_state != prev_left_state:
-        left_count += 1
-        prev_left_state = current_state
-    elif prev_left_state is None:
+
+def left_encoder_callback(channel):
+    global left_count, prev_left_state, left_last_edge, left_rejected
+    now = monotonic()
+    current_state = GPIO.input(LEFT_ENCODER)
+    if prev_left_state is None:
         prev_left_state = current_state  # First reading
+        left_last_edge = now
+        return
+    if current_state == prev_left_state:
+        return   # no real change (the level is what it was): electrical noise
+    if not _stable_level(LEFT_ENCODER, current_state) or now - left_last_edge < MIN_EDGE_INTERVAL:
+        left_rejected += 1   # a spike, or faster than the wheel can turn: not a tick
+        return
+    left_count += 1
+    prev_left_state = current_state
+    left_last_edge = now
 
 
 def right_encoder_callback(channel):
-    global right_count, prev_right_state
+    global right_count, prev_right_state, right_last_edge, right_rejected
+    now = monotonic()
     current_state = GPIO.input(RIGHT_ENCODER)
-
-    if prev_right_state is not None and current_state != prev_right_state:
-        right_count += 1
+    if prev_right_state is None:
         prev_right_state = current_state
-    elif prev_right_state is None:
-        prev_right_state = current_state
+        right_last_edge = now
+        return
+    if current_state == prev_right_state:
+        return
+    if not _stable_level(RIGHT_ENCODER, current_state) or now - right_last_edge < MIN_EDGE_INTERVAL:
+        right_rejected += 1
+        return
+    right_count += 1
+    prev_right_state = current_state
+    right_last_edge = now
 
 
 def read_counts():
@@ -441,6 +479,7 @@ def wheel_server():
                               f"L/R enc: {target_left_enc}, {target_right_enc}")
                         # Count this move from the totals right now (they are never reset).
                         start_left, start_right = read_counts()
+                        rej_left0, rej_right0 = left_rejected, right_rejected
                         with motor_pwm_lock:
                             left_pwm, right_pwm = left_speed * 100, right_speed * 100
                         motion_wake_event.set()
@@ -456,8 +495,10 @@ def wheel_server():
                             if done_left >= target_left_enc and done_right >= target_right_enc:
                                 with motor_pwm_lock:
                                     left_pwm, right_pwm = 0, 0
+                                rej = (left_rejected - rej_left0, right_rejected - rej_right0)
                                 print(f"Encoder-based movement completed at L/R enc: {done_left}, {done_right} "
-                                      f"(target {target_left_enc}, {target_right_enc})")
+                                      f"(target {target_left_enc}, {target_right_enc})"
+                                      + (f"; filtered out {rej[0]} / {rej[1]} noise edge(s)" if any(rej) else ""))
                                 break
                             elif elapsed_time >= 8:  # safety timeout
                                 with motor_pwm_lock:
@@ -515,5 +556,14 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--min-edge-ms', type=float, default=MIN_EDGE_INTERVAL * 1000,
+                        help='ignore an encoder edge closer than this to the last counted one on that wheel, ms '
+                             '(0 = off)')
+    parser.add_argument('--stable-reads', type=int, default=ENCODER_STABLE_READS,
+                        help='times the encoder pin must read the new level before an edge counts (1 = off)')
     args = parser.parse_args()
+    MIN_EDGE_INTERVAL = max(0.0, args.min_edge_ms) / 1000.0
+    ENCODER_STABLE_READS = max(1, args.stable_reads)
+    print(f"Encoder filter: edges at least {MIN_EDGE_INTERVAL * 1000:.1f} ms apart, "
+          f"{ENCODER_STABLE_READS} stable read(s)")
     main()

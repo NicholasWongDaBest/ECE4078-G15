@@ -685,7 +685,7 @@ class Navigator:
 
     def __init__(self, botconnect, ekf, aruco_sensor, baseline,
                  drive_speed=0.4, turn_speed=0.35, move_timeout=15.0,
-                 settle_time=0.4, turn_noise_frac=0.10, drive_noise_frac=0.05,
+                 settle_time=0.2, turn_noise_frac=0.10, drive_noise_frac=0.05,
                  marker_noise=(0.03, 0.03), turn_scale=1.0, turn_scale_fast=None):
         self.botconnect = botconnect
         self.ekf = ekf
