@@ -205,7 +205,7 @@ class FruitMapper:
 
     def __init__(self, camera_matrix, object_dimensions, expected_labels=(),
                  min_views=3, min_spread_deg=30.0, arena_half=None, max_pullback=0.35,
-                 min_sightings=3, target_min_sightings=5, min_sd=0.035):
+                 min_sightings=4, target_min_sightings=5, min_sd=0.035):
         # min_sd: the fruit filter's covariance floor (FruitEKF min_var, as a
         # std dev). No fruit's sd goes below it, so every new sighting keeps a
         # gain of at least P/(P+R) on the estimate: a floor of 3.5 cm (up from
@@ -3870,7 +3870,7 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                hard_max_viewpoints=None, explore_fruit_margin=0.12, optimise_order=True,
                looks_on_the_way=2, look_max_range=1.0, look_min_range=0.40, look_min_new=np.deg2rad(30.0),
                tight_leg_length=0.25, viewpoint_looks=3, viewpoint_look_range=(0.30, 1.1), viewpoint_others_bonus=1.0,
-               **level1_kwargs):
+               park_early_range=1.0, **level1_kwargs):
     """
     M3 Level 3: only the ArUco markers are given. Map the fruits first, then
     park at the search_list ones in order.
@@ -3950,6 +3950,15 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
     extra pan costs seconds; each viewpoint it saves costs a drive and its
     re-localisations. viewpoint_looks=0 and viewpoint_others_bonus=0 give
     the old one-fruit-per-viewpoint behaviour.
+
+    Parking early: after each viewpoint, any search-list fruit that is
+    already pinned down (FruitMapper.target_ready: views, spread, sightings,
+    a close look) and within park_early_range of the robot is parked at
+    right then -- the same run_level1 sequence as phase 2, with the same
+    close look on the way in (forced, even though the fruit is ready) --
+    and exploration then carries on for the rest. Phase 2 only visits the
+    fruits not parked at yet; once every search-list fruit is parked,
+    exploration stops. park_early_range=0 turns it off.
     """
     display = nav.display
     getattr(display, 'start_timer', lambda: None)()   # no-op if ENTER in setup already started it
@@ -4118,6 +4127,88 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
 
     n_way_looks, n_way_mapped = [0], [0]
     n_vp_looks, n_vp_mapped = [0], [0]
+    parked = []   # search-list fruits already parked at (during exploration or phase 2)
+
+    def park_now(name):
+        """
+        Park at `name` now, in the middle of exploration: run_level1 on this
+        one fruit against the map as it stands, with a forced close look on
+        the way in (close_check) exactly like phase 2's refine_weak, and the
+        demonstrator's ENTER at the end. Frames taken on the way may only add
+        fruits not on the map yet (plus the usual certain-pose updates); the
+        target itself only moves with the close look. Backing up is off while
+        any fruit is still unmapped: the camera cannot see behind the robot.
+        @return: True if it got to the 'Found' step
+        """
+        positions_now = mapper.positions()
+        radii = {n: object_radii_csv.get(n, 0.08) + mapper.zone_extra(n) for n in positions_now}
+        unc = {n: mapper.position_uncertainty(n) for n in positions_now}
+
+        def close_check(n, target):
+            print(f"\n[{n}] close look before parking (as in phase 2)")
+            display.notify(f"Close look at {n}")
+            nav.check_pose()
+            result = nav.pan_at_fruit(n, mapper.positions().get(n, target),
+                                      half=(2 * nav.refine_pan_half if mapper.is_provisional(n) else None))
+            nav.check_pose()
+            new = mapper.positions().get(n)
+            if new is not None:
+                radii[n] = object_radii_csv.get(n, 0.08) + mapper.zone_extra(n)
+                unc[n] = mapper.position_uncertainty(n)
+            print(f"[{n}] close look: {result['mapped_stops']} stop(s) mapped")
+            return new
+        close_check.needed = lambda n: True
+
+        done = {}
+        orig_done = display.target_done
+
+        def target_done(n, dist, ok):
+            done[n] = dist
+            return orig_done(n, dist, ok)
+
+        names = list(positions_now)
+        all_mapped = len([l for l in names if not mapper.is_provisional(l)]) >= len(object_radii_csv)
+        was_reverse = nav.allow_reverse
+        nav.allow_reverse = was_reverse and all_mapped
+        display.target_done = target_done
+        print(f"\n=== {name} is pinned down and {path_planner.dist_between(nav.get_robot_pose()[:2], positions_now[name]):.2f} m "
+              f"away -- parking at it now, then back to exploring ===")
+        display.notify(f"Parking at {name} now")
+        try:
+            with nav.mapping_policy('new'):
+                run_level1(nav, [name], names, np.array([positions_now[n] for n in names]), aruco_true_pos,
+                           planner=planner, grid_resolution=grid_resolution, max_leg_length=max_leg_length,
+                           safety_margin=safety_margin, clearance_pref=clearance_pref, fruit_margin=fruit_margin,
+                           live_positions=None, object_radii=radii, bounds=bounds, open_leg_length=open_leg_length,
+                           refine_weak=close_check, object_uncertainty=unc, **level1_kwargs)
+        finally:
+            display.target_done = orig_done
+            nav.allow_reverse = was_reverse
+        ok = done.get(name) is not None
+        if ok:
+            parked.append(name)
+        else:
+            print(f"[{name}] could not park at it now -- it stays on the list for phase 2")
+        return ok
+
+    def park_ready_nearby():
+        """Park at every pinned-down, not-yet-parked search-list fruit within
+        park_early_range, nearest first."""
+        if park_early_range <= 0:
+            return
+        tried_now = set()
+        while True:
+            here = nav.get_robot_pose()
+            est = mapper.positions()
+            ready = [(path_planner.dist_between(here[:2], est[l]), l) for l in search_list
+                     if l in est and l not in parked and l not in tried_now and not mapper.is_provisional(l)
+                     and mapper.target_ready(l)]
+            ready = [(d, l) for d, l in ready if d <= park_early_range]
+            if not ready:
+                return
+            _, l = min(ready)
+            tried_now.add(l)
+            park_now(l)
     ready_noted = [False]
     visited = 0
     while visited < max_viewpoints or (not_ok() and visited < hard_cap):
@@ -4149,6 +4240,9 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
         if visited == 0:
             vp, why = (fixed.pop(0) if fixed else tuple(pose[:2])), "centre scan"
         else:
+            if search_list and all(l in parked for l in search_list):
+                print("[explore] every search-list fruit has been parked at -- stopping exploration")
+                break
             if mapper.all_targets_ready() and not not_ok():
                 print("[explore] every search-list fruit is pinned down (wide spread of views and a close one) "
                       "-- stopping exploration")
@@ -4331,6 +4425,8 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
             pose = nav.settle_pose()
         print("[explore] after viewpoint {}: saw {}; map so far:\n{}".format(
             visited, sorted(seen) or "nothing", mapper.report()))
+        park_ready_nearby()
+        pose = nav.get_robot_pose()
 
     if n_way_looks[0]:
         print(f"[explore] {n_way_looks[0]} look(s) on the way from relocalised stops, {n_way_mapped[0]} of them mapped "
@@ -4399,7 +4495,10 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
     print("\n=== Level 3, phase 2: parking at the search-list fruits ===")
     display.notify("Level 3: parking sequence")
     names = list(positions)
-    visit = [t for t in search_list if t in positions]
+    visit = [t for t in search_list if t in positions and t not in parked]
+    if parked:
+        print("[order] already parked at {} during exploration -- {}".format(
+            ", ".join(parked), "visiting " + ", ".join(visit) if visit else "nothing left to visit"))
     if optimise_order and len(visit) > 1:
         # Level 3 may visit the fruits in any order (manual 4.4.4): the
         # shortest route from where exploration ended, not the list order.
@@ -5151,6 +5250,9 @@ if __name__ == "__main__":
     parser.add_argument("--looks-on-the-way", type=int, default=2,
                          help="Level 3: fruit looks allowed per viewpoint drive from the relocalised stops on the "
                               "way (a fruit still needing work, in range and at a new bearing); 0 turns it off")
+    parser.add_argument("--park-early-range", type=float, default=1.0,
+                         help="Level 3: park at a pinned-down search-list fruit during exploration when it is "
+                              "within this many m of the robot (then carry on exploring); 0 = only in phase 2")
     parser.add_argument("--viewpoint-looks", type=int, default=3,
                          help="Level 3: extra pans from each viewpoint at OTHER fruits that still need work and that "
                               "it sees from a new bearing; 0 = one fruit per viewpoint (the old behaviour)")
@@ -5329,7 +5431,7 @@ if __name__ == "__main__":
                        open_leg_length=args.open_leg, max_viewpoints=args.max_viewpoints,
                        hard_max_viewpoints=args.hard_max_viewpoints, explore_fruit_margin=args.explore_fruit_margin,
                        optimise_order=not args.keep_order, looks_on_the_way=max(0, args.looks_on_the_way),
-                       viewpoint_looks=max(0, args.viewpoint_looks))
+                       viewpoint_looks=max(0, args.viewpoint_looks), park_early_range=max(0.0, args.park_early_range))
             print("Level 3 run finished.")
             if display is not None:
                 display.finish("Run finished. ESC to exit")
