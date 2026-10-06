@@ -941,6 +941,8 @@ class M3Display(_RunClock):
 
         # markers: the physical 6 cm block, ringed green when the camera can see it
         for i, (mx, my) in enumerate(self.aruco_true_pos):
+            if not (np.isfinite(mx) and np.isfinite(my)):
+                continue   # not mapped yet (final_demo_l3.py builds the map live)
             centre = self._px(mx, my)
             half = max(3, int(0.03 * s))
             cv2.rectangle(img, (centre[0] - half, centre[1] - half), (centre[0] + half, centre[1] + half), (20, 20, 20), -1)
@@ -1010,6 +1012,8 @@ class M3Display(_RunClock):
 
         # marker id icons and the robot sprite, same artwork as operate.py
         for i, (mx, my) in enumerate(self.aruco_true_pos):
+            if not (np.isfinite(mx) and np.isfinite(my)):
+                continue 
             u, v = self._px(mx, my)
             pics = self.ekf.lm_pics
             pic = pics[i] if i < len(pics) - 1 else pics[-1]
