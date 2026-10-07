@@ -4,8 +4,11 @@
 # not even the markers. The run is:
 #   phase 0  map_markers(): full SLAM (markers added and refined live) from a
 #            360 deg sweep at the start pose, plus extra viewpoints while too
-#            few markers are confidently placed. Then lock_marker_map() freezes
-#            them, exactly as load_true_map() froze the true map in M3.
+#            few markers are confidently placed. The fruits seen on the way go
+#            straight into the real fruit map (phase 1 skips its centre 360).
+#            Then lock_marker_map() freezes the markers, exactly as
+#            load_true_map() froze the true map in M3, and a first re-fit
+#            removes the sweep's turn drift before exploration starts.
 #   phase 1+ the M3 Level 3 run (fruit exploration, then parking) on top of
 #            the locked markers. A marker first seen after the lock is added
 #            (and locked) once it has been seen consistently -- see
@@ -294,6 +297,46 @@ def solve_pose_graph(poses0, edges, readings, sd_depth=(0.03, 0.02), sd_side=(0.
     return {t: (float(Mk[ti[t], 0]), float(Mk[ti[t], 1])) for t in tags}, P, info
 
 
+def refit_fruit_positions(poses, fruit_reads, min_reads=3, sd_bearing=np.deg2rad(2.0), sd_range=(0.05, 0.15)):
+    """
+    Each fruit's position re-solved from all its stored sightings through
+    re-fitted poses: the bearing (box centre -- accurate) weighted hard, the
+    range (box height -- 20% off at 1.6 m) weakly, robust loss. Offline on
+    four runs (sightings attached to their nearest marker node), mean fruit
+    error vs as submitted: 5.8 -> 4.2 cm (20261007-134902), 4.2 -> 4.1
+    (143413), 5.4 -> 3.1 (170534), 6.4 -> 5.0 (174140). Fruits with fewer
+    than min_reads sightings are left out (the caller keeps the moved estimate).
+    poses: (N, 3); fruit_reads: [(node, label, ahead, left)]
+    @return: {label: (x, y)}
+    """
+    from scipy.optimize import least_squares
+    poses = np.asarray(poses, dtype=float)
+    by_label = {}
+    for k, label, a, b in fruit_reads:
+        if k < len(poses):
+            by_label.setdefault(label, []).append((k, a, b))
+    out = {}
+    for label, rd in by_label.items():
+        if len(rd) < min_reads:
+            continue
+        P = poses[[k for k, _, _ in rd]]
+        A = np.array([[a, b] for _, a, b in rd])
+        rng = np.hypot(A[:, 0], A[:, 1])
+        brg = np.arctan2(A[:, 1], A[:, 0])
+        sdr = sd_range[0] + sd_range[1] * rng
+        c, s_ = np.cos(P[:, 2]), np.sin(P[:, 2])
+        x0 = np.mean(np.stack([P[:, 0] + c * A[:, 0] - s_ * A[:, 1], P[:, 1] + s_ * A[:, 0] + c * A[:, 1]], 1), 0)
+
+        def fun(q):
+            dx, dy = q[0] - P[:, 0], q[1] - P[:, 1]
+            a, b = c * dx + s_ * dy, -s_ * dx + c * dy
+            return np.concatenate([((np.arctan2(b, a) - brg + np.pi) % (2 * np.pi) - np.pi) / sd_bearing,
+                                   (np.hypot(a, b) - rng) / sdr])
+        res = least_squares(fun, x0, loss='soft_l1', f_scale=2.0)
+        out[label] = (float(res.x[0]), float(res.x[1]))
+    return out
+
+
 def _attach(point_xy, node_old, node_new):
     """Where a point rigidly attached to a node goes when the node moves from
     node_old to node_new ([x, y, theta] each)."""
@@ -339,6 +382,7 @@ def track_fruit_nodes(nav, mapper):
         n = orig(boxes, pose, only=only, note_others=note_others)
         if n:
             nav.note_fruit_nodes({label for label, _ in boxes})
+            nav.record_fruit_sightings(boxes, pose)
         return n
     mapper.observe = observe
 
@@ -1361,6 +1405,7 @@ class Navigator:
         self.late_marker_sightings = 3
         self.late_marker_spread = 0.10
         self._late_sightings = {}   # tag -> [(x, y)] in the world frame
+        self._late_tags = set()      # markers added after the lock (left out of the re-fit's safety gate)
         self.locked_marker_sd = {}   # tag -> sd (m) when lock_marker_map() froze it (display + log)
         self.log = None              # RunLog, set by main
         # In-run re-fit (refit_markers()): every frame with marker readings
@@ -1374,11 +1419,16 @@ class Navigator:
         self.refit_max_frame_turn = np.deg2rad(20.0)
         self.refit_max_marker_move = 0.30
         self.refit_max_pose_move = (0.40, np.deg2rad(20.0))
+        self.refit_new_marker_readings = 6   # readings a not-yet-mapped marker needs for the re-fit to add it
         self._rf_poses = []          # node -> [x, y, theta], replaced by the fitted values after a re-fit
         self._rf_edges = []          # (i, j, dx, dy, dtheta, sd_xy, sd_theta)
         self._rf_readings = []       # (node, tag, ahead, left)
         self._rf_pending = []        # commanded moves since the last node: (dtheta, distance, completed)
         self._rf_fruit_nodes = {}    # fruit label -> node indices current when it was fused
+        self._rf_fruit_reads = []    # (marker node, offset from it (dx, dy, dth), label, ahead, left)
+        self.refit_fruit_min_reads = 3      # fewer stored sightings: the fruit is moved, not re-solved
+        self.refit_fruit_gate = 0.50        # m: a sighting this far from its label's estimate is not stored
+        self.refit_fruit_max_change = 0.35  # m: a re-solved fruit further than this from the moved one is not used
         self.n_refits = 0
         self._last_boxes = []
         # For the display's detector panel: the last frame YOLO actually ran
@@ -1747,6 +1797,7 @@ class Navigator:
             lm = next(lm for lm in aruco if lm.tag in self.ekf.taglist)
             if self._heading_from_one_marker(lm):
                 self._map_fruits_from_last_frame()
+                self._note_unknown_markers(aruco)   # (this return skips the finally below)
                 return 'heading', 1, 0
         if n_ar or fruits:
             # Something is in view: let it count (see vision_prior_sd).
@@ -1833,11 +1884,62 @@ class Navigator:
         ms = [lm for lm in self.filter_markers(aruco) if int(lm.tag) <= 10]
         if not ms:
             return
-        self._rf_poses.append(self._pose_list())
-        k = len(self._rf_poses) - 1
+        k = self._new_refit_node(self._pose_list())
         for lm in ms:
             f, l = (float(v) for v in np.asarray(lm.position, dtype=float).reshape(-1)[:2])
             self._rf_readings.append((k, int(lm.tag), f, l))
+
+    def record_fruit_sightings(self, boxes, pose):
+        """The fruit mapper accepted sightings from this batch: store each box
+        as (ahead, left) from the pinhole model -- the same numbers
+        estimate_pose() uses -- on a node of its own at `pose`, for
+        refit_fruit_positions(). A box that lands more than refit_fruit_gate
+        from its label's current estimate is a likely mislabel and is not
+        stored (lemon/lime, mango/orange, capsicum/lime have all happened)."""
+        m = self.fruit_mapper
+        if m is None:
+            return
+        px, py, pth = (float(v) for v in pose[:3])
+        keep = []
+        for label, box in boxes:
+            h = float(np.asarray(box).reshape(-1)[3])
+            if label not in m.dims or h <= 0:
+                continue
+            depth = m.f * m.dims[label][2] / h
+            if depth > 2.0:
+                continue
+            left = -(float(np.asarray(box).reshape(-1)[0]) - m.cx) * depth / m.f
+            est = m.fruit_ekf.estimates.get(label)
+            if est is not None:
+                wx = px + depth * math.cos(pth) - left * math.sin(pth)
+                wy = py + depth * math.sin(pth) + left * math.cos(pth)
+                if math.hypot(wx - est[0, 0], wy - est[1, 0]) > self.refit_fruit_gate:
+                    continue
+            keep.append((label, depth, left))
+        if not keep or not self._rf_poses:
+            return
+        # Attach the sightings to the nearest recent MARKER node, through the
+        # pose offset the filter itself had between them -- not to a node of
+        # their own linked by commanded moves: the mapper often hands over a
+        # pan's sightings after the pan has finished, so the moves since the
+        # last node include the rest of the pan, and the re-fit then pointed
+        # the camera up to 20 deg off (run 20261007-174140: capsicum re-solved
+        # 29 cm off; attached, 5.9 cm). The sighting moves rigidly with that node.
+        lo = max(0, len(self._rf_poses) - 40)
+        k = min(range(lo, len(self._rf_poses)),
+                key=lambda i: math.hypot(self._rf_poses[i][0] - px, self._rf_poses[i][1] - py)
+                + 0.3 * abs(_normalize_angle(self._rf_poses[i][2] - pth)))
+        bx, by, bth = self._rf_poses[k]
+        c, s_ = math.cos(bth), math.sin(bth)
+        rel = (c * (px - bx) + s_ * (py - by), -s_ * (px - bx) + c * (py - by), _normalize_angle(pth - bth))
+        for label, depth, left in keep:
+            self._rf_fruit_reads.append((k, rel, label, depth, left))
+
+    def _new_refit_node(self, pose):
+        """Append a node at `pose`, with an edge from the previous node made of
+        the moves commanded in between. @return: its index"""
+        self._rf_poses.append(list(pose))
+        k = len(self._rf_poses) - 1
         if k > 0:
             x = y = th = rot = dist = 0.0
             extra_xy = extra_th = 0.0
@@ -1854,6 +1956,7 @@ class Navigator:
             self._rf_edges.append((k - 1, k, x, y, th, 0.02 + 0.10 * dist + extra_xy,
                                    np.deg2rad(1.5) + 0.06 * rot + 0.05 * dist + extra_th))
         self._rf_pending = []
+        return k
 
     def note_fruit_nodes(self, labels):
         """The fruit mapper fused sightings of `labels` from the latest node."""
@@ -1900,18 +2003,23 @@ class Navigator:
         # robot's own correction is judged the same way: beyond the frame change.
         reason = None
         shape, frame_turn, robot_local = {}, 0.0, (0.0, 0.0)
-        if len(common) >= 3:
-            A = np.array([old_m[t_] for t_ in common]).T
-            B = np.array([new_m[t_] for t_ in common]).T
+        # Markers added after the lock (late markers) are rough by nature --
+        # one far live sighting can be 20+ cm off -- so they are left out of
+        # the gate (or one of them would block every re-fit for the rest of
+        # the run) and simply take the re-fitted position.
+        gate = [t_ for t_ in common if t_ not in self._late_tags]
+        if len(gate) >= 3:
+            A = np.array([old_m[t_] for t_ in gate]).T
+            B = np.array([new_m[t_] for t_ in gate]).T
             Rm, tm, frame_turn = _fit_rigid_2d(A, B)
             shape = {t_: float(np.hypot(*(Rm @ A[:, i:i + 1] + tm - B[:, i:i + 1]).ravel()))
-                     for i, t_ in enumerate(common)}
+                     for i, t_ in enumerate(gate)}
             q = Rm @ np.array([[cur[0]], [cur[1]]]) + tm
             robot_local = (math.hypot(nx - q[0, 0], ny - q[1, 0]),
                            abs(_normalize_angle(nth - cur[2] - frame_turn)))
         if not info['success'] and info['nfev'] < 5:
             reason = 'did not converge'
-        elif len(common) < 3:
+        elif len(gate) < 3:
             reason = 'fewer than 3 markers in common'
         elif abs(frame_turn) > self.refit_max_frame_turn:
             reason = 'the whole map would turn {:.0f} deg'.format(math.degrees(frame_turn))
@@ -1945,9 +2053,22 @@ class Navigator:
         self._last_fit_theta = None
         self._cmd_rot_since_fit = self._cmd_rot_fast_since_fit = 0.0
         self._move_fruits(old_poses, new_poses, move_point, th_g)
+        n_resolved = self._resolve_fruits(new_poses)
         self.rough_sightings = {l: [move_point(p) for p in pts] for l, pts in self.rough_sightings.items()}
         self._late_sightings = {tg: [move_point(p) for p in pts] for tg, pts in self._late_sightings.items()}
         self._rf_poses = new_poses.tolist()
+        # A marker the solver placed but the map does not have yet (seen only
+        # after the lock, and never cleanly enough for _note_unknown_markers)
+        # is added -- from enough readings in more than one frame, inside the
+        # arena. Later re-fits keep refining it like any other.
+        (bx0, bx1), (by0, by1) = path_planner.ARENA_BOUNDS
+        for tg, xy in sorted(new_m.items()):
+            if tg in self.ekf.taglist or tg not in self.valid_tags:
+                continue
+            rd = [r for r in self._rf_readings if r[1] == tg]
+            if (len(rd) >= self.refit_new_marker_readings and len({r[0] for r in rd}) >= 2
+                    and bx0 - 0.1 <= xy[0] <= bx1 + 0.1 and by0 - 0.1 <= xy[1] <= by1 + 0.1):
+                self._add_frozen_marker(tg, xy, 're-fit, {} readings'.format(len(rd)), readings=len(rd))
         self._sync_markers_live()
         self.n_refits += 1
         print("[refit] {}: {} nodes, {} readings -> map turned {:+.1f} deg; markers moved up to {:.1f} cm "
@@ -1956,9 +2077,49 @@ class Navigator:
                   100 * float(np.median(list(shape.values()))), 100 * dpos,
                   math.degrees(_normalize_angle(nth - cur[2])), dt))
         self.display.notify("Map re-fitted: markers moved up to {:.0f} cm".format(100 * max(moves.values())))
-        self._log_refit(why, True, None, dt, info=info, moves=moves, shape_moves=shape,
+        self._log_refit(why, True, None, dt, info=info, moves=moves, shape_moves=shape, fruits_resolved=n_resolved,
                         pose_move=[dpos, nth - cur[2]], robot_local=robot_local, markers=new_m, frame_turn=th_g)
         return move_point
+
+    def _resolve_fruits(self, new_poses):
+        """After _move_fruits(): replace each fruit with enough stored
+        sightings by its position re-solved through the re-fitted poses
+        (refit_fruit_positions()), unless that lands more than
+        refit_fruit_max_change from the moved estimate (then the move stands).
+        @return: how many fruits were re-solved"""
+        m = self.fruit_mapper
+        if m is None or not self._rf_fruit_reads:
+            return 0
+        # each sighting's pose: its marker node's re-fitted pose, composed with
+        # the offset recorded when it was taken
+        poses, reads = [], []
+        for i, (k, rel, label, depth, left) in enumerate(self._rf_fruit_reads):
+            bx, by, bth = new_poses[k]
+            c, s_ = math.cos(bth), math.sin(bth)
+            poses.append((bx + c * rel[0] - s_ * rel[1], by + s_ * rel[0] + c * rel[1], bth + rel[2]))
+            reads.append((i, label, depth, left))
+        try:
+            solved = refit_fruit_positions(np.array(poses), reads, min_reads=self.refit_fruit_min_reads)
+        except Exception as e:
+            print("[refit] fruit re-solve failed ({}) -- fruits moved with the map instead".format(e))
+            return 0
+        fe = m.fruit_ekf
+        used, kept = [], []
+        for label, (x, y) in sorted(solved.items()):
+            pos = fe.estimates.get(label)
+            if pos is None:
+                continue
+            d = math.hypot(x - pos[0, 0], y - pos[1, 0])
+            if d > self.refit_fruit_max_change:
+                kept.append("{} ({:.0f} cm off)".format(label, 100 * d))
+                continue
+            fe.estimates[label] = np.array([[x], [y]])
+            used.append("{} {:.0f}cm".format(label, 100 * d))
+        if used:
+            print("[refit] fruits re-solved from their sightings: " + ", ".join(used))
+        if kept:
+            print("[refit] fruits left where the map moved them (re-solve disagreed): " + ", ".join(kept))
+        return len(used)
 
     def _move_fruits(self, old_poses, new_poses, move_point, th_g):
         """Each fruit moves with the frames that fused it: the mean of where
@@ -2000,13 +2161,18 @@ class Navigator:
     def _note_unknown_markers(self, aruco):
         """After the lock: a marker phase 0 never saw cannot be fused (the map
         is frozen) and would not even be an obstacle. Record where each
-        sighting puts it -- only from a converged pose with a known marker
-        in the same frame -- and once late_marker_sightings of them agree
-        within late_marker_spread, add it to the frozen map at their median."""
+        sighting puts it -- from a converged pose -- and once
+        late_marker_sightings of them agree within late_marker_spread, add it
+        to the frozen map at their median. A known marker in the same frame
+        is NOT required: run 20261007-170534's marker 7 sat alone in a corner
+        and was seen 52 times after the lock but never added (no obstacle, and
+        10% off the marker grade); with this rule it would have been added at
+        t=127 s. Its position is then refined by every re-fit after a
+        viewpoint (refit_markers()), which also adds any marker this misses."""
         if self.slam_live or not self.ekf.freeze_map:
             return
         unknown = [lm for lm in aruco if lm.tag not in self.ekf.taglist]
-        if not unknown or self._frame_markers < 1 or not self.pose_converged():
+        if not unknown or not self.pose_converged():
             return
         s = self.ekf.robot.state
         x, y, th = float(s[0, 0]), float(s[1, 0]), float(s[2, 0])
@@ -2023,18 +2189,25 @@ class Navigator:
             med = np.median(pts, axis=0)
             if np.max(np.hypot(*(pts - med).T)) > self.late_marker_spread:
                 continue
-            self.ekf.taglist.append(int(lm.tag))
-            self.ekf.markers = np.concatenate([self.ekf.markers, med.reshape(2, 1)], axis=1)
-            n = self.ekf.P.shape[0]
-            P = np.zeros((n + 2, n + 2))
-            P[:n, :n] = self.ekf.P
-            self.ekf.P = P   # zero covariance: frozen, like every other marker
-            self._late_sightings.pop(int(lm.tag), None)
-            self._sync_markers_live()
-            print("  late marker {} added to the map at [{:+.2f}, {:+.2f}]".format(int(lm.tag), med[0], med[1]))
-            if self.log is not None:
-                self.log.event('late_marker', tag=int(lm.tag), xy=med, sightings=pts)
-            self.display.notify("Marker {} added".format(int(lm.tag)))
+            self._add_frozen_marker(int(lm.tag), med, 'sightings', sightings=pts)
+
+    def _add_frozen_marker(self, tag, xy, source, **log_extra):
+        """Append a marker to the frozen map (zero covariance, like the others)."""
+        if tag in self.ekf.taglist:
+            return
+        self.ekf.taglist.append(int(tag))
+        self._late_tags.add(int(tag))
+        self.ekf.markers = np.concatenate([self.ekf.markers, np.asarray(xy, dtype=float).reshape(2, 1)], axis=1)
+        n = self.ekf.P.shape[0]
+        P = np.zeros((n + 2, n + 2))
+        P[:n, :n] = self.ekf.P
+        self.ekf.P = P
+        self._late_sightings.pop(int(tag), None)
+        self._sync_markers_live()
+        print("  late marker {} added to the map at [{:+.2f}, {:+.2f}] (from {})".format(tag, xy[0], xy[1], source))
+        if self.log is not None:
+            self.log.event('late_marker', tag=int(tag), xy=xy, source=source, **log_extra)
+        self.display.notify("Marker {} added".format(tag))
 
     def marker_fit(self, aruco):
         """
@@ -4682,7 +4855,7 @@ def _phase0_next_viewpoint(nav, candidates, visited, marker_sd_ok, n_expected, o
     return best
 
 
-def map_markers(nav, bounds, step=np.deg2rad(20.0), frames=3, overlap=np.deg2rad(60.0), marker_sd_ok=0.05,
+def map_markers(nav, bounds, step=np.deg2rad(10.0), frames=3, overlap=np.deg2rad(60.0), marker_sd_ok=0.05,
                 n_expected=10, max_viewpoints=2, ring=0.50, safety_margin=0.10, fruit_margin=0.12,
                 object_dimensions=None):
     """
@@ -4699,9 +4872,10 @@ def map_markers(nav, bounds, step=np.deg2rad(20.0), frames=3, overlap=np.deg2rad
     ekf.redundancy_penalty = 20.0     # EKF default: repeat views from one spot must not buy confidence
     nav.slam_live = True
     nav._localised = True             # no map to fit against: the start pose IS the map frame
-    obstacle_mapper = None
-    if nav.detector is not None and object_dimensions:
-        obstacle_mapper = FruitMapper(ekf.robot.camera_matrix, object_dimensions)
+    # The fruits seen here go straight into the real fruit map (merged
+    # phases): they are obstacles for these drives, and the re-fit right
+    # after the lock re-solves them from their stored sightings.
+    obstacle_mapper = nav.fruit_mapper if nav.detector is not None else None
     start = (float(ekf.robot.state[0, 0]), float(ekf.robot.state[1, 0]))
 
     def status(where):
@@ -4869,7 +5043,7 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                hard_max_viewpoints=None, explore_fruit_margin=0.12, optimise_order=True,
                looks_on_the_way=2, look_max_range=1.0, look_min_range=0.40, look_min_new=np.deg2rad(30.0),
                tight_leg_length=0.25, viewpoint_looks=3, viewpoint_look_range=(0.30, 1.1), viewpoint_others_bonus=1.0,
-               park_early_range=1.0, **level1_kwargs):
+               park_early_range=1.0, centre_scanned=False, **level1_kwargs):
     """
     M3 Level 3: only the ArUco markers are given. Map the fruits first, then
     park at the search_list ones in order.
@@ -5214,6 +5388,13 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
             park_now(l)
     ready_noted = [False]
     visited = 0
+    if centre_scanned and fixed:
+        # Merged phases: phase 0 already swept the centre (and its extra
+        # viewpoints) with fruit mapping on -- the centre 360 is not repeated.
+        fixed.pop(0)
+        visited = 1
+        print("[explore] centre already scanned in phase 0 -- skipping viewpoint 1; map so far:\n{}".format(
+            mapper.report()))
     while visited < max_viewpoints or (not_ok() and visited < hard_cap):
         if visited >= max_viewpoints:
             print(f"[explore] past {max_viewpoints} viewpoints, but {', '.join(not_ok())} still not well mapped "
@@ -6227,8 +6408,10 @@ if __name__ == "__main__":
                          help="never re-fit the marker map after a viewpoint (default: re-fit after each one)")
     parser.add_argument("--log-dir", type=str, default='run_logs',
                          help="run logs go to <log-dir>/<date-time>/ (see RunLog, analyze_run.py)")
-    parser.add_argument("--p0-step", type=float, default=20.0,
-                         help="phase 0 (marker mapping): turn step of each 360 deg sweep, deg")
+    parser.add_argument("--p0-step", type=float, default=10.0,
+                         help="phase 0 (marker + fruit mapping): turn step of each 360 deg sweep, deg. The camera "
+                              "sees 31 deg across: at 10 deg an object stays in view for ~3 stops (at 20, ~1.6 -- "
+                              "too little overlap to carry the heading from marker to marker)")
     parser.add_argument("--p0-frames", type=int, default=3,
                          help="phase 0: SLAM frames taken at each sweep stop")
     parser.add_argument("--p0-overlap", type=float, default=60.0,
@@ -6494,6 +6677,10 @@ if __name__ == "__main__":
                     safety_margin=args.safety_margin, fruit_margin=args.explore_fruit_margin,
                     object_dimensions=object_dimensions)
         lock_marker_map(nav)
+        # First re-fit: the sweep's turn drift (8-12 deg in the logged runs)
+        # comes out before anything is planned on the map; the phase-0 fruits
+        # are re-solved with it.
+        nav.refit_markers("after phase 0")
         save_submission(nav, args.out_dir, sub_index)   # markers on disk now, in case the run dies later
 
         run_log.set_phase('level3')
@@ -6507,7 +6694,8 @@ if __name__ == "__main__":
                    open_leg_length=args.open_leg, max_viewpoints=args.max_viewpoints,
                    hard_max_viewpoints=args.hard_max_viewpoints, explore_fruit_margin=args.explore_fruit_margin,
                    optimise_order=not args.keep_order, looks_on_the_way=max(0, args.looks_on_the_way),
-                   viewpoint_looks=max(0, args.viewpoint_looks), park_early_range=max(0.0, args.park_early_range))
+                   viewpoint_looks=max(0, args.viewpoint_looks), park_early_range=max(0.0, args.park_early_range),
+                   centre_scanned=nav.fruit_mapper is not None and bool(nav.fruit_mapper.positions()))
         print("Level 3 run finished.")
         if display is not None:
             display.finish("Run finished. ESC to exit")

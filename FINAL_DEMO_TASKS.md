@@ -157,3 +157,26 @@ Status key: `[ ]` todo · `[~]` in progress · `[x]` done · `[?]` needs verific
   - Changes:
     - Run starts on ENTER.
     - Every fruit is held to the search-list bar for the object map (`FruitMapper.score_labels`, `needs_work()`). Search-list fruits keep priority. Unseen non-target fruits get a fixed-viewpoint 360.
+- 2026-10-07: Fixed late-marker registration (run_logs/20261007-170534: marker 7 was missed in phase 0 and seen 52 times after the lock, but never added):
+  - Bug fix: the single-marker heading shortcut returned before the late-marker check. Now it runs the check.
+  - Live rule no longer needs a known marker in the same frame (pose converged + 3 sightings agreeing within 10 cm + range up to 1.5 m).
+  - The re-fit now adds a marker it can place that isn't registered yet (6+ readings, 2+ frames, inside the arena).
+  - Late markers are left out of the re-fit safety gate.
+  - Replay of this log: marker 7 added at t=127 s (22 cm off), then refined by 8 accepted re-fits to 7.0 cm.
+- 2026-10-07: Fruit re-solve and phase merge:
+  - Re-fit now re-solves each fruit from its stored sightings, through the re-fitted poses (`refit_fruit_positions`):
+    - Bearing weighted hard, range weakly.
+    - Mislabel gate: a sighting more than 0.5 m from that fruit's current estimate is not stored.
+    - Fewer than 3 sightings, or a change over 35 cm: the fruit is moved with the map instead.
+    - Replay of 3 runs: fruits 5.8->3.6, 4.2->4.5, 5.4->3.0 cm.
+  - Tested fruits as pose landmarks too. No gain on any run (±0.3 cm), so not used.
+  - Phase merge:
+    - Phase-0 sweeps feed the real fruit map.
+    - A re-fit runs right after the lock (sim with turns 12% short: aligned 0.8-1.9 -> 0.4-0.5 cm, and the map's 8-9 degree drift rotation is corrected).
+    - Level 3 skips its centre 360 (~40 s).
+  - Caveat: in sim, a biased camera combined with --dist-correction made the phase-0 re-fit worse. Keep the correction off (the default) unless re-validated.
+- 2026-10-07: Phase-0 sweep step changed 20 -> 10 degrees (`--p0-step`). The camera FOV is 31 degrees, so 20-degree steps left about 1.6 stops per object.
+- 2026-10-07 (run_logs/20261007-174140, capsicum 20.7 cm off):
+  - Cause: the fruit re-solve gave each sighting its own graph node, linked by commanded moves. Pan sightings are handed over after the pan, so that link included the rest of the pan, and the camera heading came out up to 20 degrees wrong. The re-solve then moved capsicum 29 cm away from its sightings.
+  - Fix: each sighting is attached to its nearest marker node through the filter's own pose offset.
+  - Replay of 4 runs: fruit mean 4.2 / 4.1 / 3.1 / 5.0 cm (was 3.6 / 4.5 / 3.0 / 7.7). Capsicum on the latest run: 29.8 -> 5.9 cm.
