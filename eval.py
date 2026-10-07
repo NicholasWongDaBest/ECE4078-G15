@@ -1,7 +1,7 @@
 """
 Score an estimated map against the true map: SLAM RMSE (raw and after the
-best rigid alignment), the marker grade, per-object errors, and the object
-RMSE and object grade.
+best rigid alignment) and the M1 marker grade, per-object errors and the M2
+object grade.
 
 Usage:
     python eval.py                              # lab_output/slam.txt + objects.txt (as before)
@@ -15,11 +15,15 @@ alignment, with error lines; the raw estimate is shown faintly so an offset
 map is visible), saved next to the files as eval_<run>.png. --no-show only
 saves it; --no-plot only prints the numbers.
 
+Grading constants (marking guide):
+  M1 markers: rating = (Max - aligned RMSE) / (Max - Min), Min 0.02, Max 0.3,
+              Base 8, grade x markers found / 10 (compute_grade).
+  M2 objects: each object rated on its own error, (Max - err) / (Max - Min),
+              Min 0.025, Max 0.35, Base 8, averaged over every object in the
+              true map; a missing object rates 0 (compute_object_grade).
+              M2 constants are not final yet -- see --obj-*.
 The scoring maths (compute_rmse, solve_umeyama2d, apply_transform,
-eval_object's error rule, compute_grade) is unchanged from the lab version.
-The object RMSE uses the same choice as the per-object errors: the SLAM
-alignment if it gives the smaller average error, the raw positions if not;
-the object grade is compute_grade() on it with the --obj-* constants.
+eval_object's error rule) is unchanged from the lab version.
 """
 import os
 import re
@@ -149,8 +153,6 @@ def eval_object(object_est, object_gt, transform=None):
 
     # detection result
     obj_list, obj_est_vec, obj_gt_vec = match_dict_key(object_est, object_gt)
-    # raw (un-aligned) positions, used for the RMSE unless the alignment gives a smaller error
-    rmse_est_vec = obj_est_vec
     for i, obj_name in enumerate(obj_list):
         err = np.linalg.norm(obj_est_vec[:,i] - obj_gt_vec[:,i])
         errors[obj_name] = np.round(err, 5)
@@ -171,21 +173,16 @@ def eval_object(object_est, object_gt, transform=None):
             avg_error = avg_error_after
             errors = errors_after
             aligned = True
-            rmse_est_vec = object_est_vec_aligned
-
-    # RMSE across the matched objects, with the same (better) alignment as above
-    obj_rmse = compute_rmse(rmse_est_vec, obj_gt_vec) if obj_list else float('nan')
 
     print('Object pose estimation errors{}:'.format(' (after alignment)' if aligned else ''))
     print(json.dumps(errors, indent=4))
     print(f'Number of found objects: {len(obj_list)} / {len(full_obj_list)}')
     print(f'Average object pose estimation error: {np.round(avg_error, 5)}')
-    print(f"Object RMSE ({'aligned' if aligned else 'raw'}) = {np.round(obj_rmse, 5)}")
     missing = sorted(set(full_obj_list) - set(obj_list))
     if missing:
         print("Objects missing from the estimate ({}): {}".format(
             "left out of the aligned average" if aligned else "counted as {} m".format(MAX_ERROR), missing))
-    return errors, obj_rmse, len(obj_list)
+    return errors
 
 def compute_object_grade(errors, object_names, max_err, min_err, base, missing_error=1.0):
     """
@@ -302,7 +299,7 @@ def evaluate(slam_path, object_path, aruco_gt, object_gt, args, name=None, show=
     print("=" * 74)
     summary = {'run': name, 'markers': len(aruco_est), 'raw': float('nan'), 'aligned': float('nan'),
                'grade': float('nan'), 'objects': len(object_est), 'obj_mean': float('nan'),
-               'obj_rmse': float('nan'), 'obj_grade': float('nan')}
+               'obj_grade': float('nan')}
     if not has_slam and not has_obj:
         print("Nothing to evaluate.")
         return summary
@@ -320,25 +317,23 @@ def evaluate(slam_path, object_path, aruco_gt, object_gt, args, name=None, show=
             print(f'SLAM Grade: {np.round(grade, 5)}')
     if has_obj:
         print('\nEvaluating Object Detection:')
-        object_errors, obj_rmse, n_obj = eval_object(object_est, object_gt, transform=transform)
+        object_errors = eval_object(object_est, object_gt, transform=transform)
         summary['obj_mean'] = sum(object_errors.values()) / len(object_errors)
-        summary['obj_rmse'] = obj_rmse
         obj_rating, obj_grade, per_obj = compute_object_grade(object_errors, list(object_gt.keys()),
                                                               args.obj_max_err, args.obj_min_err, args.obj_base)
         summary['obj_grade'] = obj_grade
         print('\nPer-object rating (Max {} m, Min {} m): {}'.format(
             args.obj_max_err, args.obj_min_err, json.dumps({k: round(v, 4) for k, v in per_obj.items()})))
         print(f'Object Rating (average): {np.round(obj_rating, 5)}')
-        print(f'Object Grade: {np.round(obj_grade, 5)}')
+        print(f'Object Grade: {np.round(obj_grade, 5)}  (M2 constants are not final yet)')
 
     title = name
     if has_slam:
         title += "\nmarkers {}/{}  RMSE raw {:.3f} m, aligned {:.3f} m  grade {:.1f}".format(
             len(slam['tags']), len(aruco_gt), summary['raw'], summary['aligned'], summary['grade'])
     if has_obj:
-        title += "\nobjects {}/{}  mean error {:.3f} m, RMSE {:.3f} m  grade {:.1f}".format(
-            len(set(object_est) & set(object_gt)), len(object_gt), summary['obj_mean'], summary['obj_rmse'],
-            summary['obj_grade'])
+        title += "\nobjects {}/{}  mean error {:.3f} m  grade {:.1f}".format(
+            len(set(object_est) & set(object_gt)), len(object_gt), summary['obj_mean'], summary['obj_grade'])
     if args.no_plot:
         return summary
     save_path = None
@@ -373,9 +368,10 @@ if __name__ == '__main__':
     parser.add_argument('--no-show', action='store_true', help='save the plots without opening a window')
     parser.add_argument('--no-save', action='store_true', help='do not save the plots')
     parser.add_argument('--no-plot', action='store_true', help='print the numbers only: no plot window, no saved plot')
-    parser.add_argument('--max-rmse', type=float, default=0.3, help='Max RMSE for SLAM grading scale')
-    parser.add_argument('--min-rmse', type=float, default=0.0, help='Min RMSE for SLAM grading scale')
-    parser.add_argument('--base', type=float, default=10.0, help='Base for the SLAM grading curve')
+    # M1: Min 0.02, Max 0.3, Base 8.  M2: Min 0.025, Max 0.35, Base 8 (M2 not final yet).
+    parser.add_argument('--max-rmse', type=float, default=0.3, help='M1: aligned RMSE that rates 0 (m)')
+    parser.add_argument('--min-rmse', type=float, default=0.02, help='M1: aligned RMSE at or below which it rates 1 (m)')
+    parser.add_argument('--base', type=float, default=8.0, help='M1: base of the grading curve')
     parser.add_argument('--total-markers', type=int, default=10, help='Total possible markers')
     parser.add_argument('--obj-max-err', type=float, default=0.35,
                         help='object grading: per-object error that rates 0 (m)')
@@ -399,13 +395,13 @@ if __name__ == '__main__':
                                     aruco_gt, object_gt, args, name=r,
                                     show=not args.no_show and len(runs) == 1))
         if len(results) > 1:
-            print("\n%-10s %8s %9s %9s %7s %8s %9s %9s %9s" % ('run', 'markers', 'raw RMSE', 'aligned', 'grade',
-                                                               'objects', 'obj mean', 'obj RMSE', 'obj grade'))
-            print('-' * 86)
+            print("\n%-10s %8s %9s %9s %7s %8s %9s %9s" % ('run', 'markers', 'raw RMSE', 'aligned', 'grade',
+                                                          'objects', 'obj mean', 'obj grade'))
+            print('-' * 76)
             for s in results:
-                print("%-10s %8d %9.3f %9.3f %7.1f %8d %9.3f %9.3f %9.1f" % (
+                print("%-10s %8d %9.3f %9.3f %7.1f %8d %9.3f %9.1f" % (
                     s['run'], s['markers'], s['raw'], s['aligned'], s['grade'], s['objects'], s['obj_mean'],
-                    s['obj_rmse'], s['obj_grade']))
+                    s['obj_grade']))
             graded = [s for s in results if np.isfinite(s['grade'])]
             if graded:
                 best = max(graded, key=lambda s: s['grade'])

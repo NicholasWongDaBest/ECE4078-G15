@@ -2,7 +2,7 @@
 #
 # calibrate_encoder.py goes "send N ticks, tell me what happened" and FITS the
 # numbers. This script goes the other way, the way auto_fruit_search.py uses
-# them: "drive 0.5 m" / "turn 90 deg" -> the SAME tick maths and wheel speeds
+# them: "drive 50 cm" / "turn 90 deg" -> the SAME tick maths and wheel speeds
 # as Navigator.drive_forward() / Navigator.turn() -> you measure what the robot
 # actually did -> the error, and what the calibrated value should be.
 #
@@ -16,13 +16,13 @@
 # Usage:
 #   python verify_motion.py --ip <robot_ip>
 # then at the prompt:
-#   d 0.5      drive forward 0.5 m        d -0.3   backward 0.3 m
+#   d 50       drive forward 50 cm        d -30    backward 30 cm
 #   t 90       turn left 90 deg           t -45    turn right 45 deg
 #   (blank)    repeat the last command
 #   sum        summary so far: mean error, and the value that would fix it
 #   undo       drop the last saved trial
 #   q          quit (prints the summary)
-# After each move type what you measured (m or deg; + = forward / left),
+# After each move type what you measured (cm or deg; + = forward / left),
 # or press Enter to skip it.
 #
 # Measuring tips: distance -- mark the floor under one fixed point on the
@@ -108,12 +108,12 @@ def summary(trials, tpm, sep, ts, ts_fast):
         rows = [t for t in trials if t['kind'] == kind and (fast is None or t['fast'] == fast)]
         if not rows:
             continue
-        unit, conv = ("m", 1.0) if kind == 'd' else ("deg", 180 / math.pi)
+        unit, conv = ("cm", 100.0) if kind == 'd' else ("deg", 180 / math.pi)
         cur_ts = ts_fast if fast else ts
         print("\n  {}: {} trial(s)".format(title, len(rows)))
-        print("    asked     ticks   believed   measured   error")
+        print("    asked({0})  ticks   believed({0})  measured({0})   error".format(unit))
         for t in rows:
-            print("    {:+8.3f}  {:5d}   {:+8.3f}   {:+8.3f}   {:+6.1f}%".format(
+            print("    {:+8.1f}    {:5d}   {:+8.1f}       {:+8.1f}       {:+6.1f}%".format(
                 t['asked'] * conv, t['ticks'], t['believed'] * conv, t['measured'] * conv,
                 100 * (t['measured'] / t['believed'] - 1)))
         ratio = np.array([t['measured'] / t['believed'] for t in rows])
@@ -181,7 +181,7 @@ def main():
     time.sleep(1)
     if not args.no_pid:
         bot.set_pid(use_pid=1, **PID_GAINS)
-    print("\n'd 0.5' drive, 't 90' turn, blank = repeat, 'sum', 'undo', 'q'.\n")
+    print("\n'd 50' drive 50 cm, 't 90' turn 90 deg, blank = repeat, 'sum', 'undo', 'q'.\n")
 
     trials, last_cmd = [], None
     while True:
@@ -199,7 +199,7 @@ def main():
             continue
         parts = raw.split()
         if len(parts) != 2 or parts[0] not in ('d', 't'):
-            print("  'd <metres>' or 't <degrees>', or sum / undo / q")
+            print("  'd <cm>' or 't <degrees>', or sum / undo / q")
             continue
         try:
             val = float(parts[1])
@@ -211,14 +211,15 @@ def main():
 
         fast = None
         if kind == 'd':
-            # Navigator.drive_forward / drive_backward
+            # Navigator.drive_forward / drive_backward -- typed in cm, worked in metres
+            val = val / 100.0
             ticks = int(round(abs(val) * tpm))
             if ticks < 1:
                 print("  under half a tick -- the robot would not move")
                 continue
             believed = math.copysign(ticks / tpm, val)
             speeds = [DRIVE_SPEED, DRIVE_SPEED] if val > 0 else [-DRIVE_SPEED, -DRIVE_SPEED]
-            print("  {} ticks -> the EKF would be told {:+.3f} m".format(ticks, believed))
+            print("  {} ticks -> the EKF would be told {:+.1f} cm".format(ticks, 100 * believed))
             asked = val
         else:
             # Navigator.turn
@@ -246,10 +247,12 @@ def main():
             print("  timed out -- not saved")
             continue
 
-        meas = ask("  measured {} (Enter = skip): ".format("distance, m" if kind == 'd' else "angle, deg"))
+        meas = ask("  measured {} (Enter = skip): ".format("distance, cm" if kind == 'd' else "angle, deg"))
         if meas is None:
             continue
-        if kind == 't':
+        if kind == 'd':
+            meas = meas / 100.0
+        else:
             meas = math.radians(meas)
         if meas * believed < 0:
             print("  opposite sign to the command -- check the sign (+ = forward / left); not saved")
