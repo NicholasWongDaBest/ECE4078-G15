@@ -80,6 +80,30 @@ def load_true_fruits(fname):
     return fruits
 
 
+def load_true_markers(fname):
+    """{tag: (x, y)} for the ArUco markers in a truemap.txt-style file."""
+    with open(fname, 'r') as f:
+        text = f.read()
+    try:
+        gt = json.loads(text)
+    except ValueError:
+        gt = ast.literal_eval(text.strip().splitlines()[0])
+    return {int(key[len('aruco'):].split('_')[0]): (float(val['x']), float(val['y']))
+            for key, val in gt.items() if key.startswith('aruco')}
+
+
+def fit_rigid_2d(est, true):
+    """Rotation + translation (no scale, no mirror) taking `est` onto `true`,
+    both (2, N) with N >= 2 -- the same alignment eval.py scores with, in
+    closed form so two markers are enough. @return: (R 2x2, t 2x1)"""
+    mu_e = est.mean(axis=1, keepdims=True)
+    mu_t = true.mean(axis=1, keepdims=True)
+    a, b = est - mu_e, true - mu_t
+    theta = math.atan2(float(np.sum(a[0] * b[1] - a[1] * b[0])), float(np.sum(a[0] * b[0] + a[1] * b[1])))
+    R = np.array([[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]])
+    return R, mu_t - R @ mu_e
+
+
 class _RunClock:
     """Run timer shared by both displays: started once (ENTER in setup, or
     the start of the run), laps stamped and printed."""
@@ -164,6 +188,8 @@ POSE_COV = (0, 30, 56)
 GHOST = (0, 150, 150)
 SEEN = (0, 160, 0)
 ZONE = (0, 140, 0)
+MARKER_COV = (200, 50, 80)    # marker uncertainty ellipse + sd (cm)
+TRUE_MARKER = (20, 120, 200)  # T overlay: a true marker, drawn in the robot's frame
 
 TEXT = (220, 220, 220)
 GOOD = (120, 220, 120)
@@ -232,6 +258,7 @@ class M3Display(_RunClock):
         self.compare_path = compare_map
         self.compare_on = False
         self.compare_truth = {}
+        self.compare_markers = {}      # tag -> (x, y) in the TRUE map's frame
 
         self.cam_img = None
         self.visible_tags = []
@@ -343,11 +370,51 @@ class M3Display(_RunClock):
             return {l: (float(p[0, 0]), float(p[1, 0])) for l, p in mapper.fruit_ekf.estimates.items()}
         return dict(self.object_positions)
 
-    def compare_errors(self):
-        """{fruit: error_m or None if not on the robot's map} for every fruit in the true map."""
+    def _est_markers(self):
+        """{tag: (x, y)} of the robot's ArUco markers (fruit pseudo-tags left out)."""
+        return {int(t): (float(self.ekf.markers[0, i]), float(self.ekf.markers[1, i]))
+                for i, t in enumerate(self.ekf.taglist) if t < 100}
+
+    def compare_alignment(self):
+        """
+        How the true map sits in the robot's frame. The robot's map is built
+        from wherever it started, so the true map is generally rotated and
+        shifted against it; drawing truth at its raw coordinates made every
+        estimate look wrong by that offset. Fit the markers both maps share
+        (eval.py's alignment) and draw the truth through the inverse of it,
+        as operate.py does.
+        @return: dict R, t (estimate -> truth), n, tags, raw and aligned
+        marker RMSE -- or None with fewer than 2 shared markers (truth drawn raw)
+        """
+        est = self._est_markers()
+        tags = sorted(set(est) & set(self.compare_markers))
+        if len(tags) < 2:
+            return None
+        E = np.array([est[t] for t in tags], dtype=float).T
+        T = np.array([self.compare_markers[t] for t in tags], dtype=float).T
+        R, t = fit_rigid_2d(E, T)
+        rms = lambda d: float(np.sqrt(np.mean(np.sum(d ** 2, axis=0))))
+        return {'R': R, 't': t, 'n': len(tags), 'tags': tags,
+                'raw': rms(E - T), 'aligned': rms(R @ E + t - T)}
+
+    def truth_in_est_frame(self, xy, align=None):
+        """A true-map point in the robot's frame (unchanged without an alignment)."""
+        if align is None:
+            return float(xy[0]), float(xy[1])
+        p = align['R'].T @ (np.array(xy, dtype=float).reshape(2, 1) - align['t'])
+        return float(p[0, 0]), float(p[1, 0])
+
+    def compare_errors(self, align=None):
+        """{fruit: error_m or None if not on the robot's map} for every fruit in
+        the true map, after the marker alignment (what eval.py scores)."""
+        if align is None:
+            align = self.compare_alignment()
         est = self._estimates()
-        return {name: (math.hypot(est[name][0] - tx, est[name][1] - ty) if name in est else None)
-                for name, (tx, ty) in self.compare_truth.items()}
+        out = {}
+        for name, txy in self.compare_truth.items():
+            tx, ty = self.truth_in_est_frame(txy, align)
+            out[name] = math.hypot(est[name][0] - tx, est[name][1] - ty) if name in est else None
+        return out
 
     def toggle_compare(self):
         """T: show / hide the true map's fruits. Re-read on every show, so an
@@ -358,21 +425,31 @@ class M3Display(_RunClock):
             return
         try:
             truth = load_true_fruits(self.compare_path)
+            markers = load_true_markers(self.compare_path)
         except (OSError, ValueError, SyntaxError, KeyError, TypeError) as e:
             self.notification = "Could not read {} ({})".format(self.compare_path, type(e).__name__)
             print("[compare] could not read {}: {}".format(self.compare_path, e))
             return
-        if not truth:
-            self.notification = "{} has no fruits in it (markers-only map?)".format(os.path.basename(self.compare_path))
+        if not truth and not markers:
+            self.notification = "{} has no markers or fruits in it".format(os.path.basename(self.compare_path))
             return
         self.compare_truth = truth
+        self.compare_markers = markers
         self.compare_on = True
-        errors = self.compare_errors()
+        align = self.compare_alignment()
+        errors = self.compare_errors(align)
         found = [e for e in errors.values() if e is not None]
         print("\n[compare] estimate vs {} (display only):".format(self.compare_path))
+        if align is None:
+            print("  fewer than 2 shared markers: truth shown UNALIGNED")
+        else:
+            th = math.degrees(math.atan2(align['R'][1, 0], align['R'][0, 0]))
+            print("  aligned on {} markers (rotate {:+.1f} deg, shift {:+.3f}, {:+.3f} m): marker RMSE raw "
+                  "{:.3f} m, aligned {:.3f} m".format(align['n'], th, align['t'][0, 0], align['t'][1, 0],
+                                                      align['raw'], align['aligned']))
         est = self._estimates()
         for name in sorted(truth, key=lambda n: (n not in self.search_list, n)):
-            tx, ty = truth[name]
+            tx, ty = self.truth_in_est_frame(truth[name], align)
             e = errors[name]
             tag = "target" if name in self.search_list else "      "
             if e is None:
@@ -381,7 +458,7 @@ class M3Display(_RunClock):
                 print("  {:10s} {}  true [{:+.2f}, {:+.2f}]  est [{:+.2f}, {:+.2f}]  error {:5.1f} cm".format(
                     name, tag, tx, ty, est[name][0], est[name][1], e * 100))
         if found:
-            print("  mean {:.1f} cm, worst {:.1f} cm over {} fruit(s)".format(
+            print("  fruits: mean {:.1f} cm, worst {:.1f} cm over {} fruit(s)".format(
                 100 * sum(found) / len(found), 100 * max(found), len(found)))
             self.notification = "True map: mean error {:.1f} cm, worst {:.1f} cm ({} fruits)".format(
                 100 * sum(found) / len(found), 100 * max(found), len(found))
@@ -821,6 +898,40 @@ class M3Display(_RunClock):
         for k, (text, colour) in enumerate(lines[:10]):
             self.canvas.blit(self.panel_font.render(text, False, colour), (x + 10, y + 8 + 23 * k))
 
+    def _marker_layout(self):
+        """Marker positions indexed by tag - 1: live from the navigator when it
+        builds the map itself (final_demo_l3.py), else the map file's."""
+        live = getattr(self.nav, 'markers_by_id', None)
+        return live() if callable(live) else self.aruco_true_pos
+
+    def _draw_marker_uncertainty(self, img):
+        """Each marker's ellipse from the EKF while it is still being estimated
+        (operate.py's convention), with its sd in cm. A frozen marker has zero
+        covariance; if the navigator recorded the sd it was locked at
+        (locked_marker_sd), a thin grey 2-sd circle shows that instead."""
+        s = self.scale
+        locked_sd = getattr(self.nav, 'locked_marker_sd', None) or {}
+        P = self.ekf.P
+        for i, tag in enumerate(self.ekf.taglist):
+            if tag >= 100:
+                continue
+            mx, my = float(self.ekf.markers[0, i]), float(self.ekf.markers[1, i])
+            centre = self._px(mx, my)
+            j = 3 + 2 * i
+            blk = P[j:j + 2, j:j + 2] if P.shape[0] >= j + 2 else np.zeros((2, 2))
+            if np.any(blk):
+                axes_len, angle = self.ekf.make_ellipse(blk)
+                axes = (max(2, int(axes_len[0] * s)), max(2, int(axes_len[1] * s)))
+                cv2.ellipse(img, centre, axes, angle, 0, 360, MARKER_COV, 1, cv2.LINE_AA)
+                sd = math.sqrt(max(float(np.max(np.linalg.eigvalsh(0.5 * (blk + blk.T)))), 0.0))
+            elif tag in locked_sd:
+                sd = locked_sd[tag]
+                cv2.circle(img, centre, max(2, int(2 * sd * s)), (150, 150, 150), 1, cv2.LINE_AA)
+            else:
+                continue
+            cv2.putText(img, "{:.0f}".format(sd * 100), (centre[0] - 18, centre[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, MARKER_COV, 1, cv2.LINE_AA)
+
     def _px(self, x, y):
         """World metres -> map-panel pixels (+x right, +y up, origin at the centre)."""
         return (int(round(self.MAP_RES / 2 + x * self.scale)),
@@ -914,9 +1025,21 @@ class M3Display(_RunClock):
 
         # T: the true map's fruits -- a ring in the fruit's colour at the
         # actual position, a line to the estimate, and the error in cm
-        if self.compare_on and self.compare_truth:
+        if self.compare_on and (self.compare_truth or self.compare_markers):
             est = self._estimates()
-            for name, (tx, ty) in self.compare_truth.items():
+            align = self.compare_alignment()
+            est_m = self._est_markers()
+            for tag, txy in self.compare_markers.items():
+                t_px = self._px(*self.truth_in_est_frame(txy, align))
+                half = max(4, int(0.035 * s))
+                cv2.rectangle(img, (t_px[0] - half, t_px[1] - half), (t_px[0] + half, t_px[1] + half),
+                              TRUE_MARKER, 2)
+                cv2.putText(img, str(tag), (t_px[0] + half + 2, t_px[1] + half + 10), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.38, TRUE_MARKER, 1, cv2.LINE_AA)
+                if tag in est_m:
+                    cv2.line(img, self._px(*est_m[tag]), t_px, (150, 20, 20), 1, cv2.LINE_AA)
+            for name, txy in self.compare_truth.items():
+                tx, ty = self.truth_in_est_frame(txy, align)
                 colour = FRUIT_RGB.get(name, DEFAULT_FRUIT_RGB)
                 t_px = self._px(tx, ty)
                 r_true = max(6, int(0.04 * s))
@@ -932,7 +1055,13 @@ class M3Display(_RunClock):
                 cv2.drawMarker(img, t_px, (20, 20, 20), cv2.MARKER_CROSS, 6, 1)
                 cv2.putText(img, txt, (t_px[0] - 14, t_px[1] + r_true + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                             (150, 20, 20), 1, cv2.LINE_AA)
-            cv2.putText(img, "TRUE MAP: ring = actual, diamond = estimate, red = error", (8, res - 10),
+            if align is None:
+                caption = "TRUE MAP (UNALIGNED: <2 shared markers)"
+            else:
+                caption = "TRUE MAP aligned on {} markers: RMSE raw {:.1f} / aligned {:.1f} cm".format(
+                    align['n'], align['raw'] * 100, align['aligned'] * 100)
+            cv2.putText(img, caption, (8, res - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 20, 20), 1, cv2.LINE_AA)
+            cv2.putText(img, "open square/ring = true, black/diamond = estimate", (8, res - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 20, 20), 1, cv2.LINE_AA)
 
         # the current target's 0.4 m success zone
@@ -940,7 +1069,7 @@ class M3Display(_RunClock):
             cv2.circle(img, self._px(*self.target_xy), int(0.4 * s), ZONE, 1, cv2.LINE_AA)
 
         # markers: the physical 6 cm block, ringed green when the camera can see it
-        for i, (mx, my) in enumerate(self.aruco_true_pos):
+        for i, (mx, my) in enumerate(self._marker_layout()):
             if not (np.isfinite(mx) and np.isfinite(my)):
                 continue   # not mapped yet (final_demo_l3.py builds the map live)
             centre = self._px(mx, my)
@@ -948,6 +1077,7 @@ class M3Display(_RunClock):
             cv2.rectangle(img, (centre[0] - half, centre[1] - half), (centre[0] + half, centre[1] + half), (20, 20, 20), -1)
             if (i + 1) in self.visible_tags:
                 cv2.circle(img, centre, half + 7, SEEN, 2, cv2.LINE_AA)
+        self._draw_marker_uncertainty(img)
 
         # route
         state = self.ekf.robot.state
@@ -1011,7 +1141,7 @@ class M3Display(_RunClock):
         surface = pygame.image.frombuffer(img.tobytes(), (res, res), 'RGB').copy()
 
         # marker id icons and the robot sprite, same artwork as operate.py
-        for i, (mx, my) in enumerate(self.aruco_true_pos):
+        for i, (mx, my) in enumerate(self._marker_layout()):
             if not (np.isfinite(mx) and np.isfinite(my)):
                 continue 
             u, v = self._px(mx, my)

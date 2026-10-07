@@ -134,3 +134,26 @@ Status key: `[ ]` todo · `[~]` in progress · `[x]` done · `[?]` needs verific
   - Tested in simulation (phase 0 / lock / late markers / save; no YOLO): about 1–1.5 cm aligned marker RMSE.
   - Not yet run on the robot.
 - 2026-10-06: `eval.py` can now score final-demo files: `--run auto_1` / `--run all` (from `submission/`, with a summary table). Plots are saved as `eval_<run>.png`. The scoring maths is unchanged.
+- 2026-10-07: Accuracy and logging changes in `final_demo_l3.py`:
+  - Applies the marker distance correction (`CorrectedArucoSensor`; `--no-dist-correction` turns it off). Readings were 6 cm short within 1.2 m. Sim: aligned marker RMSE 5.9 cm -> 0.9-2.1 cm.
+  - `m3_display.py`: the T overlay now lines the true map up to the robot's frame before drawing it, adds true markers and a live RMSE readout, and draws marker uncertainty ellipses or sd-at-lock circles.
+  - Run log: `run_logs/<date-time>/` (meta, events, console, final). Summarise with `python analyze_run.py [--truemap truemap.txt]`.
+  - Next: R5 (noise model from real logs), R6 (end-of-run marker re-fit).
+- 2026-10-07 (from run_logs/20261007-134902):
+  - Run result: 4/4 parks. Submitted marker map 7.0 cm aligned RMSE.
+  - Cause: phase-0 turn drift. 2-3 tick turns come up 10-15% short, which rotated the locked map about 12 degrees (and the planning bounds with it).
+  - Added the in-run marker re-fit (`Navigator.refit_markers`, `solve_pose_graph`):
+    - Runs after each exploration viewpoint.
+    - Moves the markers, the robot pose, each fruit (with the frames that saw it) and stored positions.
+    - Safety gate: refused if the whole map turns more than 20 degrees, any marker moves more than 30 cm relative to the others, or the robot moves more than 40 cm / 20 degrees beyond the map change.
+    - `--no-refit` turns it off.
+    - Replayed on this log: 7.0 cm -> 3.4-3.7 cm map from viewpoint 3 onward, fruits 5.8 -> 4.7 cm, 0.5-2.4 s per re-fit.
+  - Distance correction is now OFF by default (`--dist-correction` turns it on). It over-corrected on this run.
+  - Not done yet: turn model (affine), drive overshoot (~21%, 6 samples).
+- 2026-10-07 (from run_logs/20261007-143413):
+  - Results: 4/4 parks. Markers 2.6 cm aligned RMSE (was 7.0). Fruits: targets 3.4 cm, others 5.2 cm (capsicum 7.5 cm from 2 views).
+  - Re-fit: all 6 accepted. The first turned the map -7.7 degrees, with one marker moving 28 cm relative to the others (gate limit 30).
+  - Turns: turn_scale_fast learned 0.565 (file says 0.6125). Slow turns still overshoot by a fixed ~+1.9 degrees per turn, so the turn model is still open. The user will recalibrate fast turns themselves.
+  - Changes:
+    - Run starts on ENTER.
+    - Every fruit is held to the search-list bar for the object map (`FruitMapper.score_labels`, `needs_work()`). Search-list fruits keep priority. Unseen non-target fruits get a fixed-viewpoint 360.

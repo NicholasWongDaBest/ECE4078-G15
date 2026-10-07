@@ -43,12 +43,14 @@ pip-delete-this-directory.txt
 !scale.txt
 !baseline.txt
 !turn_scale.txt
+!turn_scale_fast.txt
 
 *.png
 
 # Robot ZIP
 *.ZIP
 
+*run_logs/
 
 # Unit test / coverage reports
 htmlcov/

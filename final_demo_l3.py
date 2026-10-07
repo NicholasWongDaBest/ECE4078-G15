@@ -6,11 +6,18 @@
 #            360 deg sweep at the start pose, plus extra viewpoints while too
 #            few markers are confidently placed. Then lock_marker_map() freezes
 #            them, exactly as load_true_map() froze the true map in M3.
-#   phase 1+ the unchanged M3 Level 3 run (fruit exploration, then parking)
-#            on top of the locked markers. A marker first seen after the lock
-#            is added (and locked) once it has been seen consistently -- see
-#            Navigator._note_unknown_markers().
+#   phase 1+ the M3 Level 3 run (fruit exploration, then parking) on top of
+#            the locked markers. A marker first seen after the lock is added
+#            (and locked) once it has been seen consistently -- see
+#            Navigator._note_unknown_markers(). After each exploration
+#            viewpoint the markers are RE-FITTED from every reading so far
+#            (Navigator.refit_markers(), solve_pose_graph()) and the robot,
+#            fruits and stored positions are moved with them.
 #   end      submission/slam_auto_{i}.txt and objects_auto_{i}.txt.
+# --dist-correction applies the distance correction operate.py uses
+# (distortion_correction.json) -- OFF by default: on the robot it over-corrected
+# (run_logs/20261007-134902). See CorrectedArucoSensor. Every run writes
+# run_logs/<date-time>/ (RunLog); summarise one with analyze_run.py.
 # The map frame is the start pose: place the robot at the arena centre,
 # square to a wall, so the +-1.25 m planning bounds line up with the tape.
 #
@@ -43,6 +50,311 @@ FRUIT_TAG_BASE = 100
 
 import path_planner
 from m3_display import M3Display, NullDisplay, M3Abort
+
+DIST_CORRECTION_FILE = 'distortion_correction.json'
+
+
+class CorrectedArucoSensor(ArucoSensor):
+    """
+    ArucoSensor plus the marker-position correction operate.py applies:
+    distortion_correction.json, a polynomial fitted by fit_distortion.py to
+    distortion_grid_data.csv (markers at known spots vs what the camera
+    reported). Raw readings come out 5.6-6.9 cm SHORT within 1.2 m -- about
+    a 6 cm marker block's depth -- and uncorrected, phase 0 placed every
+    marker that much too close to wherever the robot stood when it saw it.
+    Kept here, not in slam/aruco_sensor.py, so operate.py is untouched.
+    Each Marker keeps its uncorrected reading as .raw_position (for the run log).
+    """
+
+    def __init__(self, robot, marker_length=0.06, correction_file=DIST_CORRECTION_FILE, enabled=True):
+        super().__init__(robot, marker_length=marker_length)
+        self.correction = None
+        self.correction_file = correction_file
+        if not enabled:
+            print("Marker distance correction: OFF (default; --dist-correction turns it on)")
+            return
+        try:
+            with open(correction_file) as f:
+                dc = json.load(f)
+            self.correction = (int(dc['degree']), np.array(dc['coeffs_x'], dtype=float),
+                               np.array(dc['coeffs_y'], dtype=float))
+            print("Marker distance correction: degree {} from {}".format(self.correction[0], correction_file))
+        except (OSError, ValueError, KeyError) as e:
+            print("Marker distance correction: OFF ({} not usable: {})".format(correction_file, e))
+
+    def correct(self, x, y):
+        """(ahead, left) raw -> corrected, with operate.py's feature order."""
+        if self.correction is None:
+            return x, y
+        degree, cx, cy = self.correction
+        feats = [1.0, x, y]
+        if degree >= 2:
+            feats += [x * x, x * y, y * y]
+        if degree >= 3:
+            feats += [x ** 3, x * x * y, x * y * y, y ** 3]
+        feats = np.array(feats)
+        return float(feats @ cx), float(feats @ cy)
+
+    def detect_marker_positions(self, img):
+        measurement, aruco_img = super().detect_marker_positions(img)
+        for lm in measurement:
+            raw = np.asarray(lm.position, dtype=float).reshape(2, 1).copy()
+            lm.raw_position = raw
+            x, y = self.correct(raw[0, 0], raw[1, 0])
+            lm.position = np.array([[x], [y]])
+        return measurement, aruco_img
+
+
+def _jsonable(o):
+    """json.dump default: numpy arrays / scalars -> plain Python."""
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, (set, tuple)):
+        return list(o)
+    return str(o)
+
+
+def _summarise(v, limit=40):
+    """Keep a log line small: a big array becomes its shape."""
+    if isinstance(v, np.ndarray) and v.size > limit:
+        return {'array_shape': list(v.shape)}
+    if isinstance(v, (list, tuple)) and len(v) > limit:
+        return {'list_len': len(v)}
+    return v
+
+
+class RunLog:
+    """
+    One folder per run, run_logs/<YYYYmmdd-HHMMSS>/:
+      meta.json     the run's options, calibration, noise settings, git commit
+      events.jsonl  one JSON object per line: {t, phase, kind, ...}. Kinds:
+                    phase, move (every commanded turn/drive), frame (every
+                    marker frame folded into the EKF: raw + corrected
+                    readings, mode, pose before/after, the EKF's per-marker
+                    innovation/NIS/gated), marker_status, lock, late_marker,
+                    fruit_obs, ui_* (notify/route/target/found), save
+      console.txt   everything printed
+      final.json    final markers (and their sd at the lock), fruits,
+                    phase times, submission files, truth comparison
+    Written line by line and flushed, so a crashed run still leaves its log.
+    analyze_run.py reads it.
+    """
+
+    def __init__(self, root='run_logs'):
+        self.dir = os.path.join(root, time.strftime('%Y%m%d-%H%M%S'))
+        os.makedirs(self.dir, exist_ok=True)
+        self._events = open(os.path.join(self.dir, 'events.jsonl'), 'a', encoding='utf-8')
+        self.t0 = time.time()
+        self.phase = 'start'
+        self.phase_times = {}
+        self._stdout = None
+
+    def event(self, kind, **data):
+        rec = {'t': round(time.time() - self.t0, 3), 'phase': self.phase, 'kind': kind}
+        rec.update(data)
+        self._events.write(json.dumps(rec, default=_jsonable) + '\n')
+        self._events.flush()
+
+    def set_phase(self, name):
+        now = round(time.time() - self.t0, 3)
+        if self.phase in self.phase_times:
+            self.phase_times[self.phase][1] = now
+        self.phase = name
+        self.phase_times[name] = [now, None]
+        self.event('phase', name=name)
+
+    def write_json(self, name, obj):
+        with open(os.path.join(self.dir, name), 'w', encoding='utf-8') as f:
+            json.dump(obj, f, indent=2, default=_jsonable)
+
+    def tee_stdout(self):
+        log = self
+
+        class _Tee:
+            def __init__(self, stream, path):
+                self.stream, self.file = stream, open(path, 'a', encoding='utf-8')
+
+            def write(self, text):
+                self.stream.write(text)
+                self.file.write(text)
+                self.file.flush()
+
+            def flush(self):
+                self.stream.flush()
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+        self._stdout = sys.stdout
+        sys.stdout = _Tee(sys.stdout, os.path.join(log.dir, 'console.txt'))
+
+    def close(self):
+        if self.phase in self.phase_times:
+            self.phase_times[self.phase][1] = round(time.time() - self.t0, 3)
+        if self._stdout is not None:
+            sys.stdout.file.close()
+            sys.stdout = self._stdout
+            self._stdout = None
+        self._events.close()
+
+
+def _fit_rigid_2d(a, b):
+    """Rotation + translation taking points a (2, N) onto b (2, N), N >= 2.
+    @return: (R 2x2, t 2x1, theta)"""
+    mu_a, mu_b = a.mean(axis=1, keepdims=True), b.mean(axis=1, keepdims=True)
+    da, db = a - mu_a, b - mu_b
+    th = math.atan2(float(np.sum(da[0] * db[1] - da[1] * db[0])), float(np.sum(da[0] * db[0] + da[1] * db[1])))
+    R = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+    return R, mu_b - R @ mu_a, th
+
+
+def solve_pose_graph(poses0, edges, readings, sd_depth=(0.03, 0.02), sd_side=(0.02, 0.01), max_nfev=100):
+    """
+    Least-squares re-fit of every marker AND every past robot pose at once,
+    from all the marker readings and the commanded moves between them.
+
+    The EKF in M3 freezes the markers at the lock, so the ~1000 readings
+    taken afterwards only ever correct the pose -- never the map -- and the
+    pose is then only as good as that early map. On run 20261007-134902
+    re-solving everything this way took the marker map from 7.0 cm to 3.8 cm
+    (aligned RMSE) and the pose from 6.0 cm / 1.9 deg to 3.2 cm / 0.8 deg
+    median error.
+
+    poses0:   (N, 3) starting guess [x, y, theta] per node (a frame with readings)
+    edges:    [(i, j, dx, dy, dtheta, sd_xy, sd_theta)] node j relative to node i,
+              in node i's frame (composed commanded moves)
+    readings: [(node, tag, ahead, left)] marker readings in the robot frame
+    Node 0 is held where it is, so the map stays in the start frame (the
+    arena frame the planning bounds are drawn in). Robust (soft-L1) loss:
+    a few bad readings cannot drag the fit.
+    @return: (markers {tag: (x, y)}, poses (N, 3), info dict)
+    """
+    from scipy.optimize import least_squares
+    from scipy.sparse import lil_matrix
+    poses0 = np.asarray(poses0, dtype=float)
+    N = len(poses0)
+    tags = sorted({r[1] for r in readings})
+    ti = {t: i for i, t in enumerate(tags)}
+    M = len(tags)
+    r_node = np.array([r[0] for r in readings]); r_tag = np.array([ti[r[1]] for r in readings])
+    Z = np.array([[r[2], r[3]] for r in readings], dtype=float)
+    rng = np.hypot(Z[:, 0], Z[:, 1])
+    sd_d = sd_depth[0] + sd_depth[1] * rng
+    sd_l = sd_side[0] + sd_side[1] * rng
+    # starting markers: mean of their readings through the starting poses
+    m0 = np.zeros((M, 2)); cnt = np.zeros(M)
+    for (k, j), (f, l) in zip(zip(r_node, r_tag), Z):
+        x, y, th = poses0[k]
+        m0[j] += (x + f * math.cos(th) - l * math.sin(th), y + f * math.sin(th) + l * math.cos(th))
+        cnt[j] += 1
+    m0 /= cnt[:, None]
+    E = np.array([e[:5] for e in edges], dtype=float).reshape(-1, 5)
+    Esd = np.array([e[5:] for e in edges], dtype=float).reshape(-1, 2)
+    Ei, Ej = E[:, 0].astype(int), E[:, 1].astype(int)
+    anchor = poses0[0].copy()
+    wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
+
+    def fun(v):
+        P = v[:3 * N].reshape(N, 3)
+        Mk = v[3 * N:].reshape(M, 2)
+        p, m = P[r_node], Mk[r_tag]
+        dx, dy = m[:, 0] - p[:, 0], m[:, 1] - p[:, 1]
+        c, s_ = np.cos(p[:, 2]), np.sin(p[:, 2])
+        r1 = np.concatenate([(c * dx + s_ * dy - Z[:, 0]) / sd_d, (-s_ * dx + c * dy - Z[:, 1]) / sd_l])
+        a, b = P[Ei], P[Ej]
+        ca, sa = np.cos(a[:, 2]), np.sin(a[:, 2])
+        ddx, ddy = b[:, 0] - a[:, 0], b[:, 1] - a[:, 1]
+        r2 = np.concatenate([(ca * ddx + sa * ddy - E[:, 2]) / Esd[:, 0], (-sa * ddx + ca * ddy - E[:, 3]) / Esd[:, 0],
+                             wrap(b[:, 2] - a[:, 2] - E[:, 4]) / Esd[:, 1]])
+        return np.concatenate([r1, r2, (P[0] - anchor) * 1000.0])
+
+    nr, ne = len(readings), len(Ei)
+    J = lil_matrix((2 * nr + 3 * ne + 3, 3 * N + 2 * M), dtype=int)
+    for i in range(nr):
+        k, j = r_node[i], r_tag[i]
+        for row in (i, i + nr):
+            J[row, 3 * k:3 * k + 3] = 1
+            J[row, 3 * N + 2 * j:3 * N + 2 * j + 2] = 1
+    for q in range(3):
+        for e in range(ne):
+            row = 2 * nr + q * ne + e
+            J[row, 3 * Ei[e]:3 * Ei[e] + 3] = 1
+            J[row, 3 * Ej[e]:3 * Ej[e] + 3] = 1
+    J[2 * nr + 3 * ne:, 0:3] = 1
+    x0 = np.concatenate([poses0.ravel(), m0.ravel()])
+    res = least_squares(fun, x0, jac_sparsity=J, loss='soft_l1', f_scale=2.0, x_scale='jac', max_nfev=max_nfev)
+    P = res.x[:3 * N].reshape(N, 3)
+    P[:, 2] = wrap(P[:, 2])
+    Mk = res.x[3 * N:].reshape(M, 2)
+    r = res.fun[:2 * nr]
+    info = {'success': bool(res.success), 'nfev': int(res.nfev), 'cost': float(res.cost),
+            'reading_resid_median': float(np.median(np.hypot(r[:nr], r[nr:]))), 'nodes': N, 'readings': nr}
+    return {t: (float(Mk[ti[t], 0]), float(Mk[ti[t], 1])) for t in tags}, P, info
+
+
+def _attach(point_xy, node_old, node_new):
+    """Where a point rigidly attached to a node goes when the node moves from
+    node_old to node_new ([x, y, theta] each)."""
+    dth = node_new[2] - node_old[2]
+    c, s_ = math.cos(dth), math.sin(dth)
+    dx, dy = point_xy[0] - node_old[0], point_xy[1] - node_old[1]
+    return node_new[0] + c * dx - s_ * dy, node_new[1] + s_ * dx + c * dy
+
+
+def _git_version():
+    try:
+        import subprocess
+        rev = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+        dirty = subprocess.run(['git', 'status', '--porcelain'], capture_output=True, text=True,
+                               timeout=5).stdout.strip()
+        return rev + ('+uncommitted' if dirty else '')
+    except Exception:
+        return None
+
+
+def instrument_display(display, log):
+    """Log what the run tells the display (phases in words, targets, routes,
+    'found'), by wrapping those methods on the instance -- run_level3 swaps
+    display.target_done in and out, and that keeps working."""
+    for name in ('notify', 'begin_target', 'set_route', 'target_done', 'wait_for_key', 'finish'):
+        orig = getattr(display, name, None)
+        if orig is None:
+            continue
+
+        def wrapped(*a, _orig=orig, _name=name, **k):
+            log.event('ui_' + _name, args=[_summarise(v) for v in a])
+            return _orig(*a, **k)
+        setattr(display, name, wrapped)
+
+
+def track_fruit_nodes(nav, mapper):
+    """Remember which re-fit node was current whenever the mapper fused a
+    sighting, so a re-fit can move each fruit with the frames that saw it."""
+    orig = mapper.observe
+
+    def observe(boxes, pose, only=None, note_others=None):
+        n = orig(boxes, pose, only=only, note_others=note_others)
+        if n:
+            nav.note_fruit_nodes({label for label, _ in boxes})
+        return n
+    mapper.observe = observe
+
+
+def instrument_mapper(mapper, log):
+    """Log every fruit sighting handed to the mapper and how many it accepted."""
+    orig = mapper.observe
+
+    def observe(boxes, pose, only=None, note_others=None):
+        n = orig(boxes, pose, only=only, note_others=note_others)
+        if boxes:
+            log.event('fruit_obs', pose=[float(v) for v in pose[:3]], accepted=n,
+                      only=(sorted(only) if isinstance(only, (set, list, tuple)) else only),
+                      boxes=[[label, [float(v) for v in np.asarray(box).reshape(-1)]] for label, box in boxes])
+        return n
+    mapper.observe = observe
 
 # How far inside the out-of-bounds line (path_planner.ARENA_BOUNDS: the
 # robot's centre at the tape's outer edge + one robot radius, i.e. half the
@@ -312,6 +624,13 @@ class FruitMapper:
         self.provisional_min_sigma = 0.20
         self.n_provisional_births = self.n_provisional_confirmed = 0
         self.frozen = False       # once True, observe() ignores everything: the map is locked
+        # Final demo: EVERY fruit's position is scored (object map, 25%), not
+        # only the search list's. Labels in score_labels are held to the same
+        # bar as the search list (well_mapped() with the target counts, and
+        # target_ready()) -- needs_work(). The search list keeps priority in
+        # exploration (parking depends on it); main() fills this with every
+        # fruit in object_list.csv.
+        self.score_labels = []
 
     def freeze(self):
         """Lock the map. After the exploration phase the estimates are the
@@ -569,7 +888,7 @@ class FruitMapper:
         its time on fruits that do not score."""
         if label not in self.fruit_ekf.estimates:
             return False
-        target = label in self.expected
+        target = self.held_to_target_bar(label)
         return (self.fruit_ekf.n_views(label) >= (self.min_views if target else 2)
                 and self.fruit_ekf.bearing_spread(label) >= self.min_spread_deg
                 and self.n_sightings(label) >= (self.min_sightings if target else 1))
@@ -630,6 +949,24 @@ class FruitMapper:
     def all_targets_ready(self):
         return all(self.target_ready(l) for l in self.expected)
 
+    def held_to_target_bar(self, label):
+        """True for a search-list fruit and for every scored fruit (score_labels)."""
+        return label in self.expected or label in self.score_labels
+
+    def needs_work(self, label):
+        """Still worth exploring for: a fruit held to the target bar until it
+        is target_ready(), any other until it is well_mapped()."""
+        return not (self.target_ready(label) if self.held_to_target_bar(label) else self.well_mapped(label))
+
+    def others_pending(self):
+        """Scored fruits NOT on the search list that are on the map but not yet target_ready()."""
+        return [l for l in sorted(self.fruit_ekf.estimates)
+                if l not in self.expected and l in self.score_labels and not self.target_ready(l)]
+
+    def others_unseen(self):
+        """Scored fruits NOT on the search list that are not on the map at all."""
+        return [l for l in self.score_labels if l not in self.expected and l not in self.fruit_ekf.estimates]
+
     def position_uncertainty(self, label):
         """Rough bound on how far this fruit's estimate could be off (m), from
         its observing geometry (zone_risk): 3 cm for a well-covered fruit up
@@ -641,11 +978,11 @@ class FruitMapper:
         lines = []
         for label in sorted(self.fruit_ekf.estimates, key=lambda l: (l not in self.expected, l)):
             x, y = self.positions()[label]
-            tag = "target" if label in self.expected else "obstacle"
+            tag = "target" if label in self.expected else ("scored" if label in self.score_labels else "obstacle")
             if label in self.provisional:
                 ok = "PROVISIONAL: rough location from {} unconverged sighting(s), needs a look".format(
                     len(self.provisional[label]))
-            elif label in self.expected:
+            elif self.held_to_target_bar(label):
                 ok = "ready" if self.target_ready(label) else (
                     "well mapped, wants a closer/wider look" if self.well_mapped(label) else "weak")
             else:
@@ -653,7 +990,7 @@ class FruitMapper:
             lines.append("    {:10s} at [{:+.2f}, {:+.2f}]  sigma {:.0f} cm, {} sighting(s) from {} view(s) over {:.0f} deg, zone +{:.0f} cm -- {} ({})".format(
                 label, x, y, self.sigma(label) * 100, self.n_sightings(label), self.fruit_ekf.n_views(label),
                 self.fruit_ekf.bearing_spread(label), self.zone_extra(label) * 100, ok, tag))
-        missing = [l for l in self.expected if l not in self.fruit_ekf.estimates]
+        missing = [l for l in self.expected if l not in self.fruit_ekf.estimates] + self.others_unseen()
         if missing:
             lines.append("    NOT SEEN: " + ", ".join(missing))
         if self.n_off_target_births:
@@ -1024,6 +1361,25 @@ class Navigator:
         self.late_marker_sightings = 3
         self.late_marker_spread = 0.10
         self._late_sightings = {}   # tag -> [(x, y)] in the world frame
+        self.locked_marker_sd = {}   # tag -> sd (m) when lock_marker_map() froze it (display + log)
+        self.log = None              # RunLog, set by main
+        # In-run re-fit (refit_markers()): every frame with marker readings
+        # becomes a node, with the commanded moves since the previous node as
+        # an edge -- kept in memory whether or not the run log is on.
+        self.refit_enabled = True
+        # Safety gate (see refit_markers()): a re-fit is refused if the whole
+        # map would turn more than refit_max_frame_turn, any marker would move
+        # more than refit_max_marker_move RELATIVE to the others, or the robot
+        # more than refit_max_pose_move beyond the map's own change.
+        self.refit_max_frame_turn = np.deg2rad(20.0)
+        self.refit_max_marker_move = 0.30
+        self.refit_max_pose_move = (0.40, np.deg2rad(20.0))
+        self._rf_poses = []          # node -> [x, y, theta], replaced by the fitted values after a re-fit
+        self._rf_edges = []          # (i, j, dx, dy, dtheta, sd_xy, sd_theta)
+        self._rf_readings = []       # (node, tag, ahead, left)
+        self._rf_pending = []        # commanded moves since the last node: (dtheta, distance, completed)
+        self._rf_fruit_nodes = {}    # fruit label -> node indices current when it was fused
+        self.n_refits = 0
         self._last_boxes = []
         # For the display's detector panel: the last frame YOLO actually ran
         # on, when, and how many frames so far. The display never runs the
@@ -1323,7 +1679,38 @@ class Navigator:
         finally:
             self._map_only, self._suppress_mapping, self._policy_off = prev_only, prev_suppress, prev_off
 
+    def _pose_list(self):
+        s = self.ekf.robot.state
+        return [float(s[0, 0]), float(s[1, 0]), float(s[2, 0])]
+
     def _apply_measurements(self, aruco, fruits, allow_anchor=True):
+        """Run-log shell around _apply_measurements_core(): records the frame's
+        raw and corrected marker readings, what the filter did with them and
+        the pose before/after. Behaviour is identical with or without a log."""
+        if self.log is None:
+            result = self._apply_measurements_core(aruco, fruits, allow_anchor)
+            self._record_refit_node(aruco)
+            return result
+        before = self._pose_list()
+        prev_diag = self.ekf.last_diagnostics
+        result = self._apply_measurements_core(aruco, fruits, allow_anchor)
+        self._record_refit_node(aruco)
+        diag = self.ekf.last_diagnostics
+        markers = []
+        for lm in aruco or []:
+            rec = {'tag': int(lm.tag), 'z': np.asarray(lm.position, dtype=float).reshape(-1)[:2]}
+            raw = getattr(lm, 'raw_position', None)
+            if raw is not None:
+                rec['raw'] = np.asarray(raw, dtype=float).reshape(-1)[:2]
+            markers.append(rec)
+        P = self.ekf.P
+        self.log.event('frame', mode=result[0], n_known=result[1], n_fruit=len(fruits or []),
+                       slam_live=self.slam_live, markers=markers, pose_before=before,
+                       pose_after=self._pose_list(), P_robot=[float(P[0, 0]), float(P[1, 1]), float(P[2, 2])],
+                       diag=(diag if diag is not prev_diag else []))
+        return result
+
+    def _apply_measurements_core(self, aruco, fruits, allow_anchor=True):
         """
         Fold one frame's sightings into the pose.
 
@@ -1435,6 +1822,181 @@ class Navigator:
         if hasattr(self.display, 'aruco_true_pos'):
             self.display.aruco_true_pos = self.markers_by_id()
 
+    # ------------------------------------------------------------------
+    # In-run re-fit of the marker map
+    # ------------------------------------------------------------------
+
+    def _record_refit_node(self, aruco):
+        """A frame with marker readings becomes a node of the re-fit graph:
+        its pose (after this frame's update), its readings, and an edge from
+        the previous node made of the moves commanded in between."""
+        ms = [lm for lm in self.filter_markers(aruco) if int(lm.tag) <= 10]
+        if not ms:
+            return
+        self._rf_poses.append(self._pose_list())
+        k = len(self._rf_poses) - 1
+        for lm in ms:
+            f, l = (float(v) for v in np.asarray(lm.position, dtype=float).reshape(-1)[:2])
+            self._rf_readings.append((k, int(lm.tag), f, l))
+        if k > 0:
+            x = y = th = rot = dist = 0.0
+            extra_xy = extra_th = 0.0
+            for dtheta, distance, completed in self._rf_pending:
+                if abs(distance) > 1e-9:
+                    x += distance * math.cos(th)
+                    y += distance * math.sin(th)
+                    dist += abs(distance)
+                else:
+                    th += dtheta
+                    rot += abs(dtheta)
+                if not completed:
+                    extra_xy, extra_th = extra_xy + 0.10, extra_th + np.deg2rad(20.0)
+            self._rf_edges.append((k - 1, k, x, y, th, 0.02 + 0.10 * dist + extra_xy,
+                                   np.deg2rad(1.5) + 0.06 * rot + 0.05 * dist + extra_th))
+        self._rf_pending = []
+
+    def note_fruit_nodes(self, labels):
+        """The fruit mapper fused sightings of `labels` from the latest node."""
+        if not self._rf_poses:
+            return
+        k = len(self._rf_poses) - 1
+        for label in labels:
+            nodes = self._rf_fruit_nodes.setdefault(label, [])
+            if not nodes or nodes[-1] != k:
+                nodes.append(k)
+
+    def refit_markers(self, why=''):
+        """
+        Re-fit every marker and every past pose from all readings so far
+        (solve_pose_graph()) and, if the result passes the safety gate, move
+        the world onto it: markers (still frozen), the robot's pose, each
+        fruit (with the frames that saw it), and every stored position.
+        Called while the robot is stopped. @return: a function mapping an
+        old-frame (x, y) to the new frame, for the caller's own stored
+        positions -- or None if nothing changed.
+        """
+        if not self.refit_enabled or len(self._rf_poses) < 3 or len(self._rf_readings) < 30:
+            return None
+        t0 = time.time()
+        old_poses = np.array(self._rf_poses, dtype=float)
+        try:
+            new_m, new_poses, info = solve_pose_graph(old_poses, self._rf_edges, self._rf_readings)
+        except Exception as e:
+            print("[refit] failed ({}) -- keeping the current map".format(e))
+            self._log_refit(why, False, 'error: {}'.format(e), time.time() - t0)
+            return None
+        old_m = self.marker_positions()
+        common = [t for t in old_m if t in new_m]
+        moves = {t: math.hypot(new_m[t][0] - old_m[t][0], new_m[t][1] - old_m[t][1]) for t in common}
+        cur = self._pose_list()
+        k = len(old_poses) - 1
+        nx, ny = _attach(cur[:2], old_poses[k], new_poses[k])
+        nth = _normalize_angle(cur[2] + new_poses[k][2] - old_poses[k][2])
+        dpos = math.hypot(nx - cur[0], ny - cur[1])
+        # The safety gate separates a whole-map rotation/shift -- what a re-fit
+        # is FOR: phase-0 turn drift rotated run 20261007-134902's locked map
+        # 12 deg, which moves a marker 1.3 m out by ~27 cm -- from markers
+        # moving relative to each other, which is the suspicious part. The
+        # robot's own correction is judged the same way: beyond the frame change.
+        reason = None
+        shape, frame_turn, robot_local = {}, 0.0, (0.0, 0.0)
+        if len(common) >= 3:
+            A = np.array([old_m[t_] for t_ in common]).T
+            B = np.array([new_m[t_] for t_ in common]).T
+            Rm, tm, frame_turn = _fit_rigid_2d(A, B)
+            shape = {t_: float(np.hypot(*(Rm @ A[:, i:i + 1] + tm - B[:, i:i + 1]).ravel()))
+                     for i, t_ in enumerate(common)}
+            q = Rm @ np.array([[cur[0]], [cur[1]]]) + tm
+            robot_local = (math.hypot(nx - q[0, 0], ny - q[1, 0]),
+                           abs(_normalize_angle(nth - cur[2] - frame_turn)))
+        if not info['success'] and info['nfev'] < 5:
+            reason = 'did not converge'
+        elif len(common) < 3:
+            reason = 'fewer than 3 markers in common'
+        elif abs(frame_turn) > self.refit_max_frame_turn:
+            reason = 'the whole map would turn {:.0f} deg'.format(math.degrees(frame_turn))
+        elif max(shape.values()) > self.refit_max_marker_move:
+            reason = 'marker {} would move {:.0f} cm relative to the others'.format(
+                max(shape, key=shape.get), 100 * max(shape.values()))
+        elif robot_local[0] > self.refit_max_pose_move[0] or robot_local[1] > self.refit_max_pose_move[1]:
+            reason = 'robot pose would move {:.0f} cm / {:.0f} deg beyond the map change'.format(
+                100 * robot_local[0], math.degrees(robot_local[1]))
+        dt = time.time() - t0
+        if reason is not None:
+            print("[refit] {}: refused ({}) -- keeping the current map [{:.1f} s]".format(why, reason, dt))
+            self._log_refit(why, False, reason, dt, info=info)
+            return None
+
+        # Overall rigid change of the frame, for positions not tied to a node.
+        R, t, th_g = _fit_rigid_2d(old_poses[:, :2].T, new_poses[:, :2].T)
+
+        def move_point(xy):
+            q = R @ np.array([[float(xy[0])], [float(xy[1])]]) + t
+            return float(q[0, 0]), float(q[1, 0])
+
+        # markers (zero covariance: they stay frozen at the new place)
+        for t_ in common:
+            i = self.ekf.taglist.index(t_)
+            self.ekf.markers[0, i], self.ekf.markers[1, i] = new_m[t_]
+        # the robot: rigidly attached to the latest node
+        self.ekf.robot.state[0, 0], self.ekf.robot.state[1, 0], self.ekf.robot.state[2, 0] = nx, ny, nth
+        # The turn-scale learner compares the next marker heading with the last
+        # one; across a frame turn that would read as a turning error. Restart it.
+        self._last_fit_theta = None
+        self._cmd_rot_since_fit = self._cmd_rot_fast_since_fit = 0.0
+        self._move_fruits(old_poses, new_poses, move_point, th_g)
+        self.rough_sightings = {l: [move_point(p) for p in pts] for l, pts in self.rough_sightings.items()}
+        self._late_sightings = {tg: [move_point(p) for p in pts] for tg, pts in self._late_sightings.items()}
+        self._rf_poses = new_poses.tolist()
+        self._sync_markers_live()
+        self.n_refits += 1
+        print("[refit] {}: {} nodes, {} readings -> map turned {:+.1f} deg; markers moved up to {:.1f} cm "
+              "relative to each other (median {:.1f}); robot moved {:.1f} cm / {:+.1f} deg [{:.1f} s]".format(
+                  why, info['nodes'], info['readings'], math.degrees(frame_turn), 100 * max(shape.values()),
+                  100 * float(np.median(list(shape.values()))), 100 * dpos,
+                  math.degrees(_normalize_angle(nth - cur[2])), dt))
+        self.display.notify("Map re-fitted: markers moved up to {:.0f} cm".format(100 * max(moves.values())))
+        self._log_refit(why, True, None, dt, info=info, moves=moves, shape_moves=shape,
+                        pose_move=[dpos, nth - cur[2]], robot_local=robot_local, markers=new_m, frame_turn=th_g)
+        return move_point
+
+    def _move_fruits(self, old_poses, new_poses, move_point, th_g):
+        """Each fruit moves with the frames that fused it: the mean of where
+        it goes when attached to each of those nodes. A fruit with no node on
+        record moves with the overall frame change. Its covariance and the
+        directions it was seen from turn with it."""
+        m = self.fruit_mapper
+        if m is None:
+            return
+        fe = m.fruit_ekf
+        for label, pos in list(fe.estimates.items()):
+            p = (float(pos[0, 0]), float(pos[1, 0]))
+            nodes = [k for k in self._rf_fruit_nodes.get(label, []) if k < len(old_poses)]
+            if nodes:
+                pts = np.array([_attach(p, old_poses[k], new_poses[k]) for k in nodes])
+                q = pts.mean(axis=0)
+                dth = float(np.arctan2(np.mean(np.sin(new_poses[nodes, 2] - old_poses[nodes, 2])),
+                                       np.mean(np.cos(new_poses[nodes, 2] - old_poses[nodes, 2]))))
+            else:
+                q, dth = move_point(p), th_g
+            fe.estimates[label] = np.array([[float(q[0])], [float(q[1])]])
+            if label in fe.P:
+                Rr = np.array([[math.cos(dth), -math.sin(dth)], [math.sin(dth), math.cos(dth)]])
+                fe.P[label] = Rr @ fe.P[label] @ Rr.T
+            if label in fe.view_bearings:
+                fe.view_bearings[label] = [_normalize_angle(b + dth) for b in fe.view_bearings[label]]
+        # sightings kept for later decisions: (x, y, dist, robot_x, robot_y, heading[, variance])
+        def move_rec(rec):
+            x, y = move_point(rec[:2])
+            rx, ry = move_point(rec[3:5])
+            return (x, y, rec[2], rx, ry, _normalize_angle(rec[5] + th_g)) + tuple(rec[6:])
+        m.provisional = {l: [move_rec(r) for r in recs] for l, recs in m.provisional.items()}
+        m._jumps = {l: [move_rec(r) for r in recs] for l, recs in m._jumps.items()}
+
+    def _log_refit(self, why, accepted, reason, seconds, **extra):
+        if self.log is not None:
+            self.log.event('refit', why=why, accepted=accepted, reason=reason, seconds=round(seconds, 2), **extra)
+
     def _note_unknown_markers(self, aruco):
         """After the lock: a marker phase 0 never saw cannot be fused (the map
         is frozen) and would not even be an obstacle. Record where each
@@ -1470,6 +2032,8 @@ class Navigator:
             self._late_sightings.pop(int(lm.tag), None)
             self._sync_markers_live()
             print("  late marker {} added to the map at [{:+.2f}, {:+.2f}]".format(int(lm.tag), med[0], med[1]))
+            if self.log is not None:
+                self.log.event('late_marker', tag=int(lm.tag), xy=med, sightings=pts)
             self.display.notify("Marker {} added".format(int(lm.tag)))
 
     def marker_fit(self, aruco):
@@ -2846,6 +3410,10 @@ class Navigator:
         self.ekf.P[1, 1] += xy_sd ** 2
         self.ekf.P[2, 2] += th_sd ** 2
         self._has_moved = True
+        self._rf_pending.append((float(dtheta), float(distance), bool(completed)))
+        if self.log is not None:
+            self.log.event('move', dtheta=float(dtheta), distance=float(distance), completed=bool(completed),
+                           dt=float(dt), speeds=[float(v) for v in wheel_speeds], pose_after=self._pose_list())
         self._dist_since_check += abs(distance) + (1.0 if not completed else 0.0)
         if abs(distance) > 0.0 or not completed:
             self._pos_trusted = False   # it drove (or a move was cut short): the position is in question again
@@ -4139,6 +4707,9 @@ def map_markers(nav, bounds, step=np.deg2rad(20.0), frames=3, overlap=np.deg2rad
     def status(where):
         pos = nav.marker_positions()
         good = sorted(t for t in pos if nav.marker_sd(t) <= marker_sd_ok)
+        if nav.log is not None:
+            nav.log.event('marker_status', where=where, robot=nav._pose_list(),
+                          markers={str(t): [x, y, nav.marker_sd(t)] for t, (x, y) in pos.items()})
         print("  after {}: {} marker(s) placed, {} within {:.0f} cm: {}".format(
             where, len(pos), len(good), marker_sd_ok * 100,
             ", ".join("{}({:.0f}cm)".format(t, 100 * nav.marker_sd(t)) for t in sorted(pos)) or "none"))
@@ -4194,6 +4765,11 @@ def lock_marker_map(nav):
     the rest of the run the frozen-map behaviour it was tuned for."""
     ekf = nav.ekf
     n = ekf.number_landmarks()
+    nav.locked_marker_sd = {t: nav.marker_sd(t) for t in nav.marker_positions()}
+    if nav.log is not None:
+        nav.log.event('lock', markers={str(t): [x, y, nav.locked_marker_sd[t]]
+                                       for t, (x, y) in nav.marker_positions().items()},
+                      robot=nav._pose_list(), P_robot=np.diag(ekf.P[0:3, 0:3]))
     robot_P = ekf.P[0:3, 0:3].copy()
     ekf.P = np.zeros((3 + 2 * n, 3 + 2 * n))
     ekf.P[0:3, 0:3] = robot_P
@@ -4231,6 +4807,10 @@ def save_submission(nav, out_dir, index):
         json.dump(objects, f, indent=4)
     print("Saved {} ({} markers) and {} ({} objects)".format(slam_f, len(nav.marker_positions()),
                                                             obj_f, len(objects)))
+    if nav.log is not None:
+        nav.log.event('save', slam=slam_f, objects=obj_f, n_markers=len(nav.marker_positions()),
+                      n_objects=len(objects))
+    return slam_f, obj_f
 
 
 def report_against_truth(nav, fname):
@@ -4243,13 +4823,13 @@ def report_against_truth(nav, fname):
             gt = json.load(f)
     except (OSError, ValueError) as e:
         print("[compare] could not read {}: {}".format(fname, e))
-        return
+        return None
     est_m = nav.marker_positions()
     pairs = [(t, est_m[t], (gt['aruco{}_0'.format(t)]['x'], gt['aruco{}_0'.format(t)]['y']))
              for t in sorted(est_m) if 'aruco{}_0'.format(t) in gt]
     if not pairs:
         print("[compare] no markers in common with {}".format(fname))
-        return
+        return None
     E = np.array([p[1] for p in pairs], dtype=float).T
     T = np.array([p[2] for p in pairs], dtype=float).T
     raw = float(np.sqrt(np.mean(np.sum((E - T) ** 2, axis=0))))
@@ -4274,6 +4854,10 @@ def report_against_truth(nav, fname):
     if errs:
         print("[compare] fruits (aligned): {} mapped, RMSE {:.3f} m".format(
             len(errs), float(np.sqrt(np.mean(np.square(errs))))))
+    return {'truemap': fname, 'markers_mapped': len(pairs), 'marker_rmse_raw': raw, 'marker_rmse_aligned': al,
+            'marker_errors_aligned': {str(p[0]): float(np.hypot(*(aligned[:, i] - T[:, i])))
+                                      for i, p in enumerate(pairs)},
+            'fruit_rmse_aligned': (float(np.sqrt(np.mean(np.square(errs)))) if errs else None)}
 
 
 def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_resolution=0.05,
@@ -4456,9 +5040,9 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                     continue
                 w = 2.0 if label == focus else (1.5 if not mapper.well_mapped(label) else 1.0)
             else:
-                if mapper.well_mapped(label):
+                if not mapper.needs_work(label):   # scored fruits: until target_ready (final demo)
                     continue
-                w = 0.7
+                w = 2.0 if label == focus else 0.7
             d = math.hypot(fx - here[0], fy - here[1])
             if not (min_range <= d <= max_range):
                 continue
@@ -4659,13 +5243,18 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
         if visited == 0:
             vp, why = (fixed.pop(0) if fixed else tuple(pose[:2])), "centre scan"
         else:
-            if search_list and all(l in parked for l in search_list):
+            others_left = mapper.others_pending() + mapper.others_unseen()
+            if search_list and all(l in parked for l in search_list) and not others_left:
                 print("[explore] every search-list fruit has been parked at -- stopping exploration")
                 break
-            if mapper.all_targets_ready() and not not_ok():
-                print("[explore] every search-list fruit is pinned down (wide spread of views and a close one) "
+            if mapper.all_targets_ready() and not not_ok() and not others_left:
+                print("[explore] every fruit is pinned down (wide spread of views and a close one) "
                       "-- stopping exploration")
                 break
+            if search_list and all(l in parked for l in search_list) and not ready_noted[0]:
+                ready_noted[0] = True
+                print("[explore] every search-list fruit is parked at, but {} still need(s) work for the object "
+                      "map -- carrying on".format(", ".join(others_left)))
             if mapper.all_targets_ready() and not ready_noted[0]:
                 ready_noted[0] = True
                 print("[explore] every search-list fruit is pinned down, but {} (an obstacle) is not well mapped "
@@ -4686,8 +5275,9 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                                                  others_bonus=(viewpoint_others_bonus if viewpoint_looks else 0.0),
                                                  others_range=tuple(viewpoint_look_range),
                                                  others_min_new=look_min_new)
-                if vp is None and (not_ok() or any(not mapper.target_ready(l) for l in search_list
-                                                   if l in mapper.positions())):
+                if vp is None and (not_ok() or mapper.others_pending()
+                                   or any(not mapper.target_ready(l) for l in search_list
+                                          if l in mapper.positions())):
                     # Every new bearing on a fruit still not well mapped is
                     # sealed off by the exploring margins (or the robot itself
                     # stands in a pocket they close): try once more with the tighter
@@ -4719,6 +5309,14 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                     vp = useful[0]
                     fixed.remove(vp)
                     why = "fixed viewpoint -- a new direction on {} ({})".format(", ".join(weak_targets), why)
+                elif not unseen and mapper.others_unseen() and fixed:
+                    # Every search-list fruit is on the map and nothing is
+                    # left to refine from a targeted spot, but a scored fruit
+                    # has never been seen (it would cost a full 1 m of
+                    # object error): a 360 from the nearest fixed viewpoint.
+                    fixed.sort(key=lambda v: path_planner.dist_between(v, pose[:2]))
+                    vp, why = fixed.pop(0), "fixed viewpoint ({} not seen yet -- object map)".format(
+                        ", ".join(mapper.others_unseen()))
                 elif not unseen:
                     # Everything is on the map, and no viewpoint left -- fixed
                     # or targeted -- sees a weak one from a new direction:
@@ -4844,6 +5442,14 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
             pose = nav.settle_pose()
         print("[explore] after viewpoint {}: saw {}; map so far:\n{}".format(
             visited, sorted(seen) or "nothing", mapper.report()))
+        # Re-fit the markers from every reading so far (the robot is stopped).
+        # The navigator moves itself, the markers and the fruits; the stored
+        # positions kept here move with the same frame change.
+        move_point = nav.refit_markers("after viewpoint {}".format(visited))
+        if move_point is not None:
+            tried[:] = [(move_point(q), l) for q, l in tried]
+            avoid[:] = [(move_point(q), l) for q, l in avoid]
+            pose = nav.get_robot_pose()
         park_ready_nearby()
         pose = nav.get_robot_pose()
 
@@ -5202,7 +5808,10 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
     # Obstacle fruits (not on the search list) only have to be well_mapped,
     # not target_ready -- but they do have to be that: a badly placed one
     # is what the robot drives into on the way to a target.
-    obstacles_weak = [l for l in est if l not in expected and l not in rough and not mapper.well_mapped(l)]
+    # Final demo: a scored fruit (FruitMapper.score_labels) needs work until it
+    # is target_ready, like a search-list one -- still at obstacle_weight, so
+    # the search list keeps priority.
+    obstacles_weak = [l for l in est if l not in expected and l not in rough and mapper.needs_work(l)]
     weak += obstacles_weak
     if not weak:
         return None, "every mapped fruit is pinned down", None
@@ -5611,6 +6220,13 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", type=str, default='submission',
                          help="where slam_auto_{i}.txt / objects_auto_{i}.txt go (i = next free index). Not "
                               "lab_output/, which operate.py wipes on start")
+    parser.add_argument("--dist-correction", action="store_true",
+                         help="apply distortion_correction.json to the ArUco readings (default OFF: on the robot it "
+                              "over-corrected, run_logs/20261007-134902)")
+    parser.add_argument("--no-refit", action="store_true",
+                         help="never re-fit the marker map after a viewpoint (default: re-fit after each one)")
+    parser.add_argument("--log-dir", type=str, default='run_logs',
+                         help="run logs go to <log-dir>/<date-time>/ (see RunLog, analyze_run.py)")
     parser.add_argument("--p0-step", type=float, default=20.0,
                          help="phase 0 (marker mapping): turn step of each 360 deg sweep, deg")
     parser.add_argument("--p0-frames", type=int, default=3,
@@ -5755,13 +6371,17 @@ if __name__ == "__main__":
                          help="Level 3: ...and has been seen from at least this close, m; 99 = no such requirement")
     args, _ = parser.parse_known_args()
 
+    run_log = RunLog(args.log_dir)
+    run_log.tee_stdout()
+    print("Run log: {}".format(run_log.dir))
+
     botconnect = BotConnect(args.ip)
     time.sleep(1)  # give connection threads a moment to establish
     botconnect.set_pid(use_pid=1, kp=2, ki=0.04, kd=0.29)  # same gains as operate.py
 
     ekf, baseline = init_ekf(args.calib_dir)
     # no load_true_map(): there is no map -- phase 0 builds the markers with live SLAM
-    aruco_sensor = ArucoSensor(ekf.robot, marker_length=0.06)
+    aruco_sensor = CorrectedArucoSensor(ekf.robot, marker_length=0.06, enabled=args.dist_correction)
 
     turn_scale = args.turn_scale if args.turn_scale is not None else load_turn_scale()
     if args.turn_scale_fast is not None:
@@ -5803,6 +6423,7 @@ if __name__ == "__main__":
     # landmarks -- an estimate with 10 cm of error would pull the pose the wrong way.
     nav.fruit_mapper = FruitMapper(ekf.robot.camera_matrix, object_dimensions,
                                    expected_labels=search_list, min_sd=args.fruit_min_sd)
+    nav.fruit_mapper.score_labels = sorted(object_dimensions)   # every fruit counts for the object map
     nav.fruit_mapper.target_min_spread_deg = args.target_spread
     nav.fruit_mapper.target_close_dist = args.target_close
     nav.fruit_mapper.target_min_views = max(1, args.target_views)
@@ -5818,10 +6439,38 @@ if __name__ == "__main__":
         sys.exit("Fruit detector not loaded ({}) -- Level 3 cannot map the fruits.".format(e))
     print(f"Planner: {args.planner}" + (f" (grid {args.grid_res} m)" if args.planner == 'astar' else ""))
 
+    nav.log = run_log
+    nav.refit_enabled = not args.no_refit
+    if nav.refit_enabled:
+        import importlib.util
+        if importlib.util.find_spec('scipy') is None:   # solve_pose_graph() needs scipy.optimize
+            nav.refit_enabled = False
+            print("scipy not installed -- marker re-fit after viewpoints is OFF")
+    track_fruit_nodes(nav, nav.fruit_mapper)
+    instrument_mapper(nav.fruit_mapper, run_log)
     sub_index = next_submission_index(args.out_dir)
     print("This attempt saves as {}/slam_auto_{}.txt and objects_auto_{}.txt".format(
         args.out_dir, sub_index, sub_index))
     bounds = planning_bounds(args.edge_margin)
+    run_log.write_json('meta.json', {
+        'started': time.strftime('%Y-%m-%d %H:%M:%S'), 'git': _git_version(), 'script': 'final_demo_l3.py',
+        'args': vars(args), 'search_list': search_list, 'submission_index': sub_index,
+        'calibration': {'turn_scale': nav.turn_scale, 'turn_scale_fast': nav.turn_scale_fast,
+                        'baseline': float(baseline), 'ticks_per_meter': float(nav.ticks_per_meter),
+                        'camera_matrix': np.asarray(ekf.robot.camera_matrix),
+                        'dist_coeffs': np.asarray(ekf.robot.dist_coeffs)},
+        'dist_correction': (None if aruco_sensor.correction is None else
+                            {'file': aruco_sensor.correction_file, 'degree': aruco_sensor.correction[0],
+                             'coeffs_x': aruco_sensor.correction[1], 'coeffs_y': aruco_sensor.correction[2]}),
+        'noise': {'marker_sd_base': getattr(nav, 'marker_sd_base', None),
+                  'marker_sd_per_m': getattr(nav, 'marker_sd_per_m', None),
+                  'innovation_gate': ekf.innovation_gate, 'new_landmark_inflation': ekf.new_landmark_inflation,
+                  'turn_noise_frac': nav.turn_noise_frac, 'drive_noise_frac': nav.drive_noise_frac,
+                  'vision_prior_sd': nav.vision_prior_sd, 'converge_pos_sd': nav.converge_pos_sd,
+                  'converge_ang_sd': nav.converge_ang_sd, 'robot_pos_var_floor': ekf.robot_pos_var_floor,
+                  'robot_theta_var_floor': ekf.robot_theta_var_floor},
+    })
+    compare_result = None
 
     display = None
     try:
@@ -5830,10 +6479,15 @@ if __name__ == "__main__":
                                 object_radii=path_planner.load_object_radii(),
                                 compare_map=args.compare_map or '')
             nav.display = display
-        # No setup phase and no ENTER: hands off the keyboard once the script
-        # starts. The robot must already be at the centre, square to a wall.
+        instrument_display(nav.display, run_log)
+        # One ENTER starts the run (window: ENTER/SPACE; --no-display: the
+        # terminal), then hands off the keyboard. The robot must already be
+        # at the centre, square to a wall. The run clock starts on that key.
+        print("\nReady: robot at the centre, square to a wall. Press ENTER to start.")
+        nav.display.wait_for_key("Press ENTER to start the run")
         nav.display.start_timer()
 
+        run_log.set_phase('phase0')
         map_markers(nav, bounds, step=np.deg2rad(args.p0_step), frames=args.p0_frames,
                     overlap=np.deg2rad(args.p0_overlap), marker_sd_ok=args.p0_marker_sd,
                     n_expected=args.p0_markers, max_viewpoints=args.p0_viewpoints, ring=args.p0_ring,
@@ -5842,6 +6496,7 @@ if __name__ == "__main__":
         lock_marker_map(nav)
         save_submission(nav, args.out_dir, sub_index)   # markers on disk now, in case the run dies later
 
+        run_log.set_phase('level3')
         run_level3(nav, search_list, nav.markers_live, nav.fruit_mapper,
                    planner=args.planner, grid_resolution=args.grid_res,
                    max_leg_length=args.max_leg, safety_margin=args.safety_margin,
@@ -5858,15 +6513,20 @@ if __name__ == "__main__":
             display.finish("Run finished. ESC to exit")
     except (M3Abort, KeyboardInterrupt):
         print("Stopped by user.")
+        run_log.event('stopped_by_user')
+    except Exception as e:
+        run_log.event('crash', error=repr(e))
+        raise
     finally:
         botconnect.stop()
+        run_log.set_phase('end')
         # Always leave this attempt's files behind, however the run ended.
         try:
             save_submission(nav, args.out_dir, sub_index)
         except Exception as e:
             print("Could not save the submission files: {}".format(e))
         if args.compare_map:
-            report_against_truth(nav, args.compare_map)
+            compare_result = report_against_truth(nav, args.compare_map)
         if 'nav' in dir() and nav.face_residuals:
             r = np.array(nav.face_residuals)
             print("direction planning: turn left before the next leg after {} re-localisation(s) -- median {:.0f} deg, "
@@ -5880,6 +6540,26 @@ if __name__ == "__main__":
                   "To keep it: --turn-scale-fast {:.3f}, or write it to {}".format(
                       nav.turn_scale_fast_initial, nav.turn_scale_fast, nav._turn_scale_fast_samples,
                       nav.turn_scale_fast, TURN_SCALE_FAST_FILE))
+        try:
+            mapper = nav.fruit_mapper
+            fe = mapper.fruit_ekf
+            run_log.write_json('final.json', {
+                'markers': {str(t): xy for t, xy in sorted(nav.marker_positions().items())},
+                'locked_marker_sd': {str(t): v for t, v in nav.locked_marker_sd.items()},
+                'fruits': {l: {'xy': [float(p[0, 0]), float(p[1, 0])], 'sigma': mapper.sigma(l),
+                               'views': fe.n_views(l), 'spread_deg': fe.bearing_spread(l),
+                               'well_mapped': bool(mapper.well_mapped(l))} for l, p in fe.estimates.items()},
+                'phase_times': run_log.phase_times,
+                'laps': getattr(nav.display, 'laps', []),
+                'submission': {'dir': args.out_dir, 'index': sub_index},
+                'turn_scale_learned': {'slow': nav.turn_scale, 'fast': nav.turn_scale_fast},
+                'refits_applied': nav.n_refits,
+                'compare': compare_result,
+            })
+        except Exception as e:
+            print("Could not write final.json: {}".format(e))
+        print("Run log saved in {} -- summarise with: python analyze_run.py {}".format(run_log.dir, run_log.dir))
+        run_log.close()
         if display is not None:
             import pygame
             pygame.quit()
