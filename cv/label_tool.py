@@ -5,15 +5,15 @@ Usage:
     Edit the CONFIG block below, then:  python label_tool.py
 
 Output:
-    real_dataset/images/<name>.jpg
-    real_dataset/labels/<name>.txt   (class cx cy w h, normalised)
+    OUT_DIR/images/<name>.jpg
+    OUT_DIR/labels/<name>.txt   (class cx cy w h, normalised)
 
 Mouse:
     left-drag         draw new box (uses current class)
     left-click        select box under cursor
 Keys:
     0-9               set current class; if a box is selected, change its class
-    c                 cycle selected box's class (quick lime <-> capsicum swap)
+    c                 cycle selected box's class
     d / Delete        delete selected box
     r                 reset image to model predictions
     n / Space         save + next
@@ -28,12 +28,13 @@ import numpy as np
 from ultralytics import YOLO
 
 # ============================ CONFIG ============================
-IMAGES_DIR = "images/new_test"              # folder of raw (unannotated) frames to label
-WEIGHTS = "model/new_best.pt"        # current model, used for pre-labels
-OUT_DIR = "new_test"               # writes OUT_DIR/images and OUT_DIR/labels
-CONF = 0.75                            # pre-label confidence (low on purpose)
-IMGSZ = 480                            # match detector.py inference size
-SCALE = 1.5                            # display scale
+IMAGES_DIR = "images/marker_partial"      # CHANGED: raw frames for ONE session
+WEIGHTS = "model/new_new_best.pt"               # current model, used for pre-labels
+OUT_DIR = "marker_partial/session1"           # CHANGED: one OUT_DIR per session
+CONF = 0.5                                  # CHANGED: lower so fewer fruit are missed
+IMGSZ = 480                                 # match detector.py inference size
+SCALE = 1.5                                 # display scale
+EXTRA_CLASSES = {7: "marker_partial"}       # CHANGED: classes the weights don't know yet
 # ================================================================
 
 EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
@@ -80,8 +81,9 @@ def predict(model, img_bgr, conf, imgsz):
 
 def main():
     model = YOLO(WEIGHTS)
-    names = model.names  # {id: name}
-    nc = len(names)
+    names = dict(model.names)           # CHANGED: copy, then add the new class
+    names.update(EXTRA_CLASSES)         # CHANGED
+    nc = max(names) + 1                 # CHANGED: 8 instead of 7
     print("Classes:", names)
 
     out_img = Path(OUT_DIR) / "images"
@@ -95,7 +97,7 @@ def main():
         return
 
     S = SCALE
-    st = {"boxes": [], "sel": -1, "cls": 0, "start": None, "cur": None}
+    st = {"boxes": [], "sel": -1, "cls": 7, "start": None, "cur": None}  # CHANGED: default draw class = 7
 
     def box_at(x, y):
         hits = [(i, (b[3] - b[1]) * (b[4] - b[2])) for i, b in enumerate(st["boxes"])

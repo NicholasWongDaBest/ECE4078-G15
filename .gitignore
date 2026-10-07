@@ -233,3 +233,20 @@ __marimo__/
 *.json
 lab_output/object_rmse_log.csv
 lab_output/slam_state.json
+
+# ---- exclude all images and datasets ----
+*.jpg
+*.jpeg
+*.bmp
+cv/compare_out/
+cv/images/*
+cv/datasets/**
+!cv/datasets/**/
+
+# keep dataset config so the next chat can see the class layout
+!cv/datasets/merged_v2/merged_split/data.yaml
+!cv/datasets/merged_v2/merged_split/classes.txt
+
+# ---- keep only the new marker_partial data ----
+!cv/images/marker_partial/
+!cv/images/marker_partial/**
