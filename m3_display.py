@@ -417,9 +417,10 @@ class M3Display(_RunClock):
             out[name] = math.hypot(est[name][0] - tx, est[name][1] - ty) if name in est else None
         return out
 
-    def toggle_compare(self):
+    def toggle_compare(self, quiet=False):
         """T: show / hide the true map's fruits. Re-read on every show, so an
-        edited file is picked up. Display only."""
+        edited file is picked up. Display only. quiet: no printout (turning it
+        on at start-up, before anything is mapped)."""
         if self.compare_on:
             self.compare_on = False
             self.notification = "True map hidden"
@@ -437,6 +438,9 @@ class M3Display(_RunClock):
         self.compare_truth = truth
         self.compare_markers = markers
         self.compare_on = True
+        if quiet:
+            self.notification = "True map shown ({}) -- T hides it".format(os.path.basename(self.compare_path))
+            return
         align = self.compare_alignment()
         errors = self.compare_errors(align)
         found = [e for e in errors.values() if e is not None]

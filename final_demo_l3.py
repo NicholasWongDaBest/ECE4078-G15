@@ -541,6 +541,7 @@ class Obstruction:
         self.last_frame = frame           # YOLO frame of the latest sighting
         self._look = pose                 # robot pose of the latest sighting
         self._miss_look = None            # ... and of the latest miss
+        self.rays = []                    # sightings as seen: (X, Y, TH, sd_theta, span lo, hi, range, cut_v)
 
     @property
     def sd_eff(self):
@@ -617,7 +618,8 @@ class ObstructionMap:
         self.min_sightings = min_sightings
         self.expire_frames = expire_frames
         self.items = []
-        self.stats = {'noted': 0, 'sightings': 0, 'by_marker': 0, 'by_fruit': 0, 'not_seen': 0, 'expired': 0}
+        self.stats = {'noted': 0, 'sightings': 0, 'by_marker': 0, 'by_fruit': 0, 'not_seen': 0, 'expired': 0,
+                      'all_mapped': 0}
 
     def confirmed(self):
         """The obstructions the planner uses (min_sightings or more)."""
@@ -631,7 +633,7 @@ class ObstructionMap:
             self.drop(o, 'expired')
         return old
 
-    def add(self, x, y, sd, partial, t, pose=None, frame=0):
+    def add(self, x, y, sd, partial, t, pose=None, frame=0, ray=None):
         """One sighting (from robot pose `pose`, in YOLO frame `frame`).
         @return: (obstruction, True if it is a new one)"""
         sd = max(float(sd), self.sd_floor)
@@ -643,6 +645,8 @@ class ObstructionMap:
                 best = (d, o)
         if best is None:
             o = Obstruction(x, y, sd, partial, t, pose, frame)
+            if ray is not None:
+                o.rays.append(ray)
             self.items.append(o)
             self.stats['noted'] += 1
             return o, True
@@ -663,7 +667,16 @@ class ObstructionMap:
         o.partial = o.partial or bool(partial)
         o.last = t
         o.last_frame = frame
+        if ray is not None and len(o.rays) < 12:
+            o.rays.append(ray)
         return o, False
+
+    def clear(self, why):
+        """Drop every obstruction. @return: how many"""
+        n = len(self.items)
+        for o in list(self.items):
+            self.drop(o, why)
+        return n
 
     def replace_radius(self, sd):
         """How near a mapped marker must be to replace an obstruction (or explain
@@ -698,9 +711,9 @@ class ObstructionMap:
         s = self.stats
         return ("Obstructions (CNN marker blocks no ArUco marker explained): {} noted from {} sightings; "
                 "{} replaced by a marker, {} by a fruit, {} dropped as not seen again, {} seen once and "
-                "forgotten; {} left ({} confirmed)".format(
+                "forgotten, {} cleared once every marker was mapped; {} left ({} confirmed)".format(
                     s['noted'], s['sightings'], s['by_marker'], s['by_fruit'], s['not_seen'], s['expired'],
-                    len(self.items), len(self.confirmed())))
+                    s['all_mapped'], len(self.items), len(self.confirmed())))
 
 
 def _obstructions_in_play(nav):
@@ -1945,6 +1958,10 @@ class Navigator:
             return []
         bboxes, _ = self.detector.detect_single_image(img)
         frame_h, frame_w = img.shape[0], img.shape[1]
+        # what the window's detector panel shows -- every YOLO pass, phase 0's included
+        self._last_detect_img = img
+        self._last_detect_time = time.time()
+        self._n_detect_frames += 1
         # The same YOLO pass found the marker blocks (cv/detector.py keeps them
         # out of the fruit boxes): kept for the obstructions and the look-ahead.
         self._marker_boxes = list(getattr(self.detector, 'last_markers', None) or [])
@@ -2024,9 +2041,6 @@ class Navigator:
         aruco, _ = self.detect_markers(img)
         if self.detector is not None:
             self._last_boxes = self._fruit_boxes(img)
-            self._last_detect_img = img
-            self._last_detect_time = time.time()
-            self._n_detect_frames += 1
         else:
             self._last_boxes = []
         return aruco, self._detect_fruits(img, self._last_boxes)
@@ -2479,6 +2493,17 @@ class Navigator:
         om = self.obstructions
         if om is None or not self.obstructions_enabled:
             return
+        if self._all_markers_mapped():
+            # The arena has exactly that many marker blocks and every one is on the
+            # map: any marker box is one of them (seen from a pose a little off),
+            # never a new block. Nothing more to note, and what is left goes.
+            n = om.clear('all_mapped')
+            if n:
+                print("  all {} markers are mapped -- every marker block is accounted for: {} leftover "
+                      "obstruction(s) cleared".format(len(self.valid_tags), n))
+                if self.log is not None:
+                    self.log.event('obstruction', action='cleared_all_mapped', n=n)
+            return
         known = {int(lm.tag) for lm in (aruco or []) if lm.tag in self.ekf.taglist and int(lm.tag) < FRUIT_TAG_BASE}
         diag = [d for d in (self.ekf.last_diagnostics or []) if d.get('tag') in known]
         if known and diag and all(d.get('gated') for d in diag):
@@ -2507,7 +2532,8 @@ class Navigator:
             x, y = X + r * math.cos(TH + b), Y + r * math.sin(TH + b)
             if self._explained_by_map(x, y, sd):
                 continue
-            o, new = om.add(x, y, sd, g['partial'], now, pose=(X, Y, TH), frame=self._yolo_frame)
+            o, new = om.add(x, y, sd, g['partial'], now, pose=(X, Y, TH), frame=self._yolo_frame,
+                            ray=(X, Y, TH, sd_t, g['span'][0], g['span'][1], g['range'], g['cut_v']))
             if self.log is not None and new:
                 self.log.event('obstruction', action='noted', id=o.id, xy=[o.x, o.y], sd=o.sd,
                                range=r, partial=g['partial'], cut_v=g['cut_v'])
@@ -2574,6 +2600,27 @@ class Navigator:
                     self.log.event('obstruction', action='dropped', id=o.id, xy=[o.x, o.y], misses=o.misses,
                                    sightings=o.n, looks=o.looks)
 
+    def _all_markers_mapped(self):
+        """Every arena marker (valid_tags) has a mapped position."""
+        pos = self.marker_positions()
+        return bool(self.valid_tags) and all(t in pos for t in self.valid_tags)
+
+    @staticmethod
+    def _ray_explained(ray, mx, my):
+        """Would a marker at (mx, my) have explained this sighting -- inside the
+        box's bearing span (allowing for the heading's sd then) at a range that
+        fits -- had it been on the map when the box was seen?"""
+        X, Y, TH, sd_t, lo, hi, rng, cut_v = ray
+        c, sn = math.cos(TH), math.sin(TH)
+        a_, l_ = c * (mx - X) + sn * (my - Y), -sn * (mx - X) + c * (my - Y)
+        if a_ <= 0.05:
+            return False
+        b, r = math.atan2(l_, a_), math.hypot(a_, l_)
+        tol = math.radians(3.0) + 2.0 * sd_t
+        if not (lo - tol <= b <= hi + tol):
+            return False
+        return r <= rng + 0.15 if cut_v else abs(r - rng) <= max(0.25, 0.3 * r)
+
     def _replace_obstructions(self):
         """A marker mapped near an obstruction (ObstructionMap.replace_radius),
         or a fruit within replace_fruit, is what it was: the obstruction goes,
@@ -2589,7 +2636,9 @@ class Navigator:
         for what, (px, py), radius, why in found:
             for o in list(om.items):
                 d = math.hypot(o.x - px, o.y - py)
-                if d > (om.replace_radius(o.sd_eff) if radius is None else radius):
+                if d > (om.replace_radius(o.sd_eff) if radius is None else radius) and not (
+                        radius is None and o.rays and d <= 2.0 * om.replace_marker_max
+                        and all(self._ray_explained(ray, px, py) for ray in o.rays)):
                     continue
                 om.drop(o, why)
                 if o.n >= om.min_sightings:
@@ -7433,9 +7482,12 @@ if __name__ == "__main__":
     parser.add_argument("--one-marker-no-range", action="store_true",
                          help="a one-marker heading fix leaves x, y completely alone (by default the marker's "
                               "range still corrects the position along the line of sight to it)")
-    parser.add_argument("--compare-map", type=str, default=None,
-                         help="REHEARSAL ONLY: a known map (truemap.txt) to score the run against at the end and "
-                              "for T in the window -- never used by the robot. Leave unset at the demo")
+    parser.add_argument("--compare-map", type=str, default='truemap.txt',
+                         help="a known map to compare against: shown in the window from the start (T hides / "
+                              "shows it) and scored at the end -- display and report only, never used by the "
+                              "robot. Skipped if the file isn't there")
+    parser.add_argument("--no-compare", action="store_true",
+                         help="no true-map comparison (window and end-of-run report)")
     parser.add_argument("--looks-on-the-way", type=int, default=2,
                          help="Level 3: fruit looks allowed per viewpoint drive from the relocalised stops on the "
                               "way (a fruit still needing work, in range and at a new bearing); 0 turns it off")
@@ -7516,6 +7568,13 @@ if __name__ == "__main__":
     parser.add_argument("--target-close", type=float, default=0.90,
                          help="Level 3: ...and has been seen from at least this close, m; 99 = no such requirement")
     args, _ = parser.parse_known_args()
+    if args.no_compare or not args.compare_map or not os.path.isfile(args.compare_map):
+        if args.compare_map and not args.no_compare:
+            print("True map for comparison: {} not found -- no comparison".format(args.compare_map))
+        args.compare_map = None
+    else:
+        print("True map for comparison: {} (window + end-of-run report only, never used by the robot; "
+              "--no-compare turns it off)".format(args.compare_map))
 
     run_log = RunLog(args.log_dir)
     run_log.tee_stdout()
@@ -7662,6 +7721,8 @@ if __name__ == "__main__":
                                 object_radii=path_planner.load_object_radii(),
                                 compare_map=args.compare_map or '')
             nav.display = display
+            if args.compare_map:
+                display.toggle_compare(quiet=True)   # true map on from the start (T toggles it)
         instrument_display(nav.display, run_log)
         # One ENTER starts the run (window: ENTER/SPACE; --no-display: the
         # terminal), then hands off the keyboard. The robot must already be
