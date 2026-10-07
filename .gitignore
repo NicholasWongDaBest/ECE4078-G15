@@ -251,3 +251,5 @@ cv/datasets/**
 # ---- keep only the new marker_partial data ----
 !cv/images/marker_partial/
 !cv/images/marker_partial/**
+
+!cv/marker/**
