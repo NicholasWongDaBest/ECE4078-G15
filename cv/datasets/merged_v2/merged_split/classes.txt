@@ -1,0 +1,8 @@
+capsicum
+greenapple
+lemon
+lime
+mango
+orange
+redapple
+marker_partial
