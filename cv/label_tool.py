@@ -28,13 +28,13 @@ import numpy as np
 from ultralytics import YOLO
 
 # ============================ CONFIG ============================
-IMAGES_DIR = "images/marker_partial"      # CHANGED: raw frames for ONE session
+IMAGES_DIR = "images/marker"      # CHANGED: raw frames for ONE session
 WEIGHTS = "model/new_new_best.pt"               # current model, used for pre-labels
-OUT_DIR = "marker_partial/session1"           # CHANGED: one OUT_DIR per session
+OUT_DIR = "marker/session1"           # CHANGED: one OUT_DIR per session
 CONF = 0.5                                  # CHANGED: lower so fewer fruit are missed
 IMGSZ = 480                                 # match detector.py inference size
 SCALE = 1.5                                 # display scale
-EXTRA_CLASSES = {7: "marker_partial"}       # CHANGED: classes the weights don't know yet
+EXTRA_CLASSES = {7: "marker"}       # CHANGED: classes the weights don't know yet
 # ================================================================
 
 EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
