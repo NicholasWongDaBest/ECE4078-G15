@@ -560,6 +560,8 @@ class Operate:
     # so both stash obj_detector_output identically.
     def _run_object_detector(self):
         bboxes, self.cv_vis = self.obj_detector.detect_single_image(self.img)
+        markers = self.obj_detector.last_markers
+        too_close = any(m["partial"] for m in markers)
         self.obj_detector_output = (self.cv_vis, self.ekf.robot.state.tolist(), bboxes) # three things to be saved
         return len(set([box[0] for box in bboxes]))
 
@@ -1157,7 +1159,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.
     parser.add_argument("--calib_dir", type=str, default="calibration/param/") # calibration directory
-    parser.add_argument("--yolo_path", default='cv/model/yolo26n.pt') # directory for your trained AI model
+    parser.add_argument("--yolo_path", default='cv/model/best_best.pt') # directory for your trained AI model
     parser.add_argument("--truemap", type=str, default='truemap.txt', help="ground-truth map for live RMSE practice tracking (optional)")
     parser.add_argument("--no-faces", action="store_true",
                         help="old marker readings (face centres) -- then navigate this map with "
@@ -1210,4 +1212,4 @@ if __name__ == "__main__":
         operate.save_result()
         operate.detect_object()
         operate.draw(canvas)
-        pygame.display.update()
+        pygame.display.update()

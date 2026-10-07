@@ -1,50 +1,27 @@
-"""
-merge_labeled_batches.py - merge multiple label_tool.py output folders (each
-with images/ + labels/, each independently starting img_0) into one combined
-labeled pool, renaming to avoid collisions while keeping image/label pairs
-matched.
-
-Edit BATCHES below, then: python merge_labeled_batches.py
-"""
 import shutil
 from pathlib import Path
 
-# ============================ CONFIG ============================
-# (prefix, source_dir) - source_dir must contain images/ and labels/
-BATCHES = [
-    ("batch1", "datasets/real/real_dataset"),   # your original ~102 images
-    ("batch2", "datasets/half/half_dataset"),       # your new ~40 partial-occlusion images
-]
-OUT_DIR = "datasets/merged/merged_dataset"
-# ================================================================
-
+SPLIT = Path("datasets/merged_v2/merged_split")
+SYN = SPLIT / "synthetic" / "train"
 EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
+n = 0
+for img in sorted((SYN / "images").iterdir()):
+    if img.suffix.lower() not in EXTS:
+        continue
+    lbl = SYN / "labels" / f"{img.stem}.txt"
+    if not lbl.exists():
+        print("no label, skipping:", img.name); continue
+    new = f"synth_{img.stem}"
+    dst_img = SPLIT / "images" / "train" / f"{new}{img.suffix}"
+    if dst_img.exists():
+        print("already exists, skipping:", dst_img.name); continue
+    shutil.copy(img, dst_img)
+    shutil.copy(lbl, SPLIT / "labels" / "train" / f"{new}.txt")
+    n += 1
+print("copied", n)
 
-def main():
-    out_img = Path(OUT_DIR) / "images"
-    out_lbl = Path(OUT_DIR) / "labels"
-    out_img.mkdir(parents=True, exist_ok=True)
-    out_lbl.mkdir(parents=True, exist_ok=True)
-
-    total = 0
-    for prefix, src in BATCHES:
-        src_img = Path(src) / "images"
-        src_lbl = Path(src) / "labels"
-        files = sorted(f for f in src_img.iterdir() if f.suffix.lower() in EXTS)
-        for f in files:
-            new_stem = f"{prefix}_{f.stem}"          # e.g. batch1_img_0
-            shutil.copy(f, out_img / f"{new_stem}{f.suffix}")
-            lp = src_lbl / (f.stem + ".txt")
-            if lp.exists():
-                shutil.copy(lp, out_lbl / f"{new_stem}.txt")
-            else:
-                print(f"WARNING: no label for {f.name} in {src}")
-            total += 1
-        print(f"{prefix}: {len(files)} images copied from {src}")
-
-    print(f"Merged {total} images into {OUT_DIR}")
-
-
-if __name__ == "__main__":
-    main()
+ids = set()
+for f in (SPLIT / "labels" / "train").glob("synth_*.txt"):
+    ids |= {int(l.split()[0]) for l in f.read_text().splitlines() if l.strip()}
+print("class ids in synthetic labels:", sorted(ids))   # expect only 0-6

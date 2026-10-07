@@ -28,13 +28,14 @@ import numpy as np
 from ultralytics import YOLO
 
 # ============================ CONFIG ============================
-IMAGES_DIR = "images/marker"      # CHANGED: raw frames for ONE session
+IMAGES_DIR = "datasets/review/images"      # CHANGED: raw frames for ONE session
 WEIGHTS = "model/new_new_best.pt"               # current model, used for pre-labels
-OUT_DIR = "marker/session1"           # CHANGED: one OUT_DIR per session
+OUT_DIR = "datasets/review"           # CHANGED: one OUT_DIR per session
 CONF = 0.5                                  # CHANGED: lower so fewer fruit are missed
 IMGSZ = 480                                 # match detector.py inference size
 SCALE = 1.5                                 # display scale
-EXTRA_CLASSES = {7: "marker"}       # CHANGED: classes the weights don't know yet
+NAMES = {0: "capsicum", 1: "greenapple", 2: "lemon", 3: "lime",
+         4: "mango", 5: "orange", 6: "redapple", 7: "marker"}
 # ================================================================
 
 EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
@@ -81,9 +82,8 @@ def predict(model, img_bgr, conf, imgsz):
 
 def main():
     model = YOLO(WEIGHTS)
-    names = dict(model.names)           # CHANGED: copy, then add the new class
-    names.update(EXTRA_CLASSES)         # CHANGED
-    nc = max(names) + 1                 # CHANGED: 8 instead of 7
+    names = NAMES
+    nc = len(names)
     print("Classes:", names)
 
     out_img = Path(OUT_DIR) / "images"

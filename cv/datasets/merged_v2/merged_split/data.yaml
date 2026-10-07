@@ -1,4 +1,4 @@
-train: ["images/train", "synthetic/train/images", "partial/images/train"]
+train: "images/train"
 val: images/val
 nc: 8
 names:
