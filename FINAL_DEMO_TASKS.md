@@ -86,6 +86,7 @@ Status key: `[ ]` todo · `[~]` in progress · `[x]` done · `[?]` needs verific
 - [x] D3. Make sure the search-list order is used as given: no hand-picked order. `search_list.txt` is used as is; the order is automatic (`optimise_order`), or `--keep-order`.
 - [x] D4. Bounds for an offset map in L3. Decided: the robot starts at the centre, square to a wall. The map frame is the start pose, so the existing ±1.25 m bounds hold. **Placement matters.**
 - [?] D5. Full Level 3 rehearsal: mapping score plus at least 2 objects reached.
+- [?] D6. ArUco faces in `final_demo_l3.py`: heading from the marker faces in phase 0, after the lock and in the re-fit (see the Log). Simulation only so far: needs a real run. Check first that the blocks sit square to the arena.
 
 ### E. Robustness and safety (all levels)
 - [ ] E1. Collision margins: check `--safety-margin`, `--fruit-margin` and `--clearance` against the measured robot footprint.
@@ -180,3 +181,13 @@ Status key: `[ ]` todo · `[~]` in progress · `[x]` done · `[?]` needs verific
   - Cause: the fruit re-solve gave each sighting its own graph node, linked by commanded moves. Pan sightings are handed over after the pan, so that link included the rest of the pan, and the camera heading came out up to 20 degrees wrong. The re-solve then moved capsicum 29 cm away from its sightings.
   - Fix: each sighting is attached to its nearest marker node through the filter's own pose offset.
   - Replay of 4 runs: fruit mean 4.2 / 4.1 / 3.1 / 5.0 cm (was 3.6 / 4.5 / 3.0 / 7.7). Capsicum on the latest run: 29.8 -> 5.9 cm.
+- 2026-10-07: ArUco faces in `final_demo_l3.py` (`slam/aruco_faces.py`, ported from the M3 branch; `--no-faces` turns all of it off):
+  - Every block sits square to the arena, so a face's direction is a heading measurement that needs no map. Readings also become block centres (the face is half a block in front of the centre the marked map holds).
+  - Phase 0: each frame's face heading is fused BEFORE the marker update, so new markers are placed with the corrected heading instead of the drifted one. The start heading gets +/-3 deg (`--start-heading-sd`), so the faces also square the map to the arena when the robot was placed a few degrees off (arena axes at 0 in the start frame, `--arena-axes`).
+  - The same readings teach turn_scale from the first sweep on (only frames whose face picks don't depend on the heading estimate; at most 15% per sample).
+  - A big face correction (over 3 sd and 6 deg) waits until another block agrees, then gets through even if the filter was too sure of its heading. Heading from faces switches itself off if more than half of 40+ frames disagree (blocks not square).
+  - After the lock: faces fused after each update. Pan / scan / refine / arrival lines end with `| faces ...`.
+  - Re-fit: every usable face reading is a heading residual (`solve_pose_graph(faces=...)`, with a small tilt per block), so the re-fitted poses, and the fruits re-solved through them, carry the faces' heading. Positions not tied to a node now move with the markers' rigid change (the nodes of a sweep on the spot give no usable rotation).
+  - `m3_display.py` reads markers through `Navigator.detect_markers()`. `slam/aruco_sensor.py` only adds face data when given a faces config, so `operate.py` and `auto_fruit_search.py` behave exactly as before. `slam/ekf.py` untouched.
+  - Run log: `frame` events carry `faces` (measurement, sd, innovation, fused / held / rejected); `phase0_faces` after each sweep; `faces_off` if the guard trips; meta.json has the faces settings.
+  - Sim (fake faces; slow turns 12% short, fast 5% long; 30 seeds, current code vs faces): marker map 7.7 -> 0.7 cm aligned RMSE, fruits 11.3 -> 1.3 cm, heading error at drives 14 -> 3.8 deg, map rotation vs arena 10 -> 0.3 deg, parks 3.6 -> 4 of 4. The current code does worse in this sim than on the robot (some runs lose 30+ deg in phase 0), so read these as relative. Robot placed 4 deg off: map lined up with the arena to 0.4 deg. Blocks turned ~8 deg each: still 0.9 cm / 3.3 cm.

@@ -589,7 +589,10 @@ class M3Display(_RunClock):
 
     def _sense(self):
         img = self.nav.botconnect.get_image()
-        measurement, aruco_img = self.nav.aruco_sensor.detect_marker_positions(img)
+        # Through the navigator when it has detect_markers() (final_demo_l3.py), so
+        # the window measures markers exactly as the run does (ArUco faces: block centres).
+        detect = getattr(self.nav, 'detect_markers', None) or self.nav.aruco_sensor.detect_marker_positions
+        measurement, aruco_img = detect(img)
         self.cam_img = aruco_img if aruco_img is not None else img
         self.last_measurement = measurement
         self.visible_tags = sorted({int(lm.tag) for lm in measurement if lm.tag in self.ekf.taglist})

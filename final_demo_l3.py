@@ -24,6 +24,21 @@
 # The map frame is the start pose: place the robot at the arena centre,
 # square to a wall, so the +-1.25 m planning bounds line up with the tape.
 #
+# ArUco faces (slam/aruco_faces.py; --no-faces turns all of it off). Every
+# block sits square to the arena, so the direction its face points is a
+# HEADING measurement, independent of the map, and the face centre is half a
+# block in front of the block centre the marked map holds:
+#   * readings become block centres (Navigator.detect_markers);
+#   * phase 0 fuses each frame's face heading BEFORE the marker update, so new
+#     markers are placed with the corrected heading and the sweep's turn drift
+#     (8-12 deg on the logged runs) never builds up in the map; the start
+#     heading gets --start-heading-sd of uncertainty so the faces also correct
+#     how squarely the robot was placed (the map then lines up with the arena);
+#   * after the lock, faces are fused after each update (Navigator._fold_in_faces);
+#   * every face reading is a heading residual in the re-fit (solve_pose_graph),
+#     so the re-fitted poses -- and the fruits re-solved through them -- carry
+#     the faces' heading, not the commanded turns'.
+#
 # Usage: python final_demo_l3.py --ip <robot-ip>
 import os
 import sys
@@ -45,6 +60,7 @@ from slam.ekf import (EKF, DriveMeasurement, FruitEKF, in_frame_fraction, is_box
 from object_pose_est import estimate_pose
 from slam.robot import Robot
 from slam.aruco_sensor import ArucoSensor, Marker
+from slam import aruco_faces
 
 # Pseudo tag ids for fruit landmarks in the EKF's frozen map -- real ArUco
 # markers are 1..10, fruits get FRUIT_TAG_BASE + index. See
@@ -67,12 +83,20 @@ class CorrectedArucoSensor(ArucoSensor):
     marker that much too close to wherever the robot stood when it saw it.
     Kept here, not in slam/aruco_sensor.py, so operate.py is untouched.
     Each Marker keeps its uncorrected reading as .raw_position (for the run log).
+
+    With ArUco faces on (faces_config), the polynomial is NOT applied here:
+    the faces corrector applies it itself, to each raw face reading, before
+    moving it to the block centre (aruco_faces.MarkerCorrector._centre) --
+    main() hands it the same file. Here it would be applied twice.
     """
 
-    def __init__(self, robot, marker_length=0.06, correction_file=DIST_CORRECTION_FILE, enabled=True):
-        super().__init__(robot, marker_length=marker_length)
+    def __init__(self, robot, marker_length=0.06, correction_file=DIST_CORRECTION_FILE, enabled=True,
+                 faces_config=None):
+        super().__init__(robot, marker_length=marker_length, faces_config=faces_config)
         self.correction = None
         self.correction_file = correction_file
+        if getattr(self, 'faces_on', False):
+            return   # the faces corrector applies the polynomial (if any) -- see above
         if not enabled:
             print("Marker distance correction: OFF (default; --dist-correction turns it on)")
             return
@@ -213,7 +237,8 @@ def _fit_rigid_2d(a, b):
     return R, mu_b - R @ mu_a, th
 
 
-def solve_pose_graph(poses0, edges, readings, sd_depth=(0.03, 0.02), sd_side=(0.02, 0.01), max_nfev=100):
+def solve_pose_graph(poses0, edges, readings, sd_depth=(0.03, 0.02), sd_side=(0.02, 0.01), max_nfev=100,
+                     faces=None, axes=0.0, block_sd=np.deg2rad(2.0), start_theta=0.0, start_sd=np.deg2rad(3.0)):
     """
     Least-squares re-fit of every marker AND every past robot pose at once,
     from all the marker readings and the commanded moves between them.
@@ -232,6 +257,19 @@ def solve_pose_graph(poses0, edges, readings, sd_depth=(0.03, 0.02), sd_side=(0.
     Node 0 is held where it is, so the map stays in the start frame (the
     arena frame the planning bounds are drawn in). Robust (soft-L1) loss:
     a few bad readings cannot drag the fit.
+
+    faces (ArUco faces, optional): [(node, tag, phi, sd)] -- a block face seen
+    pointing phi (rad, robot frame) from that node. Every block sits square to
+    the arena, so theta_node + phi lies on an arena axis: the residual is its
+    distance to the NEAREST axis (axes + k*90 deg), over sd. That pins every
+    node's heading to the arena, whatever the turns in between did. Each block
+    gets its own small tilt (an unknown, prior sd block_sd), shared by all its
+    readings, so one block that sits a little crooked is not averaged into the
+    headings frame after frame. axes: the arena axes' angle in the map frame
+    (rad), or None to estimate it too. With faces and fixed axes, node 0's
+    heading is not held exactly but has a prior (start_theta, start_sd) --
+    how squarely the robot was placed -- so the faces can turn the map onto
+    the arena; its x, y stay held.
     @return: (markers {tag: (x, y)}, poses (N, 3), info dict)
     """
     from scipy.optimize import least_squares
@@ -241,6 +279,20 @@ def solve_pose_graph(poses0, edges, readings, sd_depth=(0.03, 0.02), sd_side=(0.
     tags = sorted({r[1] for r in readings})
     ti = {t: i for i, t in enumerate(tags)}
     M = len(tags)
+    faces = [fc for fc in (faces or []) if 0 <= fc[0] < N]
+    F = len(faces)
+    if F:
+        btags = sorted({fc[1] for fc in faces})
+        bi = {t: i for i, t in enumerate(btags)}
+        B = len(btags)
+        f_node = np.array([fc[0] for fc in faces], dtype=int)
+        f_blk = np.array([bi[fc[1]] for fc in faces], dtype=int)
+        f_phi = np.array([fc[2] for fc in faces], dtype=float)
+        f_sd = np.array([max(fc[3], 1e-3) for fc in faces], dtype=float)
+        free_axes = axes is None
+    else:
+        B, free_axes = 0, False
+    n_extra = B + (1 if free_axes else 0)    # block tilts [, arena axes]
     r_node = np.array([r[0] for r in readings]); r_tag = np.array([ti[r[1]] for r in readings])
     Z = np.array([[r[2], r[3]] for r in readings], dtype=float)
     rng = np.hypot(Z[:, 0], Z[:, 1])
@@ -258,10 +310,14 @@ def solve_pose_graph(poses0, edges, readings, sd_depth=(0.03, 0.02), sd_side=(0.
     Ei, Ej = E[:, 0].astype(int), E[:, 1].astype(int)
     anchor = poses0[0].copy()
     wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
+    wrap_q = lambda a: (a + np.pi / 4) % (np.pi / 2) - np.pi / 4    # distance to the nearest of 4 axes
+    # node 0's heading: held exactly, unless faces with fixed axes may turn the map onto the arena
+    theta_prior = F > 0 and not free_axes
+    n_pose = 3 * N + 2 * M                   # unknowns before the face extras
 
     def fun(v):
         P = v[:3 * N].reshape(N, 3)
-        Mk = v[3 * N:].reshape(M, 2)
+        Mk = v[3 * N:n_pose].reshape(M, 2)
         p, m = P[r_node], Mk[r_tag]
         dx, dy = m[:, 0] - p[:, 0], m[:, 1] - p[:, 1]
         c, s_ = np.cos(p[:, 2]), np.sin(p[:, 2])
@@ -271,10 +327,20 @@ def solve_pose_graph(poses0, edges, readings, sd_depth=(0.03, 0.02), sd_side=(0.
         ddx, ddy = b[:, 0] - a[:, 0], b[:, 1] - a[:, 1]
         r2 = np.concatenate([(ca * ddx + sa * ddy - E[:, 2]) / Esd[:, 0], (-sa * ddx + ca * ddy - E[:, 3]) / Esd[:, 0],
                              wrap(b[:, 2] - a[:, 2] - E[:, 4]) / Esd[:, 1]])
-        return np.concatenate([r1, r2, (P[0] - anchor) * 1000.0])
+        if theta_prior:
+            r3 = np.array([(P[0, 0] - anchor[0]) * 1000.0, (P[0, 1] - anchor[1]) * 1000.0,
+                           wrap(P[0, 2] - start_theta) / start_sd])
+        else:
+            r3 = (P[0] - anchor) * 1000.0
+        if not F:
+            return np.concatenate([r1, r2, r3])
+        tilt = v[n_pose:n_pose + B]
+        ax = v[n_pose + B] if free_axes else axes
+        r4 = wrap_q(P[f_node, 2] + f_phi - ax - tilt[f_blk]) / f_sd
+        return np.concatenate([r1, r2, r3, r4, tilt / block_sd])
 
     nr, ne = len(readings), len(Ei)
-    J = lil_matrix((2 * nr + 3 * ne + 3, 3 * N + 2 * M), dtype=int)
+    J = lil_matrix((2 * nr + 3 * ne + 3 + F + B, n_pose + n_extra), dtype=int)
     for i in range(nr):
         k, j = r_node[i], r_tag[i]
         for row in (i, i + nr):
@@ -285,15 +351,34 @@ def solve_pose_graph(poses0, edges, readings, sd_depth=(0.03, 0.02), sd_side=(0.
             row = 2 * nr + q * ne + e
             J[row, 3 * Ei[e]:3 * Ei[e] + 3] = 1
             J[row, 3 * Ej[e]:3 * Ej[e] + 3] = 1
-    J[2 * nr + 3 * ne:, 0:3] = 1
-    x0 = np.concatenate([poses0.ravel(), m0.ravel()])
+    J[2 * nr + 3 * ne:2 * nr + 3 * ne + 3, 0:3] = 1
+    row0 = 2 * nr + 3 * ne + 3
+    for i in range(F):
+        J[row0 + i, 3 * f_node[i] + 2] = 1
+        J[row0 + i, n_pose + f_blk[i]] = 1
+        if free_axes:
+            J[row0 + i, n_pose + B] = 1
+    for b_ in range(B):
+        J[row0 + F + b_, n_pose + b_] = 1
+    x0 = np.concatenate([poses0.ravel(), m0.ravel(), np.zeros(n_extra)])
+    if free_axes:
+        # start the axes where the starting poses put the faces
+        x0[-1] = math.atan2(float(np.mean(np.sin(4 * (poses0[f_node, 2] + f_phi)))),
+                            float(np.mean(np.cos(4 * (poses0[f_node, 2] + f_phi))))) / 4
     res = least_squares(fun, x0, jac_sparsity=J, loss='soft_l1', f_scale=2.0, x_scale='jac', max_nfev=max_nfev)
     P = res.x[:3 * N].reshape(N, 3)
     P[:, 2] = wrap(P[:, 2])
-    Mk = res.x[3 * N:].reshape(M, 2)
+    Mk = res.x[3 * N:n_pose].reshape(M, 2)
     r = res.fun[:2 * nr]
     info = {'success': bool(res.success), 'nfev': int(res.nfev), 'cost': float(res.cost),
             'reading_resid_median': float(np.median(np.hypot(r[:nr], r[nr:]))), 'nodes': N, 'readings': nr}
+    if F:
+        rf = res.fun[row0:row0 + F] * f_sd                     # face residuals, rad
+        tilt = res.x[n_pose:n_pose + B]
+        info.update(faces=F, face_resid_median_deg=float(np.degrees(np.median(np.abs(rf)))),
+                    block_tilt_max_deg=float(np.degrees(np.max(np.abs(tilt)))),
+                    axes_deg=float(np.degrees(res.x[n_pose + B] if free_axes else axes)),
+                    start_theta_deg=float(np.degrees(P[0, 2])))
     return {t: (float(Mk[ti[t], 0]), float(Mk[ti[t], 1])) for t in tags}, P, info
 
 
@@ -1087,6 +1172,32 @@ class Navigator:
         self.botconnect = botconnect
         self.ekf = ekf
         self.aruco_sensor = aruco_sensor
+        # ArUco faces (slam/aruco_faces.py): marker readings become BLOCK centres,
+        # and each face's direction is a heading measurement. None (a sensor
+        # without face info, or --no-faces) = the old behaviour everywhere.
+        faces_cfg = getattr(aruco_sensor, 'faces_cfg', None)
+        self.marker_corrector = (aruco_faces.MarkerCorrector(faces_cfg, program='final demo')
+                                 if faces_cfg is not None and faces_cfg.get('faces', True) else None)
+        self.face_heading = self.marker_corrector is not None and self.marker_corrector.heading
+        # Phase 0 (live SLAM): fuse each frame's face heading BEFORE the marker
+        # update, so a new marker is placed with the corrected heading.
+        self.face_heading_live = True
+        # Every usable face reading also goes into the re-fit's pose graph as a
+        # heading residual (solve_pose_graph(): faces=...).
+        self.refit_faces = True
+        # Heading uncertainty at the start (rad): how squarely the robot was
+        # placed. Only used with faces on and the arena axes fixed -- it is what
+        # lets the faces turn the map onto the arena's axes. See map_markers().
+        self.start_heading_sd = np.deg2rad(3.0)
+        self._face_acc = {'fused': 0, 'moved': 0.0, 'gated': 0, 'held': 0, 'learned': 0, 'fix': 0}   # for _face_note()
+        self._p0_faces = {'fused': 0, 'gated': 0, 'held': 0, 'moved': 0.0, 'innov': []}   # phase 0, per sweep (map_markers)
+        self._face_frame = None             # last frame's FoldResult (run log)
+        self._rf_start_theta = None         # heading of the re-fit's start node (map_markers)
+        # Step 3: one marker seen at an angle fixes the whole pose (heading from its
+        # face, position from its range and bearing) -- see _try_one_marker_fix().
+        self.one_marker_fix = self.marker_corrector is not None and bool(faces_cfg.get('one_marker_fix', False))
+        self._frame_one_fix = False
+        self._frame_markers_gated = False   # every marker in this frame rejected by the filter
         self.ticks_per_meter = ekf.robot.ticks_per_meter
         # Physical distance between the wheels. baseline.txt stores it as a
         # NEGATIVE number (-0.1386: the calibration formula used the -0.5 wheel
@@ -1423,6 +1534,7 @@ class Navigator:
         self._rf_poses = []          # node -> [x, y, theta], replaced by the fitted values after a re-fit
         self._rf_edges = []          # (i, j, dx, dy, dtheta, sd_xy, sd_theta)
         self._rf_readings = []       # (node, tag, ahead, left)
+        self._rf_faces = []          # (node, tag, face direction in the robot frame rad, its sd rad) -- ArUco faces
         self._rf_pending = []        # commanded moves since the last node: (dtheta, distance, completed)
         self._rf_fruit_nodes = {}    # fruit label -> node indices current when it was fused
         self._rf_fruit_reads = []    # (marker node, offset from it (dx, dy, dth), label, ahead, left)
@@ -1646,12 +1758,32 @@ class Navigator:
             out.append(m)
         return out
 
+    def detect_markers(self, img):
+        """
+        ArUco readings for one frame, the way the whole run uses them: with
+        faces on, BLOCK centres (MarkerCorrector.correct(): each face reading
+        pushed half a block into the block along the face's normal, which is
+        snapped to the arena axis it points along). Phase 0, every later
+        frame and the display all read markers through here.
+        @return: (markers, annotated image)
+        """
+        aruco, aruco_img = self.aruco_sensor.detect_marker_positions(img)
+        if self.marker_corrector is not None and aruco:
+            known = self._localised or self._has_moved
+            theta = float(self.ekf.robot.state[2, 0]) if known else None
+            theta_sd = math.sqrt(max(float(self.ekf.P[2, 2]), 0.0)) if known else None
+            raw = {int(lm.tag): getattr(lm, 'raw_position', lm.position) for lm in aruco}
+            aruco = self.marker_corrector.correct(aruco, theta, theta_sd)
+            for lm in aruco:
+                lm.raw_position = raw.get(int(lm.tag), lm.position)   # the face-centre reading, for the run log
+        return aruco, aruco_img
+
     def _sense(self, img):
         """@return: (aruco_measurements, fruit_measurements) for one frame.
         The gated fruit boxes are kept in _last_boxes for the Level 3 mapper,
         which needs the pose AFTER this frame's marker update -- see
         _apply_measurements()."""
-        aruco, _ = self.aruco_sensor.detect_marker_positions(img)
+        aruco, _ = self.detect_markers(img)
         if self.detector is not None:
             self._last_boxes = self._fruit_boxes(img)
             self._last_detect_img = img
@@ -1754,10 +1886,18 @@ class Navigator:
                 rec['raw'] = np.asarray(raw, dtype=float).reshape(-1)[:2]
             markers.append(rec)
         P = self.ekf.P
+        extra = {}
+        fr = self._face_frame
+        if fr is not None and fr.meas_deg is not None:
+            # this frame's heading from the marker faces (deg, map frame), its sd,
+            # how far it was from the heading before, and whether it was fused
+            extra['faces'] = {'meas': round(fr.meas_deg, 2), 'sd': round(fr.sd_deg, 2),
+                              'innov': round(fr.innov_deg, 2), 'fused': fr.fused, 'gated': fr.gated,
+                              'held': fr.held, 'confirmed': fr.confirmed, 'moved': round(fr.moved_deg, 2)}
         self.log.event('frame', mode=result[0], n_known=result[1], n_fruit=len(fruits or []),
                        slam_live=self.slam_live, markers=markers, pose_before=before,
                        pose_after=self._pose_list(), P_robot=[float(P[0, 0]), float(P[1, 1]), float(P[2, 2])],
-                       diag=(diag if diag is not prev_diag else []))
+                       diag=(diag if diag is not prev_diag else []), **extra)
         return result
 
     def _apply_measurements_core(self, aruco, fruits, allow_anchor=True):
@@ -1781,21 +1921,29 @@ class Navigator:
         @return: ('anchor' | 'update' | 'heading' | 'none', n_aruco_known, n_fruit)
         """
         aruco = self.filter_markers(aruco)
+        self._face_frame = None
         if self.slam_live:
             # Phase 0: plain SLAM, markers move with the robot. Fruits are
             # not fused (they are not EKF landmarks in Level 3).
             n_ar = sum(1 for lm in aruco if lm.tag in self.ekf.taglist)
             self._frame_markers = n_ar
             if aruco:
+                # Heading from the marker faces FIRST: the update below then
+                # starts from a better heading, and add_landmarks() places any
+                # new marker with it -- the turn drift of the sweep never gets
+                # into the map, instead of being pulled out of it afterwards.
+                self._fold_in_faces(aruco, live=True)
                 self.ekf.update(aruco)
                 self.ekf.add_landmarks(aruco)
             return ('update' if n_ar else 'none'), n_ar, 0
         n_ar = sum(1 for lm in aruco if lm.tag in self.ekf.taglist)
         self._frame_markers = sum(1 for lm in aruco if lm.tag in self.ekf.taglist and lm.tag < FRUIT_TAG_BASE)
+        self._frame_markers_gated = False
         if (self.one_marker_heading and self._pos_trusted and n_ar == 1 and self._frame_markers == 1
                 and not fruits):
             lm = next(lm for lm in aruco if lm.tag in self.ekf.taglist)
             if self._heading_from_one_marker(lm):
+                self._fold_in_faces(aruco)
                 self._map_fruits_from_last_frame()
                 self._note_unknown_markers(aruco)   # (this return skips the finally below)
                 return 'heading', 1, 0
@@ -1821,6 +1969,8 @@ class Navigator:
             if n_ar or fruits:
                 measurement = list(aruco) + list(fruits)
                 self.ekf.update(measurement)
+                marker_diag = [d for d in (self.ekf.last_diagnostics or []) if d['tag'] < FRUIT_TAG_BASE]
+                self._frame_markers_gated = bool(marker_diag) and all(d['gated'] for d in marker_diag)
                 if self.gated_recovery:
                     self._recover_if_all_gated(measurement)
                 if self._frame_markers >= 2 and self.pose_converged():
@@ -1828,11 +1978,155 @@ class Navigator:
                 return 'update', n_ar, len(fruits)
             return 'none', 0, 0
         finally:
+            # Heading from the markers' faces first (slam/aruco_faces.py), so
+            # the fruits below are stamped with the best pose this frame gives.
+            self._fold_in_faces(aruco)
             # Only frames that anchored or updated carry a pose worth
             # stamping a fruit with; a frame with no markers is stamped with
             # dead reckoning, which is still the best available.
             self._map_fruits_from_last_frame()
             self._note_unknown_markers(aruco)
+
+    # ------------------------------------------------------------------
+    # ArUco faces (slam/aruco_faces.py)
+    # ------------------------------------------------------------------
+
+    def _fold_in_faces(self, aruco, live=False):
+        """
+        Hand one frame's marker faces to the corrector, which fuses their
+        combined heading as ONE scalar Kalman update over the full state
+        (gated at heading_gate_sigma; a big correction is held until another
+        block agrees -- aruco_faces heading_confirm_*). Every marker in view
+        counts, mapped or not: a face's direction needs no map. A fused reading
+        whose face picks didn't lean on the heading estimate also feeds the
+        turn_scale learner (_learn_turn_scale).
+
+        live=True: phase 0, called BEFORE the frame's marker update (see
+        _apply_measurements_core), and a remembered face may not reset the
+        heading while the map itself is still being built. Otherwise (after the
+        lock) it runs after the update, and is skipped when the filter has just
+        rejected every marker position in the frame: the pose is then badly off
+        (a slipped turn), possibly by more than 45 deg, where snapping a face to
+        the nearest arena axis picks the wrong axis and would push the heading
+        further the wrong way (a remembered face can still reset it).
+        @return: the corrector's FoldResult, or None
+        """
+        gated, self._frame_markers_gated = self._frame_markers_gated, False
+        if self.marker_corrector is None or not aruco:
+            return None
+        markers = [lm for lm in aruco if int(lm.tag) in self.valid_tags]
+        if not markers:
+            return None
+        known = [lm for lm in markers if lm.tag in self.ekf.taglist]
+        fuse = self.face_heading and (self.face_heading_live if live else not gated)
+        res = self.marker_corrector.fold(self.ekf, markers, len(known), fuse=fuse, recover=not live)
+        self._face_frame = res
+        self._frame_one_fix = False
+        if not live and self.one_marker_fix and not res.recovered and not gated and len(known) == 1:
+            self._try_one_marker_fix(known[0])
+        if res.recovered:
+            # A remembered face just reset a badly wrong heading (step 4): whatever
+            # position was worked out under the old heading isn't trusted any more.
+            self._pos_trusted = False
+            self.last_relocalise_converged = False
+        acc = self._face_acc
+        acc['fused'] += res.fused
+        acc['moved'] += res.moved_deg
+        acc['gated'] += res.gated
+        acc['held'] += 1 if res.held else 0
+        acc['learned'] += 1 if res.learned else 0
+        if res.fused and res.heading_free and self.learn_turn_scale and \
+                (self._last_fit_theta is None or abs(self._cmd_rot_since_fit) >= self.learn_min_turn):
+            # The faces measure the heading after every turn, so they also measure
+            # how far each turn really went: the same turn_scale learning the
+            # 2+ marker anchors do, but from phase 0's first sweep on -- where turns
+            # coming up short is exactly what rotated the locked map. Only from
+            # frames whose face picks didn't lean on the heading estimate (a
+            # wrong heading can make the axis rule pick the mirror solution,
+            # and the reading then just repeats the wrong heading).
+            self._learn_turn_scale(math.radians(res.meas_deg), math.radians(res.sd_deg), max_step=0.15)
+        if live and res.meas_deg is not None:
+            p0 = self._p0_faces
+            p0['fused' if res.fused else ('held' if res.held else 'gated')] += 1
+            p0['moved'] += res.moved_deg
+            p0['innov'].append(abs(res.innov_deg))
+        if self.face_heading and (res.fused or res.gated or res.held):
+            problem = self.marker_corrector.squareness_problem()
+            if problem is not None:
+                # Blocks that don't sit square to the arena would bend the heading
+                # (and the map with it): stop using the faces' directions. Block
+                # centres stay (they don't depend on it).
+                self.face_heading = False
+                self.refit_faces = False
+                self._rf_faces = []
+                print("ArUco faces: {} -- heading from faces OFF for the rest of the run".format(problem))
+                if self.log is not None:
+                    self.log.event('faces_off', reason=problem)
+        return res
+
+    def _try_one_marker_fix(self, lm):
+        """
+        Step 3 (opt-in, --one-marker-fix): the whole pose from the ONE known
+        marker in this frame -- heading from its face, position from its range
+        and bearing (MarkerCorrector.one_marker_pose). Applied only when the pose
+        isn't already converged, when the fix's own uncertainty is within the
+        converged limits (a near marker seen at an angle; never a far or face-on
+        one), and when it agrees with the current estimate (Mahalanobis distance,
+        3 DOF, 99%). Replaces the pose like a marker anchor.
+        """
+        if self.pose_converged():
+            return False
+        i = self.ekf.taglist.index(lm.tag)
+        fix = self.marker_corrector.one_marker_pose(self.ekf, lm, self.ekf.markers[:, i])
+        if fix is None:
+            return False
+        state, cov, note = fix
+        if (math.sqrt(cov[0, 0]) > self.converge_pos_sd or math.sqrt(cov[1, 1]) > self.converge_pos_sd
+                or math.sqrt(cov[2, 2]) > self.converge_ang_sd):
+            return False
+        cur = self.ekf.robot.state[:, 0]
+        d = state - cur
+        d[2] = _normalize_angle(d[2])
+        S = self.ekf.P[0:3, 0:3] + cov
+        try:
+            if float(d @ np.linalg.solve(S, d)) > 11.34:
+                return False
+        except np.linalg.LinAlgError:
+            return False
+        self.ekf.robot.state[0, 0], self.ekf.robot.state[1, 0], self.ekf.robot.state[2, 0] = state
+        self.ekf.P[0:3, :] = 0.0
+        self.ekf.P[:, 0:3] = 0.0
+        self.ekf.P[0:3, 0:3] = cov
+        self._pos_trusted = True
+        self._frame_one_fix = True
+        self._face_acc['fix'] += 1
+        return True
+
+    def _face_note(self):
+        """
+        What the marker faces did since the last note, for the end of the
+        per-frame log lines (pan / scan / refine / arrival):
+          'faces -1.3deg (2)'  heading moved by the faces (2 face readings fused)
+          'faces: 1 rejected'  a face disagreed with the pose by > 3 sigma
+          'faces: 1 held ...'  a big correction waiting for another block to agree
+        Empty when the faces did nothing (or are off).
+        """
+        acc = getattr(self, '_face_acc', None)
+        if not acc:
+            return ""
+        parts = []
+        if acc['fused']:
+            parts.append("faces {:+.1f}deg ({})".format(acc['moved'], acc['fused']))
+        if acc['gated']:
+            parts.append("faces: {} rejected".format(acc['gated']))
+        if acc.get('held'):
+            parts.append("faces: {} held until another block agrees".format(acc['held']))
+        if acc['learned'] and not acc['fused']:
+            parts.append("faces: axes")
+        if acc.get('fix'):
+            parts.append("one-marker fix")
+        self._face_acc = {'fused': 0, 'moved': 0.0, 'gated': 0, 'held': 0, 'learned': 0, 'fix': 0}
+        return ("   | " + ", ".join(parts)) if parts else ""
 
     # ------------------------------------------------------------------
     # Final demo: marker map built on the fly
@@ -1888,6 +2182,11 @@ class Navigator:
         for lm in ms:
             f, l = (float(v) for v in np.asarray(lm.position, dtype=float).reshape(-1)[:2])
             self._rf_readings.append((k, int(lm.tag), f, l))
+        if self.refit_faces and self.face_heading:
+            # each usable face: which way it points in the robot frame, and how
+            # well -- a heading residual for this node in the re-fit
+            for f, sd in self.marker_corrector.usable_faces(ms):
+                self._rf_faces.append((k, int(f.tag), math.radians(f.phi), math.radians(sd)))
 
     def record_fruit_sightings(self, boxes, pose):
         """The fruit mapper accepted sightings from this batch: store each box
@@ -1983,7 +2282,8 @@ class Navigator:
         t0 = time.time()
         old_poses = np.array(self._rf_poses, dtype=float)
         try:
-            new_m, new_poses, info = solve_pose_graph(old_poses, self._rf_edges, self._rf_readings)
+            new_m, new_poses, info = solve_pose_graph(old_poses, self._rf_edges, self._rf_readings,
+                                                      **self._refit_face_args())
         except Exception as e:
             print("[refit] failed ({}) -- keeping the current map".format(e))
             self._log_refit(why, False, 'error: {}'.format(e), time.time() - t0)
@@ -2035,8 +2335,15 @@ class Navigator:
             self._log_refit(why, False, reason, dt, info=info)
             return None
 
-        # Overall rigid change of the frame, for positions not tied to a node.
-        R, t, th_g = _fit_rigid_2d(old_poses[:, :2].T, new_poses[:, :2].T)
+        # Overall rigid change of the frame, for positions not tied to a node:
+        # from the markers (spread across the arena) -- the nodes' positions
+        # can all lie within a few cm of each other (a sweep on the spot), and
+        # then their fit's rotation is noise. That matters now that the faces
+        # can turn the whole map a few degrees onto the arena's axes.
+        if len(gate) >= 3:
+            R, t, th_g = Rm, tm, frame_turn
+        else:
+            R, t, th_g = _fit_rigid_2d(old_poses[:, :2].T, new_poses[:, :2].T)
 
         def move_point(xy):
             q = R @ np.array([[float(xy[0])], [float(xy[1])]]) + t
@@ -2071,15 +2378,34 @@ class Navigator:
                 self._add_frozen_marker(tg, xy, 're-fit, {} readings'.format(len(rd)), readings=len(rd))
         self._sync_markers_live()
         self.n_refits += 1
-        print("[refit] {}: {} nodes, {} readings -> map turned {:+.1f} deg; markers moved up to {:.1f} cm "
+        print("[refit] {}: {} nodes, {} readings{} -> map turned {:+.1f} deg; markers moved up to {:.1f} cm "
               "relative to each other (median {:.1f}); robot moved {:.1f} cm / {:+.1f} deg [{:.1f} s]".format(
-                  why, info['nodes'], info['readings'], math.degrees(frame_turn), 100 * max(shape.values()),
+                  why, info['nodes'], info['readings'],
+                  (", {} face headings (median residual {:.1f} deg)".format(info['faces'], info['face_resid_median_deg'])
+                   if info.get('faces') else ""),
+                  math.degrees(frame_turn), 100 * max(shape.values()),
                   100 * float(np.median(list(shape.values()))), 100 * dpos,
                   math.degrees(_normalize_angle(nth - cur[2])), dt))
         self.display.notify("Map re-fitted: markers moved up to {:.0f} cm".format(100 * max(moves.values())))
         self._log_refit(why, True, None, dt, info=info, moves=moves, shape_moves=shape, fruits_resolved=n_resolved,
                         pose_move=[dpos, nth - cur[2]], robot_local=robot_local, markers=new_m, frame_turn=th_g)
         return move_point
+
+    def _refit_face_args(self):
+        """solve_pose_graph()'s ArUco-face arguments: every usable face reading
+        so far (while the faces' heading is in use) and how the arena axes are
+        handled. Node 0 is the start node map_markers() records before the
+        first turn, at heading 0 with start_heading_sd of placement uncertainty."""
+        if not (self.refit_faces and self.face_heading and self._rf_faces):
+            return {}
+        mc = self.marker_corrector
+        fixed = mc.axes.fixed
+        start = getattr(self, '_rf_start_theta', None)
+        return {'faces': self._rf_faces,
+                'axes': None if fixed is None else math.radians(fixed),
+                'block_sd': math.radians(float(mc.cfg['heading_sd_floor_deg'])),
+                'start_theta': start if start is not None else float(self._rf_poses[0][2]),
+                'start_sd': max(float(self.start_heading_sd), np.deg2rad(0.1)) if start is not None else 1e-3}
 
     def _resolve_fruits(self, new_poses):
         """After _move_fruits(): replace each fruit with enough stored
@@ -2373,7 +2699,7 @@ class Navigator:
                   "fixed)".format(math.degrees(k * innov), int(lm.tag)))
         return True
 
-    def _learn_turn_scale(self, theta_fit, fit_sigma):
+    def _learn_turn_scale(self, theta_fit, fit_sigma, max_step=None):
         """
         Compare the rotation the markers say happened since the last marker
         heading with the rotation that was commanded in between, and move
@@ -2386,7 +2712,9 @@ class Navigator:
         across 30), the turn at least learn_min_turn and at most 150 deg
         (unambiguous once wrapped), and a ratio within 0.4-2.5. Anything
         else is discarded, and the current fit only becomes the next
-        bracket's start if it is good.
+        bracket's start if it is good. max_step (ArUco faces' readings): one
+        sample may move the scale's target at most this fraction from the
+        current scale.
         """
         prev, prev_sigma, cmd = self._last_fit_theta, self._last_fit_sigma, self._cmd_rot_since_fit
         cmd_fast = self._cmd_rot_fast_since_fit
@@ -2419,6 +2747,8 @@ class Navigator:
         # The robot turned `measured` for ticks meant to give `cmd`: it needs
         # cmd/measured times as many ticks per radian as it is sending now.
         target = min(2.0, max(0.5, cur * cmd / measured))
+        if max_step is not None:
+            target = min(cur * (1.0 + max_step), max(cur * (1.0 - max_step), target))
         if which == 'fast':
             self._turn_scale_fast_samples += 1
             n = self._turn_scale_fast_samples
@@ -2721,8 +3051,9 @@ class Navigator:
                     if n_prov:
                         status += "; {} placed provisionally".format(n_prov)
             s = self.ekf.robot.state
-            print("  scan {:2d}/{}: hdg {:+6.1f}deg, {} marker(s), fruits {} -> {}".format(
-                k + 1, n_steps, math.degrees(_normalize_angle(float(s[2, 0]))), n_ar_last, labels or "-", status))
+            print("  scan {:2d}/{}: hdg {:+6.1f}deg, {} marker(s), fruits {} -> {}{}".format(
+                k + 1, n_steps, math.degrees(_normalize_angle(float(s[2, 0]))), n_ar_last, labels or "-", status,
+                self._face_note()))
             turned += abs(self.turn(step, noise_frac=self.scan_turn_noise_frac))
         print("  scan: {} stops, {:.0f} deg turned".format(k + 1, math.degrees(turned)))
         if skipped_stops:
@@ -3084,9 +3415,9 @@ class Navigator:
                 self.fruit_mapper.observe_provisional(boxes, (float(s[0, 0]), float(s[1, 0]), float(s[2, 0])),
                                                       (sd_x, sd_y, sd_t))
             s = self.ekf.robot.state
-            print("  [{}] refine {}{:2d}/{}: hdg {:+6.1f}deg, {} marker(s), fruits {} -> {}".format(
+            print("  [{}] refine {}{:2d}/{}: hdg {:+6.1f}deg, {} marker(s), fruits {} -> {}{}".format(
                 name, "back " if sweep == 2 else "", k + 1, n_steps + 1, math.degrees(_normalize_angle(float(s[2, 0]))),
-                n_ar_last, labels or "-", status))
+                n_ar_last, labels or "-", status, self._face_note()))
         if pending and mapped_stops == 0:
             birth = name not in self.fruit_mapper.positions() or self.fruit_mapper.is_provisional(name)
             mapped_stops += self._map_held_sightings(
@@ -3241,13 +3572,14 @@ class Navigator:
             if kind == 'anchor':
                 anchors += 1
             s = self.ekf.robot.state
-            strong = kind == 'anchor' or (n_ar + n_fr) >= 2
+            strong = (kind == 'anchor' or (n_ar + n_fr) >= 2
+                      or self._frame_one_fix)   # one marker + its face: full pose (--one-marker-fix)
             sd_x, sd_y, sd_t, _, _ = self.pose_uncertainty()
             converged = (sd_x <= self.converge_pos_sd and sd_y <= self.converge_pos_sd
                          and sd_t <= self.converge_ang_sd)
-            print("  pan {:+6.1f}deg: {} marker(s) {} fruit(s) -> {:<6s} [{:.3f}, {:.3f}, {:.1f}deg]".format(
+            print("  pan {:+6.1f}deg: {} marker(s) {} fruit(s) -> {:<6s} [{:.3f}, {:.3f}, {:.1f}deg]{}".format(
                 math.degrees(_normalize_angle(float(s[2, 0]))), n_ar, n_fr, kind,
-                s[0, 0], s[1, 0], math.degrees(_normalize_angle(float(s[2, 0])))))
+                s[0, 0], s[1, 0], math.degrees(_normalize_angle(float(s[2, 0]))), self._face_note()))
             if hits >= 2 and (strong or converged) and not full_sweep:
                 # A frame with two landmarks pins x, y AND heading, and a
                 # covariance already under the convergence thresholds means
@@ -3885,8 +4217,8 @@ def drive_to_point(waypoint, nav, max_distance=None, relocalise=True, allow_reve
         nav.drive_forward(distance)
 
     pose = nav.get_robot_pose()
-    print("Arrived near [{:.3f}, {:.3f}] -- pose now [{:.3f}, {:.3f}, {:.1f}deg]".format(
-        waypoint[0], waypoint[1], pose[0], pose[1], math.degrees(_normalize_angle(pose[2]))))
+    print("Arrived near [{:.3f}, {:.3f}] -- pose now [{:.3f}, {:.3f}, {:.1f}deg]{}".format(
+        waypoint[0], waypoint[1], pose[0], pose[1], math.degrees(_normalize_angle(pose[2])), nav._face_note()))
 
     # Pan across the nearest markers and re-anchor before the next leg is
     # planned, so the heading and distance for that leg are computed from a
@@ -4733,8 +5065,8 @@ def _phase0_frames(nav, obstacle_mapper, n_frames, gap=0.08):
     box_frames = []
     for _ in range(max(1, n_frames)):
         img = nav._latest_image()
-        aruco, _ = nav.aruco_sensor.detect_marker_positions(img)
-        nav._apply_measurements(aruco, [], allow_anchor=False)   # slam_live: update + add_landmarks
+        aruco, _ = nav.detect_markers(img)   # block centres with faces on, like every other frame
+        nav._apply_measurements(aruco, [], allow_anchor=False)   # slam_live: faces, update + add_landmarks
         if nav.detector is not None:
             box_frames.append(nav._fruit_boxes(img))
         nav.display.idle(gap)
@@ -4872,6 +5204,22 @@ def map_markers(nav, bounds, step=np.deg2rad(10.0), frames=3, overlap=np.deg2rad
     ekf.redundancy_penalty = 20.0     # EKF default: repeat views from one spot must not buy confidence
     nav.slam_live = True
     nav._localised = True             # no map to fit against: the start pose IS the map frame
+    mc = nav.marker_corrector
+    if mc is not None and nav.face_heading:
+        if mc.axes.fixed is not None and nav.face_heading_live and nav.start_heading_sd > 0:
+            # The start pose defines the map frame, but only as squarely as the
+            # robot was placed. With that much heading uncertainty the faces
+            # (arena axes fixed in this frame) can turn the heading -- and every
+            # marker placed from it -- onto the arena's axes.
+            ekf.P[2, 2] = max(float(ekf.P[2, 2]), float(nav.start_heading_sd) ** 2)
+        if not nav._rf_poses:
+            # The re-fit's start node, before the first turn: its heading prior
+            # (0 +/- start_heading_sd) is what holds the map's rotation besides the faces.
+            nav._new_refit_node(nav._pose_list())
+            nav._rf_start_theta = float(ekf.robot.state[2, 0])
+        print("ArUco faces: heading from faces {} in phase 0; start heading +/-{:.1f} deg; arena axes {}".format(
+            "ON" if nav.face_heading_live else "off", math.degrees(math.sqrt(max(float(ekf.P[2, 2]), 0.0))),
+            "at {:+.1f} deg".format(mc.axes.fixed) if mc.axes.fixed is not None else "learnt"))
     # The fruits seen here go straight into the real fruit map (merged
     # phases): they are obstacles for these drives, and the re-fit right
     # after the lock re-solves them from their stored sightings.
@@ -4887,6 +5235,20 @@ def map_markers(nav, bounds, step=np.deg2rad(10.0), frames=3, overlap=np.deg2rad
         print("  after {}: {} marker(s) placed, {} within {:.0f} cm: {}".format(
             where, len(pos), len(good), marker_sd_ok * 100,
             ", ".join("{}({:.0f}cm)".format(t, 100 * nav.marker_sd(t)) for t in sorted(pos)) or "none"))
+        p0 = nav._p0_faces
+        if p0['innov']:
+            # how much turn drift the faces took out of this sweep (the sum of
+            # their corrections) and how far off the heading was before each one
+            print("    faces: {} frame(s) fused, {} held until another block agreed, {} rejected; heading moved {:+.1f} deg "
+                  "in total (median {:.1f} deg off before each, max {:.1f}); turn_scale now {:.4f}".format(
+                      p0['fused'], p0['held'], p0['gated'], p0['moved'], float(np.median(p0['innov'])),
+                      max(p0['innov']), nav.turn_scale))
+            if nav.log is not None:
+                nav.log.event('phase0_faces', where=where, fused=p0['fused'], held=p0['held'], gated=p0['gated'],
+                              moved_deg=p0['moved'], innov_median=float(np.median(p0['innov'])),
+                              innov_max=max(p0['innov']), turn_scale=nav.turn_scale)
+        nav._p0_faces = {'fused': 0, 'gated': 0, 'held': 0, 'moved': 0.0, 'innov': []}
+        nav._face_note()   # (resets the per-line face notes: phase 0 prints its own summary above)
         return len(good)
 
     _phase0_sweep(nav, obstacle_mapper, step, frames, overlap)
@@ -4952,6 +5314,8 @@ def lock_marker_map(nav):
     nav.slam_live = False
     nav._sync_markers_live()
     nav._pos_trusted = nav.pose_converged()
+    nav._face_note()   # phase 0's face corrections are summarised by map_markers(), not on the next line
+    nav._p0_faces = {'fused': 0, 'gated': 0, 'held': 0, 'moved': 0.0, 'innov': []}
     print("Markers locked: {}".format(", ".join(
         "{} [{:+.2f}, {:+.2f}]".format(t, x, y) for t, (x, y) in sorted(nav.marker_positions().items())) or "none"))
     nav.display.notify("{} markers locked".format(n))
@@ -6406,6 +6770,30 @@ if __name__ == "__main__":
                               "over-corrected, run_logs/20261007-134902)")
     parser.add_argument("--no-refit", action="store_true",
                          help="never re-fit the marker map after a viewpoint (default: re-fit after each one)")
+    parser.add_argument("--no-faces", action="store_true",
+                         help="ArUco faces off: face-centre readings and no heading from the faces (the run as "
+                              "it was before slam/aruco_faces.py)")
+    parser.add_argument("--no-face-heading", action="store_true",
+                         help="keep block-centre readings, but never use the faces' directions as a heading "
+                              "(not in phase 0, not after the lock, not in the re-fit)")
+    parser.add_argument("--no-refit-faces", action="store_true",
+                         help="leave the faces' headings out of the marker re-fit (still fused live)")
+    parser.add_argument("--arena-axes", type=float, default=0.0, metavar="DEG",
+                         help="where the arena's axes are in the map frame (the start pose), deg. 0 = the robot "
+                              "starts square to a wall (default); the faces then also correct up to a few "
+                              "degrees of placement (--start-heading-sd)")
+    parser.add_argument("--learn-axes", action="store_true",
+                         help="learn the arena axes during the run instead of --arena-axes (heading from faces "
+                              "only starts once they are known; the re-fit estimates them too)")
+    parser.add_argument("--start-heading-sd", type=float, default=3.0, metavar="DEG",
+                         help="how squarely the robot is placed at the start, deg (the start heading's "
+                              "uncertainty, which the faces may correct); 0 = exactly")
+    parser.add_argument("--one-marker-fix", action="store_true",
+                         help="after the lock: take the whole pose from ONE marker and its face when that is "
+                              "within the converged limits (a near marker seen at an angle). Off by default")
+    parser.add_argument("--no-face-ids", action="store_true",
+                         help="don't remember which printed face of each block points where (no heading reset "
+                              "from a remembered face)")
     parser.add_argument("--log-dir", type=str, default='run_logs',
                          help="run logs go to <log-dir>/<date-time>/ (see RunLog, analyze_run.py)")
     parser.add_argument("--p0-step", type=float, default=10.0,
@@ -6564,7 +6952,22 @@ if __name__ == "__main__":
 
     ekf, baseline = init_ekf(args.calib_dir)
     # no load_true_map(): there is no map -- phase 0 builds the markers with live SLAM
-    aruco_sensor = CorrectedArucoSensor(ekf.robot, marker_length=0.06, enabled=args.dist_correction)
+    # ArUco faces: settings from calibration/param/aruco_faces.json, then this run's flags.
+    faces_cfg = aruco_faces.load_config(args.calib_dir)
+    if args.no_faces:
+        faces_cfg['faces'] = False
+    if args.no_face_heading:
+        faces_cfg['heading_navigation'] = False
+    # the distance polynomial: only with --dist-correction (as without faces), applied
+    # by the faces corrector to each raw face reading
+    faces_cfg['polynomial'] = DIST_CORRECTION_FILE if args.dist_correction else ''
+    faces_cfg['axes_deg'] = None if args.learn_axes else float(args.arena_axes)
+    if args.one_marker_fix:
+        faces_cfg['one_marker_fix'] = True
+    if args.no_face_ids:
+        faces_cfg['face_ids'] = False
+    aruco_sensor = CorrectedArucoSensor(ekf.robot, marker_length=0.06, enabled=args.dist_correction,
+                                        faces_config=(faces_cfg if faces_cfg.get('faces', True) else None))
 
     turn_scale = args.turn_scale if args.turn_scale is not None else load_turn_scale()
     if args.turn_scale_fast is not None:
@@ -6587,6 +6990,14 @@ if __name__ == "__main__":
     print("Turns: <= {:.0f} deg at {:.2f} with turn_scale {:.4f}; bigger at {:.2f} with turn_scale_fast {:.4f}".format(
         nav.small_turn_max_deg, nav.small_turn_speed, nav.turn_scale, nav.turn_speed, nav.turn_scale_fast))
     nav.one_marker_heading = not args.no_one_marker_heading
+    if nav.marker_corrector is None:
+        print("ArUco faces: off (--no-faces) -- face-centre readings, no heading from faces")
+    else:
+        if args.no_face_heading:
+            nav.face_heading = False
+            print("ArUco faces: heading from faces off (--no-face-heading) -- block centres only")
+        nav.refit_faces = not args.no_refit_faces
+        nav.start_heading_sd = np.deg2rad(max(0.0, args.start_heading_sd))
     nav.heading_fix_use_range = not args.one_marker_no_range
     nav.learn_turn_scale = not args.no_learn_turn_scale
     nav.pan_half = np.deg2rad(args.pan_half)
@@ -6645,6 +7056,11 @@ if __name__ == "__main__":
         'dist_correction': (None if aruco_sensor.correction is None else
                             {'file': aruco_sensor.correction_file, 'degree': aruco_sensor.correction[0],
                              'coeffs_x': aruco_sensor.correction[1], 'coeffs_y': aruco_sensor.correction[2]}),
+        'faces': (None if nav.marker_corrector is None else
+                  {'describe': nav.marker_corrector.describe(), 'heading': nav.face_heading,
+                   'refit_faces': nav.refit_faces, 'start_heading_sd_deg': math.degrees(nav.start_heading_sd),
+                   'polynomial_applied': nav.marker_corrector.applies_polynomial,
+                   'config': {k: v for k, v in faces_cfg.items() if not k.startswith('_')}}),
         'noise': {'marker_sd_base': getattr(nav, 'marker_sd_base', None),
                   'marker_sd_per_m': getattr(nav, 'marker_sd_per_m', None),
                   'innovation_gate': ekf.innovation_gate, 'new_landmark_inflation': ekf.new_landmark_inflation,
@@ -6715,6 +7131,8 @@ if __name__ == "__main__":
             print("Could not save the submission files: {}".format(e))
         if args.compare_map:
             compare_result = report_against_truth(nav, args.compare_map)
+        if 'nav' in dir() and nav.marker_corrector is not None:
+            print(nav.marker_corrector.summary())
         if 'nav' in dir() and nav.face_residuals:
             r = np.array(nav.face_residuals)
             print("direction planning: turn left before the next leg after {} re-localisation(s) -- median {:.0f} deg, "
@@ -6742,6 +7160,7 @@ if __name__ == "__main__":
                 'submission': {'dir': args.out_dir, 'index': sub_index},
                 'turn_scale_learned': {'slow': nav.turn_scale, 'fast': nav.turn_scale_fast},
                 'refits_applied': nav.n_refits,
+                'faces': (nav.marker_corrector.summary() if nav.marker_corrector is not None else None),
                 'compare': compare_result,
             })
         except Exception as e:
