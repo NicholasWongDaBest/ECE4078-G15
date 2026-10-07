@@ -441,6 +441,9 @@ class M3Display(_RunClock):
     def _locked(self, what):
         self.start_timer()   # the run clock starts on the ENTER that locks the pose
         self.nav._localised = True
+        fold = getattr(self.nav, '_fold_in_faces', None)
+        if fold is not None:
+            fold(self.last_measurement)   # a 2-marker lock also shows where the arena axes are
         s = self.ekf.robot.state
         msg = "{}: [{:.2f}, {:.2f}, {:.0f} deg]".format(what, s[0, 0], s[1, 0], _wrap_deg(s[2, 0]))
         print(msg)
@@ -512,7 +515,10 @@ class M3Display(_RunClock):
 
     def _sense(self):
         img = self.nav.botconnect.get_image()
-        measurement, aruco_img = self.nav.aruco_sensor.detect_marker_positions(img)
+        # Through the navigator, so the setup lock uses the same block-centre
+        # readings as the rest of the run (slam/aruco_faces.py).
+        detect = getattr(self.nav, 'detect_markers', None) or self.nav.aruco_sensor.detect_marker_positions
+        measurement, aruco_img = detect(img)
         self.cam_img = aruco_img if aruco_img is not None else img
         self.last_measurement = measurement
         self.visible_tags = sorted({int(lm.tag) for lm in measurement if lm.tag in self.ekf.taglist})
