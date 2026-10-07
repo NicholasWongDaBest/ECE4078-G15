@@ -187,8 +187,29 @@ def eval_object(object_est, object_gt, transform=None):
             "left out of the aligned average" if aligned else "counted as {} m".format(MAX_ERROR), missing))
     return errors, obj_rmse, len(obj_list)
 
+def compute_object_grade(errors, object_names, max_err, min_err, base, missing_error=1.0):
+    """
+    M2 object grade, per the marking guide:
+        rating_per_obj = (Max - err) / (Max - Min), clipped to [0, 1]
+        avg_rating     = mean of rating_per_obj over ALL objects in the true map
+        grade          = (Base ** avg_rating - 1) / (Base - 1)
+    err is each object's own position error (its "RMSE" -- one point). An
+    object missing from the estimate counts as missing_error (rating 0).
+    Max is the error that scores 0 and Min the error that scores full marks
+    (reference values 0.35 m, 0.025 m, Base 8 -- the guide lists them as
+    "0.025, 0.35" for "Max, Min", which read literally would reward error).
+    @return: (avg_rating, grade in %, {object: rating})
+    """
+    ratings = {}
+    for name in object_names:
+        err = float(errors.get(name, missing_error))
+        ratings[name] = float(np.clip((max_err - err) / (max_err - min_err), 0.0, 1.0))
+    avg = float(np.mean(list(ratings.values()))) if ratings else 0.0
+    grade = (base ** avg - 1) / (base - 1)
+    return avg, grade * 100, ratings
+
 def compute_grade(aligned_rmse, num_found, max_rmse, min_rmse, base, total_count=10):
-    """Markers (num_found of total_count markers) or objects (of total_count objects)."""
+    """Markers (num_found of total_count markers)."""
     rating = (max_rmse - aligned_rmse) / (max_rmse - min_rmse)
     rating = np.clip(rating, 0.0, 1.0)
     grade = (base**rating - 1) / (base - 1) * num_found / total_count
@@ -302,12 +323,13 @@ def evaluate(slam_path, object_path, aruco_gt, object_gt, args, name=None, show=
         object_errors, obj_rmse, n_obj = eval_object(object_est, object_gt, transform=transform)
         summary['obj_mean'] = sum(object_errors.values()) / len(object_errors)
         summary['obj_rmse'] = obj_rmse
-        if np.isfinite(obj_rmse):
-            obj_rating, obj_grade = compute_grade(obj_rmse, n_obj, args.obj_max_rmse, args.obj_min_rmse,
-                                                  args.obj_base, args.total_objects)
-            summary['obj_grade'] = obj_grade
-            print(f'\nObject Rating: {np.round(obj_rating, 5)}')
-            print(f'Object Grade: {np.round(obj_grade, 5)}')
+        obj_rating, obj_grade, per_obj = compute_object_grade(object_errors, list(object_gt.keys()),
+                                                              args.obj_max_err, args.obj_min_err, args.obj_base)
+        summary['obj_grade'] = obj_grade
+        print('\nPer-object rating (Max {} m, Min {} m): {}'.format(
+            args.obj_max_err, args.obj_min_err, json.dumps({k: round(v, 4) for k, v in per_obj.items()})))
+        print(f'Object Rating (average): {np.round(obj_rating, 5)}')
+        print(f'Object Grade: {np.round(obj_grade, 5)}')
 
     title = name
     if has_slam:
@@ -355,10 +377,11 @@ if __name__ == '__main__':
     parser.add_argument('--min-rmse', type=float, default=0.0, help='Min RMSE for SLAM grading scale')
     parser.add_argument('--base', type=float, default=10.0, help='Base for the SLAM grading curve')
     parser.add_argument('--total-markers', type=int, default=10, help='Total possible markers')
-    parser.add_argument('--obj-max-rmse', type=float, default=0.5, help='Max RMSE for object grading scale')
-    parser.add_argument('--obj-min-rmse', type=float, default=0.0, help='Min RMSE for object grading scale')
-    parser.add_argument('--obj-base', type=float, default=10.0, help='Base for the object grading curve')
-    parser.add_argument('--total-objects', type=int, default=7, help='Total possible objects')
+    parser.add_argument('--obj-max-err', type=float, default=0.35,
+                        help='object grading: per-object error that rates 0 (m)')
+    parser.add_argument('--obj-min-err', type=float, default=0.025,
+                        help='object grading: per-object error at or below which it rates 1 (m)')
+    parser.add_argument('--obj-base', type=float, default=8.0, help='Base for the object grading curve')
     args, _ = parser.parse_known_args()
 
     aruco_gt, object_gt = parse_map(args.truemap)
