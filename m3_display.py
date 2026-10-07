@@ -190,6 +190,7 @@ SEEN = (0, 160, 0)
 ZONE = (0, 140, 0)
 MARKER_COV = (200, 50, 80)    # marker uncertainty ellipse + sd (cm)
 TRUE_MARKER = (20, 120, 200)  # T overlay: a true marker, drawn in the robot's frame
+OBSTRUCTION = (200, 0, 200)   # a marker block the CNN saw that no ArUco marker explains (final_demo_l3)
 
 TEXT = (220, 220, 220)
 GOOD = (120, 220, 120)
@@ -518,6 +519,9 @@ class M3Display(_RunClock):
     def _locked(self, what):
         self.start_timer()   # the run clock starts on the ENTER that locks the pose
         self.nav._localised = True
+        fold = getattr(self.nav, '_fold_in_faces', None)
+        if fold is not None:
+            fold(self.last_measurement)   # a 2-marker lock also shows where the arena axes are
         s = self.ekf.robot.state
         msg = "{}: [{:.2f}, {:.2f}, {:.0f} deg]".format(what, s[0, 0], s[1, 0], _wrap_deg(s[2, 0]))
         print(msg)
@@ -589,8 +593,9 @@ class M3Display(_RunClock):
 
     def _sense(self):
         img = self.nav.botconnect.get_image()
-        # Through the navigator when it has detect_markers() (final_demo_l3.py), so
-        # the window measures markers exactly as the run does (ArUco faces: block centres).
+        # Through the navigator when it has detect_markers() (final_demo_l3.py,
+        # auto_fruit_search.py), so the window -- and the setup lock -- measure
+        # markers exactly as the run does (ArUco faces: block centres).
         detect = getattr(self.nav, 'detect_markers', None) or self.nav.aruco_sensor.detect_marker_positions
         measurement, aruco_img = detect(img)
         self.cam_img = aruco_img if aruco_img is not None else img
@@ -758,6 +763,15 @@ class M3Display(_RunClock):
                 col = FRUIT_RGB.get(label, DEFAULT_FRUIT_RGB)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
                 cv2.putText(frame, label, (x1, max(14, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
+            # the CNN's marker blocks (cv/detector.py last_markers), 'partial' = cut off by the frame edge
+            for mk in getattr(nav, '_marker_boxes', None) or []:
+                try:
+                    x1, y1, x2, y2 = (int(v) for v in mk['xyxy'])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                cv2.rectangle(frame, (x1, y1), (x2, y2), OBSTRUCTION, 2)
+                cv2.putText(frame, "marker (partial)" if mk.get('partial') else "marker", (x1, max(14, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, OBSTRUCTION, 2, cv2.LINE_AA)
             view = cv2.resize(frame, (w, h))
             age = time.time() - getattr(nav, '_last_detect_time', 0.0)
             names = ", ".join(label for label, _ in nav._last_boxes) or "nothing"
@@ -1025,6 +1039,22 @@ class M3Display(_RunClock):
                 cv2.putText(img, "{} {:.0f}cm".format(tag, mapper.sigma(label) * 100),
                             (centre[0] + 8, centre[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                             (30, 30, 30), 1, cv2.LINE_AA)
+
+        # Obstructions (final_demo_l3 ObstructionMap): a marker block the CNN saw
+        # whose tag no marker reading explains -- a cross and its uncertainty
+        # circle once confirmed (what the planner avoids), a small cross before
+        obstr = getattr(self.nav, 'obstructions', None)
+        if obstr is not None and getattr(self.nav, 'obstructions_enabled', True):
+            for o in list(obstr.items):
+                c_px = self._px(o.x, o.y)
+                if o.n < getattr(obstr, 'min_sightings', 1):
+                    cv2.drawMarker(img, c_px, OBSTRUCTION, cv2.MARKER_TILTED_CROSS, 7, 1)
+                    continue
+                cv2.drawMarker(img, c_px, OBSTRUCTION, cv2.MARKER_TILTED_CROSS, 12, 2)
+                cv2.circle(img, c_px, max(4, int((obstr.half_block + obstr.radius_extra(o)) * s)), OBSTRUCTION, 1,
+                           cv2.LINE_AA)
+                cv2.putText(img, "?{}".format(o.n), (c_px[0] + 7, c_px[1] + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                            OBSTRUCTION, 1, cv2.LINE_AA)
 
         # T: the true map's fruits -- a ring in the fruit's colour at the
         # actual position, a line to the estimate, and the error in cm

@@ -1,5 +1,6 @@
 import cv2
 import json
+import math
 import time
 import shutil
 import argparse
@@ -17,6 +18,7 @@ from slam.ekf import (DriveMeasurement, EKF, FruitEKF, in_frame_fraction,
                        CONFUSABLE_DISTANCE_THRESHOLD)
 from slam.robot import Robot
 from slam.aruco_sensor import ArucoSensor
+from slam import aruco_faces
 
 # import CV components (M2)
 sys.path.insert(0,"{}/cv/".format(os.getcwd()))
@@ -115,7 +117,19 @@ class Operate:
 
         # Initialise SLAM parameters
         self.ekf = self.init_ekf(args.calib_dir, args.ip)
-        self.aruco_sensor = ArucoSensor(self.ekf.robot, marker_length=0.06) # size of the ARUCO markers (6cm)
+        # ArUco faces (slam/aruco_faces.py): readings become BLOCK centres, the
+        # positions the marked map is compared against. Settings in
+        # calibration/param/aruco_faces.json, shared with auto_fruit_search.py so
+        # the navigation measures markers exactly as this map was built.
+        # --no-faces = the old face-centre readings.
+        self.faces_cfg = aruco_faces.load_config(args.calib_dir)
+        if getattr(args, 'no_faces', False):
+            self.faces_cfg['faces'] = False
+        if getattr(args, 'face_heading', False):
+            self.faces_cfg['heading_mapping'] = True
+        self.aruco_sensor = ArucoSensor(self.ekf.robot, marker_length=0.06, faces_config=self.faces_cfg) # size of the ARUCO markers (6cm)
+        self.marker_corrector = (aruco_faces.MarkerCorrector(self.faces_cfg, program='mapping')
+                                 if self.faces_cfg.get('faces', True) else None)
 
         # Persisted SLAM map: survives program restarts unless 'r','r' is pressed
         self.slam_state_fname = os.path.join(self.lab_output_dir, 'slam_state.json')
@@ -352,9 +366,17 @@ class Operate:
     def perform_slam(self, drive_measurement):
         sensor_measurement, self.aruco_img = self.aruco_sensor.detect_marker_positions(self.img)
 
-        for lm in sensor_measurement:
-            x_c, y_c = self.apply_distortion_correction(lm.position[0,0], lm.position[1,0])
-            lm.position[0,0], lm.position[1,0] = x_c, y_c
+        if self.marker_corrector is not None:
+            # Block centres (slam/aruco_faces.py). The corrector applies the
+            # distortion polynomial itself (first, to the face-centre reading it
+            # was fitted on), so it must not be applied again below.
+            sensor_measurement = self.marker_corrector.correct(
+                sensor_measurement, float(self.ekf.robot.state[2, 0]),
+                math.sqrt(max(float(self.ekf.P[2, 2]), 0.0)))
+        else:
+            for lm in sensor_measurement:
+                x_c, y_c = self.apply_distortion_correction(lm.position[0,0], lm.position[1,0])
+                lm.position[0,0], lm.position[1,0] = x_c, y_c
 
         # Discard any detected tag outside our known marker set (1-10).
         # DICT_4X4_100 can detect tags 0-99, so a stray/misread marker would
@@ -399,6 +421,13 @@ class Operate:
                 self.ekf.predict(drive_measurement)
             self.ekf.add_landmarks(sensor_measurement)
             self.ekf.update(sensor_measurement, drive_measurement)  # pass drive_measurement so update() knows how much rotation is happening right now
+            if self.marker_corrector is not None:
+                # Learns where the arena axes sit in this map's frame (from the
+                # start, where the heading is exactly known). Only with
+                # "heading_mapping": true (or --face-heading) does it also fuse
+                # the faces' directions into the heading -- off by default.
+                known = [lm for lm in sensor_measurement if lm.tag in self.ekf.taglist]
+                self.marker_corrector.fold(self.ekf, known, len(known))
 
     def save_live_objects(self):
         """Write the LIVE FruitEKF estimates to lab_output/objects.txt -- the
@@ -493,6 +522,8 @@ class Operate:
             # save_live_objects() for why the live estimate is worth keeping
             # even though object_pose_est.py can regenerate one offline.
             obj_msg = self.save_live_objects()
+            if self.marker_corrector is not None:
+                print(self.marker_corrector.summary())
             self.notification = f'Map is saved{obj_msg}'
             self.command['save_slam'] = False
 
@@ -529,6 +560,8 @@ class Operate:
     # so both stash obj_detector_output identically.
     def _run_object_detector(self):
         bboxes, self.cv_vis = self.obj_detector.detect_single_image(self.img)
+        markers = self.obj_detector.last_markers
+        too_close = any(m["partial"] for m in markers)
         self.obj_detector_output = (self.cv_vis, self.ekf.robot.state.tolist(), bboxes) # three things to be saved
         return len(set([box[0] for box in bboxes]))
 
@@ -1126,8 +1159,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.
     parser.add_argument("--calib_dir", type=str, default="calibration/param/") # calibration directory
-    parser.add_argument("--yolo_path", default='cv/model/yolo26n.pt') # directory for your trained AI model
+    parser.add_argument("--yolo_path", default='cv/model/include_marker_model.pt') # directory for your trained AI model
     parser.add_argument("--truemap", type=str, default='truemap.txt', help="ground-truth map for live RMSE practice tracking (optional)")
+    parser.add_argument("--no-faces", action="store_true",
+                        help="old marker readings (face centres) -- then navigate this map with "
+                             "auto_fruit_search.py --no-faces too")
+    parser.add_argument("--face-heading", action="store_true",
+                        help="also fuse the markers' face directions into the heading while mapping "
+                             "(same as \"heading_mapping\": true in calibration/param/aruco_faces.json)")
     args, _ = parser.parse_known_args()
 
     pygame.font.init()

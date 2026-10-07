@@ -8,6 +8,12 @@ from copy import deepcopy
 from ultralytics import YOLO
 from ultralytics.utils import ops
 
+# constants
+MARKER_LABEL = "marker"
+MARKER_COLOUR = (255, 0, 255)   # RGB, since the frame is RGB
+EDGE_PX = 3                     # box within 3 px of the frame edge counts as cut off
+MARKER_CONF = 0.5               # partial markers score lower than fruit
+FRUIT_CONF = 0.75               # your existing threshold, now applied per class
 
 class ObjectDetector:
     def __init__(self, yolo_path):
@@ -23,49 +29,61 @@ class ObjectDetector:
         
         self.pred_pose_fname = open(os.path.join('lab_output', 'pred.txt'), 'w')
         self.pred_count = 0
+        self.last_markers = []
 
     def detect_single_image(self, img):
         """
-        Detect objects given a captured frame.
         Return:
-            bboxes: list of lists, box info [label,[x,y,width,height]] for all detected objects in image
-            img_out: image with bounding boxes and class labels drawn on
+            bboxes: fruit only, [label,[x,y,width,height]] (same format as before)
+            img_out: image with fruit and markers drawn
+        Markers are stored in self.last_markers as dicts:
+            {"xyxy": (x1,y1,x2,y2), "partial": bool, "sides": ["left", ...]}
         """
         bboxes = self._get_bounding_boxes(img)
         img_out = deepcopy(img)
+        H, W = img.shape[:2]
 
-        # draw bounding boxes on the image
+        fruit_bboxes = []
+        self.last_markers = []
         for bbox in bboxes:
-            #  translate bounding box info back to the format of [x1,y1,x2,y2]
+            label = bbox[0]
             xyxy = ops.xywh2xyxy(bbox[1])
-            x1 = int(xyxy[0])
-            y1 = int(xyxy[1])
-            x2 = int(xyxy[2])
-            y2 = int(xyxy[3])
+            x1, y1, x2, y2 = (int(v) for v in xyxy)
 
-            # draw bounding box and class label
-            img_out = cv2.rectangle(img_out, (x1, y1), (x2, y2), self.colour_code[bbox[0]], thickness=2)
-            img_out = cv2.putText(img_out, bbox[0], (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.colour_code[bbox[0]], 2)
+            if label == MARKER_LABEL:
+                hits = [("left", x1 <= EDGE_PX), ("right", x2 >= W - EDGE_PX),
+                        ("top", y1 <= EDGE_PX), ("bottom", y2 >= H - EDGE_PX)]
+                sides = [s for s, hit in hits if hit]
+                self.last_markers.append({"xyxy": (x1, y1, x2, y2),
+                                        "partial": bool(sides), "sides": sides})
+                if sides:
+                    print("marker cut off at:", sides)
+                col = MARKER_COLOUR
+                tag = "marker (partial)" if sides else "marker"
+            else:
+                fruit_bboxes.append(bbox)
+                col = self.colour_code.get(label, (255, 255, 255))
+                tag = label
 
-        return bboxes, img_out
+            img_out = cv2.rectangle(img_out, (x1, y1), (x2, y2), col, thickness=2)
+            img_out = cv2.putText(img_out, tag, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
+
+        return fruit_bboxes, img_out
 
     def _get_bounding_boxes(self, img):
         # img arrives in RGB (per operate.py); Ultralytics predict() on a raw
         # numpy array assumes BGR (the cv2/training convention), so convert here
         # predict target type and bounding box with your trained YOLO
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        predictions = self.model.predict(img_bgr, imgsz=480, verbose=False, conf=0.75, iou=0.5)
+        predictions = self.model.predict(img_bgr, imgsz=480, verbose=False, conf=MARKER_CONF, iou=0.5)
 
-        # get bounding box and class label for target(s) detected
         bounding_boxes = []
         for prediction in predictions:
-            boxes = prediction.boxes
-            for box in boxes:
-                # bounding format in [x, y, width, height]
-                box_cord = box.xywh[0]
-                box_label = box.cls  # class label of the box
-                bounding_boxes.append([prediction.names[int(box_label)], np.asarray(box_cord)])
-        
+            for box in prediction.boxes:
+                label = prediction.names[int(box.cls)]
+                if label != MARKER_LABEL and float(box.conf) < FRUIT_CONF:
+                    continue          # fruit keeps the old 0.75 threshold
+                bounding_boxes.append([label, np.asarray(box.xywh[0])])
         return bounding_boxes
         
     def write_output(self, pred, state, bboxes, lab_output_dir):

@@ -39,6 +39,17 @@
 #     so the re-fitted poses -- and the fruits re-solved through them -- carry
 #     the faces' heading, not the commanded turns'.
 #
+# Obstructions (ObstructionMap; --no-obstructions turns them off). The CNN
+# (cv/model/include_marker_model.pt) also detects marker blocks -- including
+# ones only partly in frame, too oblique or too far for the tag to read (on this
+# robot no tag nearer than ~0.31 m reads at all: it runs off the bottom of the
+# frame). A block no marker reading explains, seen in 2+ frames, is noted as an
+# obstruction and avoided like a marker until a marker or fruit is mapped where
+# it is (that replaces it); and before every drive the camera's marker blocks in
+# the robot's path stop it short, map or no map (Navigator.fruit_ahead). Phase
+# 0's drives use both. Where an obstruction's margins leave no route, the plan
+# falls back to marker-sized circles, then (phase 0, parking) to none.
+#
 # Usage: python final_demo_l3.py --ip <robot-ip>
 import os
 import sys
@@ -500,6 +511,216 @@ def planning_bounds(margin=EDGE_MARGIN):
     (xmin, xmax), (ymin, ymax) = path_planner.ARENA_BOUNDS
     m = max(0.0, float(margin))
     return ((xmin + m, xmax - m), (ymin + m, ymax - m))
+
+
+def _same_look(a, b, dist=0.10):
+    """Two robot poses (x, y, theta) from the same spot: one look at the scene,
+    whatever the heading (a sweep's frames all share that spot's pose error)."""
+    return a is not None and b is not None and math.hypot(a[0] - b[0], a[1] - b[1]) <= dist
+
+
+class Obstruction:
+    """One unexplained marker block (see ObstructionMap)."""
+    _next_id = 1
+
+    def __init__(self, x, y, sd, partial, t, pose=None, frame=0):
+        self.id = Obstruction._next_id
+        Obstruction._next_id += 1
+        self.x, self.y, self.sd = float(x), float(y), float(sd)
+        self._w = 1.0 / sd ** 2           # running inverse-variance weighted mean of the sightings
+        self._wx, self._wy = self._w * self.x, self._w * self.y
+        # The best single sighting's sd. Sightings from one spot share that
+        # spot's pose error, so the merged sd above shrinks faster than the real
+        # uncertainty does (see sd_eff).
+        self.sd_one = float(sd)
+        self.n = 1                        # sightings (frames)
+        self.looks = 1                    # ... from this many different spots
+        self.misses = 0                   # looks since then that had it in view and saw no marker block there
+        self.partial = bool(partial)      # ever seen cut off by the frame edge
+        self.first = self.last = t
+        self.last_frame = frame           # YOLO frame of the latest sighting
+        self._look = pose                 # robot pose of the latest sighting
+        self._miss_look = None            # ... and of the latest miss
+
+    @property
+    def sd_eff(self):
+        """Position sd to plan with: the best sighting's, shrunk only by the
+        number of different spots it was seen from (frames from one spot share
+        its pose error), never below the merged sd."""
+        return max(self.sd, self.sd_one / math.sqrt(self.looks))
+
+
+class ObstructionMap:
+    """
+    Marker blocks the CNN sees that no ArUco marker explains -- noted as
+    OBSTRUCTIONS, which the planner keeps clear of like markers.
+
+    cv/detector.py (ck branch, model cv/model/include_marker_model.pt) has a
+    'marker' class: the cube including its white border, flagged 'partial' when
+    the box touches the frame edge. A block whose tag doesn't decode -- only
+    partly in view, too oblique or too far -- is invisible to the ArUco map, and
+    the robot could drive into it. Each such box (no decoded marker in this frame
+    and no mapped marker where it points) gives a sighting:
+      bearing  from the box centre; a box cut off at the left/right edge is
+               taken as at least as wide as it is tall and extended out of frame;
+      range    from the box height (box_height_m: 6 cm black square padded 12% a
+               side, as cv/prelabel_markers.py labelled it), plus half a block to
+               the block's centre. On the team's 81 labelled photos (cv/marker)
+               this is within 2% of the ArUco depth of the same tag. A box cut at
+               the top or bottom shows only part of the block: on this robot the
+               box reaches the bottom of the frame for any block nearer than about
+               0.37 m (and the tag stops decoding at ~0.31 m) -- 67 of those 160
+               labelled boxes. Then the WIDTH gives the range (a block's box is as
+               wide as it is tall face-on, wider at a corner, so this errs nearer),
+               at most cut_range_max; cut at a side as well, it is placed at
+               close_range.
+    Every marker box the map doesn't explain also feeds the look-before-you-drive
+    check (Navigator.fruit_ahead), which needs no map at all.
+    Sightings within merge_radius are one obstruction (inverse-variance weighted
+    mean); one whose sd (pose, bearing and range errors together) is over max_sd
+    is not used -- placed that vaguely it would only block the map, and the
+    look-ahead still guards against the block itself. An obstruction counts for
+    the planner once it has min_sightings sightings (a box in one frame only is
+    as likely a false detection); one that never gets a second within
+    expire_frames YOLO frames is forgotten. The planner keeps clear of
+    an obstruction like a marker, plus 1.5 sd (Obstruction.sd_eff) up to
+    max_extra; where those margins leave no route, phase 0 and Level 3's tight
+    re-plan treat it at a marker's size, and phase 0 finally ignores it
+    (build_obstacles(obstructions=...)) -- the look-ahead still stops the robot
+    short of a block it can see. An obstruction is REPLACED -- dropped, the real
+    object now standing for it -- once a marker is mapped within replace_marker
+    m of it (up to replace_marker_max for one noted from a shaky pose: 2 sd) or
+    a fruit within replace_fruit m; and dropped as a false detection after
+    max_misses looks in a row (from different spots, and at least as many as it
+    was seen from) that had it well in view and saw no marker block there.
+    """
+    active = None   # the run's map; build_obstacles() adds its circles to every obstacle list
+
+    def __init__(self, box_height_m=0.0744, half_block=0.03, max_range=1.5, close_range=0.20,
+                 cut_range_max=0.45, merge_radius=0.20, replace_marker=0.25, replace_marker_max=0.40,
+                 replace_fruit=0.15, max_misses=3, miss_range=(0.30, 1.20), sd_floor=0.03, max_sd=0.20,
+                 max_extra=0.10, min_sightings=2, expire_frames=30):
+        self.box_height_m = box_height_m
+        self.half_block = half_block
+        self.max_range = max_range
+        self.close_range = close_range
+        self.cut_range_max = cut_range_max
+        self.merge_radius = merge_radius
+        self.replace_marker = replace_marker
+        self.replace_marker_max = replace_marker_max
+        self.replace_fruit = replace_fruit
+        self.max_misses = max_misses
+        self.miss_range = miss_range
+        self.sd_floor = sd_floor
+        self.max_sd = max_sd
+        self.max_extra = max_extra
+        self.min_sightings = min_sightings
+        self.expire_frames = expire_frames
+        self.items = []
+        self.stats = {'noted': 0, 'sightings': 0, 'by_marker': 0, 'by_fruit': 0, 'not_seen': 0, 'expired': 0}
+
+    def confirmed(self):
+        """The obstructions the planner uses (min_sightings or more)."""
+        return [o for o in self.items if o.n >= self.min_sightings]
+
+    def expire(self, frame):
+        """Forget unconfirmed obstructions not seen again for expire_frames YOLO frames.
+        @return: the ones dropped"""
+        old = [o for o in self.items if o.n < self.min_sightings and frame - o.last_frame > self.expire_frames]
+        for o in old:
+            self.drop(o, 'expired')
+        return old
+
+    def add(self, x, y, sd, partial, t, pose=None, frame=0):
+        """One sighting (from robot pose `pose`, in YOLO frame `frame`).
+        @return: (obstruction, True if it is a new one)"""
+        sd = max(float(sd), self.sd_floor)
+        self.stats['sightings'] += 1
+        best = None
+        for o in self.items:
+            d = math.hypot(o.x - x, o.y - y)
+            if d <= max(self.merge_radius, 2.0 * math.hypot(sd, o.sd_eff)) and (best is None or d < best[0]):
+                best = (d, o)
+        if best is None:
+            o = Obstruction(x, y, sd, partial, t, pose, frame)
+            self.items.append(o)
+            self.stats['noted'] += 1
+            return o, True
+        o = best[1]
+        w = 1.0 / sd ** 2
+        o._w += w
+        o._wx += w * x
+        o._wy += w * y
+        o.x, o.y = o._wx / o._w, o._wy / o._w
+        o.sd = max(self.sd_floor, 1.0 / math.sqrt(o._w))
+        o.sd_one = min(o.sd_one, sd)
+        o.n += 1
+        if pose is not None and not _same_look(pose, o._look):
+            o.looks += 1
+            o._look = pose
+        o.misses = 0
+        o._miss_look = None
+        o.partial = o.partial or bool(partial)
+        o.last = t
+        o.last_frame = frame
+        return o, False
+
+    def replace_radius(self, sd):
+        """How near a mapped marker must be to replace an obstruction (or explain
+        a sighting) with this position sd."""
+        return max(self.replace_marker, min(self.replace_marker_max, 2.0 * float(sd)))
+
+    def drop(self, o, why):
+        if o in self.items:
+            self.items.remove(o)
+            self.stats[why] = self.stats.get(why, 0) + 1
+
+    def radius_extra(self, o):
+        """Planner margin on top of a marker's for this obstruction's position uncertainty."""
+        return min(self.max_extra, 1.5 * o.sd_eff)
+
+    def circles(self, robot_radius, marker_radius, safety_margin, widen=True):
+        """(N, 3) [x, y, r] like path_planner.build_obstacles(): a marker's circle,
+        widened by the uncertainty unless `widen` is False."""
+        items = self.confirmed()
+        if not items:
+            return np.empty((0, 3))
+        return np.array([[o.x, o.y, robot_radius + marker_radius + safety_margin
+                          + (self.radius_extra(o) if widen else 0.0)] for o in items], dtype=float)
+
+    def move(self, move_point):
+        """A re-fit moved the map: obstructions go with it (refit_markers)."""
+        for o in self.items:
+            o.x, o.y = move_point((o.x, o.y))
+            o._wx, o._wy = o._w * o.x, o._w * o.y
+
+    def summary(self):
+        s = self.stats
+        return ("Obstructions (CNN marker blocks no ArUco marker explained): {} noted from {} sightings; "
+                "{} replaced by a marker, {} by a fruit, {} dropped as not seen again, {} seen once and "
+                "forgotten; {} left ({} confirmed)".format(
+                    s['noted'], s['sightings'], s['by_marker'], s['by_fruit'], s['not_seen'], s['expired'],
+                    len(self.items), len(self.confirmed())))
+
+
+def _obstructions_in_play(nav):
+    """True when the planner is avoiding at least one obstruction."""
+    om = getattr(nav, 'obstructions', None)
+    return bool(getattr(nav, 'obstructions_enabled', False) and om is not None and om.confirmed())
+
+
+def build_obstacles(aruco_positions, object_positions, robot_radius, obstructions='full', **kwargs):
+    """path_planner.build_obstacles() plus the run's obstructions (ObstructionMap.active).
+    obstructions: 'full' -- each a marker's safety circle widened by its position
+    uncertainty; 'plain' -- a marker's circle (a route the full margins close
+    off); 'off' -- left out (the look-ahead still sees them)."""
+    obs = path_planner.build_obstacles(aruco_positions, object_positions, robot_radius, **kwargs)
+    om = ObstructionMap.active
+    if om is None or not om.confirmed() or obstructions == 'off':
+        return obs
+    extra = om.circles(robot_radius, kwargs.get('marker_radius', path_planner.DEFAULT_MARKER_RADIUS),
+                       kwargs.get('safety_margin', 0.05), widen=(obstructions == 'full'))
+    return np.vstack([np.asarray(obs, dtype=float).reshape(-1, 3), extra])
 
 
 def read_true_map(fname):
@@ -1326,6 +1547,18 @@ class Navigator:
         self.object_dimensions = {}
         self.fruit_tags = {}                      # fruit name -> pseudo tag in ekf.taglist
         self.fruit_mapper = None                  # FruitMapper, Level 3 only: every frame's boxes go to it
+        # Obstructions (ObstructionMap): marker blocks the CNN's 'marker' class
+        # sees that no ArUco marker explains -- obstacles until a marker or fruit
+        # is mapped there. Needs a model with that class (include_marker_model.pt);
+        # with any other model there are simply no marker boxes.
+        self.obstructions = ObstructionMap()
+        ObstructionMap.active = self.obstructions
+        self.obstructions_enabled = True
+        self._marker_boxes = []        # the latest YOLO frame's marker boxes (detector.last_markers)
+        self._yolo_frame = 0           # YOLO frames so far (_fruit_boxes)
+        self._yolo_wh = None           # that frame's (width, height)
+        self._marker_info = (-1, [])   # (YOLO frame, _classify_marker_boxes() result) for that frame
+        self._obstr_frame = -1         # the YOLO frame _note_obstructions() last used
         self._suppress_mapping = False            # scan_around() holds fruit boxes back until the pose has settled
         # Which fruits a frame may update while the mapping is not suppressed:
         # None = all, a set of labels = those only, 'new' = only fruits not
@@ -1712,6 +1945,11 @@ class Navigator:
             return []
         bboxes, _ = self.detector.detect_single_image(img)
         frame_h, frame_w = img.shape[0], img.shape[1]
+        # The same YOLO pass found the marker blocks (cv/detector.py keeps them
+        # out of the fruit boxes): kept for the obstructions and the look-ahead.
+        self._marker_boxes = list(getattr(self.detector, 'last_markers', None) or [])
+        self._yolo_frame += 1
+        self._yolo_wh = (frame_w, frame_h)
         out = []
         for label, box in bboxes:
             if label not in self.object_dimensions:
@@ -1946,6 +2184,7 @@ class Navigator:
                 self._fold_in_faces(aruco)
                 self._map_fruits_from_last_frame()
                 self._note_unknown_markers(aruco)   # (this return skips the finally below)
+                self._note_obstructions(aruco)
                 return 'heading', 1, 0
         if n_ar or fruits:
             # Something is in view: let it count (see vision_prior_sd).
@@ -1986,6 +2225,8 @@ class Navigator:
             # dead reckoning, which is still the best available.
             self._map_fruits_from_last_frame()
             self._note_unknown_markers(aruco)
+            # marker blocks the CNN saw that no marker explains (ObstructionMap)
+            self._note_obstructions(aruco)
 
     # ------------------------------------------------------------------
     # ArUco faces (slam/aruco_faces.py)
@@ -2127,6 +2368,236 @@ class Navigator:
             parts.append("one-marker fix")
         self._face_acc = {'fused': 0, 'moved': 0.0, 'gated': 0, 'held': 0, 'learned': 0, 'fix': 0}
         return ("   | " + ", ".join(parts)) if parts else ""
+
+    # ------------------------------------------------------------------
+    # Obstructions: marker blocks the CNN sees that no ArUco marker explains
+    # ------------------------------------------------------------------
+
+    def _marker_box_geometry(self, mk):
+        """
+        One YOLO marker box (detector.last_markers: 'xyxy', 'partial', 'sides')
+        in the robot frame: {'front': m to the block's near face, 'range': to its
+        centre, 'bearing': of its centre, 'span': (lo, hi) bearings it covers
+        (extended out of frame on a side it is cut off at), 'cut_v': cut at the
+        top or bottom -- then the range is only a cap, 'partial'}, or None.
+        """
+        try:
+            x1, y1, x2, y2 = (float(v) for v in mk['xyxy'])
+        except (KeyError, TypeError, ValueError):
+            return None
+        sides = set(mk.get('sides') or [])
+        w, h = x2 - x1, y2 - y1
+        if w <= 2.0 or h <= 2.0:
+            return None
+        K = np.asarray(self.ekf.robot.camera_matrix, dtype=float)
+        f, cx = float(K[0, 0]), float(K[0, 2])
+        om = self.obstructions
+        cut_v = bool(sides & {'top', 'bottom'})
+        cut_h = bool(sides & {'left', 'right'})
+        front = f * om.box_height_m / h
+        if cut_v:
+            # Only part of the block's height is in the picture (the box reaches the
+            # bottom of the frame for any block nearer than ~0.37 m): the height
+            # says nothing, the whole width does -- unless a side is cut off too.
+            front = (min(f * om.box_height_m / w, om.cut_range_max) if not cut_h
+                     else min(front, om.close_range))
+        full_w = max(w, h)              # a cube's box is at least as wide as it is tall
+        u_lo, u_hi = x1, x2
+        if 'left' in sides and 'right' not in sides:
+            u_lo = min(x1, x2 - full_w)
+        elif 'right' in sides and 'left' not in sides:
+            u_hi = max(x2, x1 + full_w)
+        u = 0.5 * (u_lo + u_hi)
+        return {'front': front, 'range': front + om.half_block, 'bearing': math.atan2(-(u - cx), f),
+                'span': (math.atan2(-(u_hi - cx), f), math.atan2(-(u_lo - cx), f)),
+                'cut_v': cut_v, 'cut_h': cut_h, 'partial': bool(sides)}
+
+    def _classify_marker_boxes(self, aruco):
+        """
+        The latest YOLO frame's marker boxes (_marker_box_geometry), each with
+        what explains it: 'decoded' -- the tag of an ArUco marker read in this
+        frame inside its span; 'mapped' -- the tag of a mapped marker the pose
+        puts there, at about that range; both None for a block nothing
+        explains. Worked out once per YOLO frame.
+        """
+        if self._marker_info[0] == self._yolo_frame:
+            return self._marker_info[1]
+        out = []
+        if self._marker_boxes:
+            s = self.ekf.robot.state
+            X, Y, TH = float(s[0, 0]), float(s[1, 0]), float(s[2, 0])
+            sd_t = math.sqrt(max(float(self.ekf.P[2, 2]), 0.0))
+            decoded = []
+            for lm in aruco or []:
+                a_, l_ = (float(v) for v in np.asarray(lm.position, dtype=float).reshape(-1)[:2])
+                if a_ > 0.0:
+                    decoded.append((int(lm.tag), math.atan2(l_, a_)))
+            c, sn = math.cos(TH), math.sin(TH)
+            mapped = []
+            for t, (mx, my) in self.marker_positions().items():
+                a_, l_ = c * (mx - X) + sn * (my - Y), -sn * (mx - X) + c * (my - Y)
+                if a_ > 0.05:
+                    mapped.append((t, math.atan2(l_, a_), math.hypot(a_, l_)))
+            tol_d = math.radians(2.0)
+            tol_m = math.radians(3.0) + 2.0 * sd_t
+            for mk in self._marker_boxes:
+                g = self._marker_box_geometry(mk)
+                if g is None:
+                    continue
+                lo, hi = g['span']
+                g['decoded'] = next((t for t, b in decoded if lo - tol_d <= b <= hi + tol_d), None)
+                g['mapped'] = next((t for t, b, r in mapped if lo - tol_m <= b <= hi + tol_m and (
+                    r <= g['range'] + 0.15 if g['cut_v'] else abs(r - g['range']) <= max(0.25, 0.3 * r))), None)
+                out.append(g)
+        self._marker_info = (self._yolo_frame, out)
+        return out
+
+    def _explained_by_map(self, x, y, sd=0.0):
+        """A mapped marker or fruit already stands where (x, y) -- a sighting
+        with this sd -- is (ObstructionMap's replace radii)."""
+        om = self.obstructions
+        r_m = om.replace_radius(sd)
+        if any(math.hypot(mx - x, my - y) <= r_m for mx, my in self.marker_positions().values()):
+            return True
+        fruits = self.fruit_mapper.positions() if self.fruit_mapper is not None else {}
+        return any(math.hypot(fx - x, fy - y) <= om.replace_fruit for fx, fy in fruits.values())
+
+    def _note_obstructions(self, aruco):
+        """
+        After this frame's pose update (once per YOLO frame): every marker box
+        that neither a marker read in this frame nor a mapped marker explains is
+        a sighting of an obstruction (ObstructionMap.add); obstructions this
+        frame looked straight at without seeing a block collect a miss; any that
+        a mapped marker or fruit now explains are replaced (dropped). A frame
+        whose known markers ALL disagreed with the pose (the EKF gated every
+        one) places nothing and counts no misses: its pose is likely off.
+        """
+        if self.detector is None or self._obstr_frame == self._yolo_frame:
+            return
+        self._obstr_frame = self._yolo_frame
+        info = self._classify_marker_boxes(aruco)    # (also what fruit_ahead() looks at)
+        om = self.obstructions
+        if om is None or not self.obstructions_enabled:
+            return
+        known = {int(lm.tag) for lm in (aruco or []) if lm.tag in self.ekf.taglist and int(lm.tag) < FRUIT_TAG_BASE}
+        diag = [d for d in (self.ekf.last_diagnostics or []) if d.get('tag') in known]
+        if known and diag and all(d.get('gated') for d in diag):
+            self._replace_obstructions()
+            return
+        s = self.ekf.robot.state
+        X, Y, TH = float(s[0, 0]), float(s[1, 0]), float(s[2, 0])
+        P = self.ekf.P
+        sd_pos = math.sqrt(max(float(P[0, 0]) + float(P[1, 1]), 0.0))
+        sd_t = math.sqrt(max(float(P[2, 2]), 0.0))
+        now = time.time()
+        for g in info:
+            if g['decoded'] is not None or g['mapped'] is not None or g['range'] > om.max_range:
+                continue
+            r, b = g['range'], g['bearing']
+            sd_b = math.radians(5.0 if g['partial'] else 1.5)
+            if g['cut_v']:
+                # from the width (a corner view is wider); cut at a side too, the
+                # range is only "near": weak, so better sightings decide the position
+                sd_r = 0.10 if g['cut_h'] else 0.02 + 0.15 * g['front']
+            else:
+                sd_r = 0.02 + 0.06 * r
+            sd = math.sqrt(sd_pos ** 2 + (r * math.hypot(sd_t, sd_b)) ** 2 + sd_r ** 2)
+            if sd > om.max_sd:
+                continue          # too unsure to place usefully (the look-ahead still sees the block)
+            x, y = X + r * math.cos(TH + b), Y + r * math.sin(TH + b)
+            if self._explained_by_map(x, y, sd):
+                continue
+            o, new = om.add(x, y, sd, g['partial'], now, pose=(X, Y, TH), frame=self._yolo_frame)
+            if self.log is not None and new:
+                self.log.event('obstruction', action='noted', id=o.id, xy=[o.x, o.y], sd=o.sd,
+                               range=r, partial=g['partial'], cut_v=g['cut_v'])
+            if o.n == om.min_sightings:     # confirmed: from now on the planner avoids it
+                print("  obstruction: a marker block with no readable tag at [{:+.2f}, {:+.2f}] ({:.2f} m away{}) "
+                      "-- avoided until a marker or fruit is mapped there".format(
+                          o.x, o.y, r, ", cut off by the frame edge" if g['partial'] else ""))
+                if self.log is not None:
+                    self.log.event('obstruction', action='confirmed', id=o.id, xy=[o.x, o.y], sd=o.sd_eff)
+        self._obstruction_misses(info, X, Y, TH, sd_t)
+        self._replace_obstructions()
+        for o in om.expire(self._yolo_frame):
+            if self.log is not None:
+                self.log.event('obstruction', action='expired', id=o.id, xy=[o.x, o.y])
+
+    def _obstruction_misses(self, info, X, Y, TH, sd_t):
+        """An obstruction 0.3-1.2 m away that this frame has well in view -- the
+        whole block, allowing for 1 sd of where it might really be -- not
+        hidden behind a mapped marker or fruit, and that no marker box covers
+        (within 2 sd): one miss, counted once per spot the robot looks from.
+        max_misses looks like that in a row, and at least as many as it was
+        seen from -> dropped as a false detection."""
+        om = self.obstructions
+        if not om.items or self._yolo_wh is None:
+            return
+        K = np.asarray(self.ekf.robot.camera_matrix, dtype=float)
+        f, cx = float(K[0, 0]), float(K[0, 2])
+        half_l, half_r = math.atan2(cx, f), math.atan2(self._yolo_wh[0] - cx, f)
+        c, sn = math.cos(TH), math.sin(TH)
+        others = list(self.marker_positions().values())
+        if self.fruit_mapper is not None:
+            others += list(self.fruit_mapper.positions().values())
+        others_rb = []
+        for ox, oy in others:
+            a_, l_ = c * (ox - X) + sn * (oy - Y), -sn * (ox - X) + c * (oy - Y)
+            if a_ > 0.05:
+                others_rb.append((math.hypot(a_, l_), math.atan2(l_, a_)))
+        for o in list(om.items):
+            a_, l_ = c * (o.x - X) + sn * (o.y - Y), -sn * (o.x - X) + c * (o.y - Y)
+            r = math.hypot(a_, l_)
+            if a_ <= 0.0 or not (om.miss_range[0] <= r <= om.miss_range[1]):
+                continue
+            b = math.atan2(l_, a_)
+            half_w = math.atan2(om.half_block * math.sqrt(2.0), r)       # the block itself
+            unc = math.hypot(math.atan2(o.sd_eff, r), sd_t)                # where it may really be
+            edge = half_w + unc + math.radians(1.0)
+            if not (-half_r + edge <= b <= half_l - edge):
+                continue                                  # not wholly in view
+            tol = half_w + 2.0 * unc + math.radians(1.0)
+            if any(g['span'][0] - tol <= b <= g['span'][1] + tol for g in info):
+                continue                                  # a marker block is there
+            if any(ro < r - 0.05 and abs(_normalize_angle(bo - b)) <= math.atan2(0.06, ro) for ro, bo in others_rb):
+                continue                                  # hidden behind a mapped marker or fruit
+            if _same_look((X, Y, TH), o._miss_look):
+                continue                                  # this look already counted
+            o._miss_look = (X, Y, TH)
+            o.misses += 1
+            if o.misses >= max(om.max_misses, o.looks):
+                om.drop(o, 'not_seen')
+                if o.n >= om.min_sightings:
+                    print("  obstruction at [{:+.2f}, {:+.2f}] dropped: {} looks at it since it was seen, none saw "
+                          "a marker block there".format(o.x, o.y, o.misses))
+                if self.log is not None:
+                    self.log.event('obstruction', action='dropped', id=o.id, xy=[o.x, o.y], misses=o.misses,
+                                   sightings=o.n, looks=o.looks)
+
+    def _replace_obstructions(self):
+        """A marker mapped near an obstruction (ObstructionMap.replace_radius),
+        or a fruit within replace_fruit, is what it was: the obstruction goes,
+        the real object (already an obstacle) stands for it."""
+        om = self.obstructions
+        if om is None or not om.items:
+            return
+        found = [('marker {}'.format(t), xy, None, 'by_marker')
+                 for t, xy in sorted(self.marker_positions().items())]
+        if self.fruit_mapper is not None:
+            found += [("the {}".format(label), xy, om.replace_fruit, 'by_fruit')
+                      for label, xy in sorted(self.fruit_mapper.positions().items())]
+        for what, (px, py), radius, why in found:
+            for o in list(om.items):
+                d = math.hypot(o.x - px, o.y - py)
+                if d > (om.replace_radius(o.sd_eff) if radius is None else radius):
+                    continue
+                om.drop(o, why)
+                if o.n >= om.min_sightings:
+                    print("  obstruction at [{:+.2f}, {:+.2f}] replaced by {} (mapped {:.0f} cm from it)".format(
+                        o.x, o.y, what, 100 * d))
+                if self.log is not None:
+                    self.log.event('obstruction', action='replaced', id=o.id, xy=[o.x, o.y], by=what,
+                                   sightings=o.n)
 
     # ------------------------------------------------------------------
     # Final demo: marker map built on the fly
@@ -2363,6 +2834,8 @@ class Navigator:
         n_resolved = self._resolve_fruits(new_poses)
         self.rough_sightings = {l: [move_point(p) for p in pts] for l, pts in self.rough_sightings.items()}
         self._late_sightings = {tg: [move_point(p) for p in pts] for tg, pts in self._late_sightings.items()}
+        if self.obstructions is not None:
+            self.obstructions.move(move_point)   # unexplained marker blocks move with the map too
         self._rf_poses = new_poses.tolist()
         # A marker the solver placed but the map does not have yet (seen only
         # after the lock, and never cleanly enough for _note_unknown_markers)
@@ -3116,7 +3589,8 @@ class Navigator:
     def fruit_ahead(self, distance, margin=None):
         """
         Look-before-you-drive check on the latest frame, in the ROBOT's frame:
-        is any detected fruit (mapped or not) inside the strip the robot is
+        is any detected fruit (mapped or not), or any marker block the map does
+        not explain (the CNN's 'marker' class), inside the strip the robot is
         about to sweep? Range from the box height, bearing from its centre --
         the same pinhole geometry as _detect_fruits(). Nothing here depends on
         the pose estimate or the fruit map, so it still works when the map is
@@ -3125,14 +3599,12 @@ class Navigator:
         @return: how far the robot may drive before its body comes within
             `margin` of such a fruit (m, may be <= 0), or None if the way is clear
         """
-        if not self._last_boxes:
-            return None
         dims_all = self.object_dimensions or (self.fruit_mapper.dims if self.fruit_mapper is not None else {})
         K = np.asarray(self.ekf.robot.camera_matrix, dtype=float)
         f, cx = float(K[0, 0]), float(K[0, 2])
         margin = self.path_check_margin if margin is None else margin
         limit = None
-        for label, box in self._last_boxes:
+        for label, box in self._last_boxes or []:
             dims = dims_all.get(label)
             if dims is None:
                 continue
@@ -3145,9 +3617,27 @@ class Navigator:
             if forward <= 0 or abs(lateral) >= reach:
                 continue
             stop = forward - math.sqrt(reach ** 2 - lateral ** 2)
-            if stop < distance:
-                limit = stop if limit is None else min(limit, stop)
-                self.last_fruit_ahead = label
+            if stop < distance and (limit is None or stop < limit):
+                limit = stop
+                self.last_fruit_ahead = label          # the nearest one is what the caller reports
+        # Marker blocks the CNN saw in this frame that no mapped marker explains
+        # (partly out of frame, or a tag that doesn't read): the planner cannot
+        # know about them, so stop short of them the same way. Their nearest
+        # visible edge counts, not their centre -- part of the block may be out of
+        # frame on the far side.
+        if self.obstructions_enabled and self._marker_info[0] == self._yolo_frame:
+            reach = path_planner.ROBOT_RADIUS + self.obstructions.half_block * math.sqrt(2.0) + margin
+            for g in self._marker_info[1]:
+                if g['mapped'] is not None:
+                    continue
+                lat_lo, lat_hi = g['front'] * math.tan(g['span'][0]), g['front'] * math.tan(g['span'][1])
+                if lat_hi <= -reach or lat_lo >= reach:
+                    continue
+                lateral = 0.0 if lat_lo <= 0.0 <= lat_hi else min(abs(lat_lo), abs(lat_hi))
+                stop = g['range'] - math.sqrt(max(reach ** 2 - lateral ** 2, 0.0))
+                if stop < distance and (limit is None or stop < limit):
+                    limit = stop
+                    self.last_fruit_ahead = 'marker block'
         return limit
 
     def register_fruit_ahead(self):
@@ -3162,6 +3652,8 @@ class Navigator:
         m = self.fruit_mapper
         if m is None or m.frozen or self._suppress_mapping or self._map_only != 'new' or label is None:
             return
+        if label not in m.dims:
+            return            # a marker block: it went on the obstruction map with its frame
         if label in m.positions():
             return
         s = self.ekf.robot.state
@@ -4639,6 +5131,7 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
         target_r = path_planner.load_object_radii().get(target_name, 0.08)
 
         tight = False   # set once a route with the normal margins could not be found
+                        # ('bare' once the tight ones failed too and obstructions were in play)
 
         def route_obstacles():
             """Every other object's safety circle PLUS the target's own body
@@ -4655,9 +5148,13 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             close off). Skipping the target costs a whole fruit, so plan once
             more with half the safety margins and the fruits at their bare
             size: still 3-5 cm clear of every object's body, and A* still
-            pays to keep away from them."""
-            obs = path_planner.build_obstacles(
+            pays to keep away from them. Obstructions (marker blocks whose
+            tags never read) are at a marker's size then, and left out
+            altogether ('bare') when even that leaves no route -- the camera
+            still checks every leg for a block in the way."""
+            obs = build_obstacles(
                 aruco_true_pos, object_positions, path_planner.ROBOT_RADIUS,
+                obstructions=('off' if tight == 'bare' else 'plain' if tight else 'full'),
                 object_radii=(bare_radii if tight else object_radii),
                 safety_margin=(0.5 * safety_margin if tight else safety_margin), exclude=target_name,
                 object_safety_margin=(0.5 * fruit_margin if tight else fruit_margin))
@@ -4790,6 +5287,13 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                     display.begin_target(i, target_name, target, obstacles)
                     print(f"[{target_name}] no free parking spot with the normal margins -- trying tighter ones")
                     goal, goal_risk, neighbours = pick_goal(start)
+                if goal is None and tight is True and _obstructions_in_play(nav):
+                    tight = 'bare'
+                    obstacles, grid = route_obstacles()
+                    display.begin_target(i, target_name, target, obstacles)
+                    print(f"[{target_name}] still no free parking spot -- trying without the obstructions "
+                          f"(the camera still checks each leg)")
+                    goal, goal_risk, neighbours = pick_goal(start)
                 if goal is None:
                     failure = "no collision-free standoff point"
                     break
@@ -4808,6 +5312,17 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                       f"(the target sits in a tight pocket; skipping it would lose the fruit)")
                 if goal is None:
                     failure = "no collision-free standoff point even with tight margins"
+                    break
+                path = path_planner.plan(start, goal, obstacles, planner=planner, grid=grid, bounds=bounds)
+            if path is None and tight is True and _obstructions_in_play(nav):
+                tight = 'bare'
+                obstacles, grid = route_obstacles()
+                display.begin_target(i, target_name, target, obstacles)
+                goal, goal_risk, neighbours = pick_goal(start)
+                print(f"[{target_name}] still no route -- planning without the obstructions (marker blocks whose "
+                      f"tags never read; the camera still checks each leg)")
+                if goal is None:
+                    failure = "no collision-free standoff point even without the obstructions"
                     break
                 path = path_planner.plan(start, goal, obstacles, planner=planner, grid=grid, bounds=bounds)
             if path is None and planner != 'astar':
@@ -5069,6 +5584,8 @@ def _phase0_frames(nav, obstacle_mapper, n_frames, gap=0.08):
         nav._apply_measurements(aruco, [], allow_anchor=False)   # slam_live: faces, update + add_landmarks
         if nav.detector is not None:
             box_frames.append(nav._fruit_boxes(img))
+            nav._last_boxes = box_frames[-1]          # for the look-ahead before a drive (fruit_ahead)
+            nav._note_obstructions(aruco)             # marker blocks no marker explains (ObstructionMap)
         nav.display.idle(gap)
     nav._sync_markers_live()
     if obstacle_mapper is not None and box_frames:
@@ -5093,11 +5610,11 @@ def _phase0_sweep(nav, obstacle_mapper, step, frames, overlap):
         _phase0_frames(nav, obstacle_mapper, frames)
 
 
-def _phase0_obstacles(nav, obstacle_mapper, bounds, safety_margin, fruit_margin, resolution):
+def _phase0_obstacles(nav, obstacle_mapper, bounds, safety_margin, fruit_margin, resolution, obstructions='full'):
     pos = obstacle_mapper.positions() if obstacle_mapper is not None else {}
-    obs = path_planner.build_obstacles(nav.markers_live, pos, path_planner.ROBOT_RADIUS,
-                                       object_radii=path_planner.load_object_radii(),
-                                       safety_margin=safety_margin, object_safety_margin=fruit_margin)
+    obs = build_obstacles(nav.markers_live, pos, path_planner.ROBOT_RADIUS, obstructions=obstructions,
+                          object_radii=path_planner.load_object_radii(),
+                          safety_margin=safety_margin, object_safety_margin=fruit_margin)
     grid = path_planner.OccupancyGrid(obs, bounds=bounds, resolution=resolution)
     return obs, grid
 
@@ -5107,15 +5624,38 @@ def _phase0_goto(nav, goal, obstacle_mapper, bounds, frames, safety_margin, frui
     """Drive to `goal` while SLAM stays live: plan around the markers and
     fruits seen so far, turn-and-drive in legs of at most `leg`, SLAM-update
     after every leg, and re-plan whenever the next leg would now cross
-    something just seen. @return: True if it got within 8 cm."""
-    for _ in range(attempts):
+    something just seen. Obstructions (marker blocks whose tags didn't read)
+    are planned around with their uncertainty margins; when those leave no
+    route -- typically a block or two right beside the start -- at a marker's
+    size, and then not at all: the camera's look before each leg still stops
+    the robot short of a block it can see. @return: True if it got within 8 cm."""
+    modes = ['full', 'plain', 'off'] if (nav.obstructions_enabled and nav.obstructions is not None) else ['full']
+
+    def relax(why):
+        """Next obstruction mode for this drive, or None if there is none left."""
+        if len(modes) < 2 or not nav.obstructions.confirmed():
+            return None
+        modes.pop(0)
+        print("    no route with the obstructions' {} -- {} for this drive ({})".format(
+            "uncertainty margins" if modes[0] == 'plain' else "marker-sized circles",
+            "planning them at a marker's size" if modes[0] == 'plain' else
+            "planning without them (the camera still checks each leg)", why))
+        return modes[0]
+
+    attempt = 0
+    while attempt < attempts:
+        attempt += 1
         s = nav.ekf.robot.state
         here = (float(s[0, 0]), float(s[1, 0]))
         if math.hypot(goal[0] - here[0], goal[1] - here[1]) <= 0.08:
             return True
-        obs, grid = _phase0_obstacles(nav, obstacle_mapper, bounds, safety_margin, fruit_margin, resolution)
+        obs, grid = _phase0_obstacles(nav, obstacle_mapper, bounds, safety_margin, fruit_margin, resolution,
+                                      modes[0])
         start = _escape_obstacles(here, obs, bounds=bounds)
         if start is None or path_planner.point_in_collision(goal, obs):
+            if relax("the goal or the robot is boxed in") is not None:
+                attempt -= 1           # relaxing is not a failed attempt
+                continue
             return False
         esc = math.hypot(start[0] - here[0], start[1] - here[1])
         if esc > 0.01:
@@ -5134,6 +5674,9 @@ def _phase0_goto(nav, goal, obstacle_mapper, bounds, frames, safety_margin, frui
             continue
         path = path_planner.plan(tuple(start), tuple(goal), obs, planner='astar', grid=grid, bounds=bounds)
         if path is None:
+            if relax("no path") is not None:
+                attempt -= 1
+                continue
             return False
         path = path_planner.smooth_path(path, obs)
         nav.display.set_route(goal, [tuple(p) for p in path[1:]])
@@ -5147,12 +5690,31 @@ def _phase0_goto(nav, goal, obstacle_mapper, bounds, frames, safety_margin, frui
                     break
                 d = min(leg, dist)
                 nxt = (x + d * (wp[0] - x) / dist, y + d * (wp[1] - y) / dist)
-                obs, _ = _phase0_obstacles(nav, obstacle_mapper, bounds, safety_margin, fruit_margin, resolution)
+                obs, _ = _phase0_obstacles(nav, obstacle_mapper, bounds, safety_margin, fruit_margin, resolution,
+                                           modes[0])
                 if path_planner.segment_in_collision((x, y), nxt, obs):
                     replan = True
                     break
                 nav.turn(_normalize_angle(math.atan2(wp[1] - y, wp[0] - x) - th))
                 _phase0_frames(nav, obstacle_mapper, 1)
+                # What that frame (facing the leg) saw: an obstruction noted on the
+                # leg -> plan again; a marker block or fruit right ahead that the
+                # map doesn't explain -> stop short of it.
+                s = nav.ekf.robot.state
+                x, y = float(s[0, 0]), float(s[1, 0])
+                obs, _ = _phase0_obstacles(nav, obstacle_mapper, bounds, safety_margin, fruit_margin, resolution,
+                                           modes[0])
+                if path_planner.segment_in_collision((x, y), nxt, obs):
+                    replan = True
+                    break
+                ahead = nav.fruit_ahead(d * 1.25)
+                if ahead is not None and ahead / 1.25 < d:
+                    print("  camera: {} in the way -- driving {:.2f} m instead of {:.2f} m".format(
+                        nav.last_fruit_ahead, max(0.0, ahead / 1.25), d))
+                    d = max(0.0, ahead / 1.25)
+                    if d < 0.03:
+                        replan = True
+                        break
                 nav.drive_forward(d)
                 _phase0_frames(nav, obstacle_mapper, frames)
             if replan:
@@ -5165,12 +5727,16 @@ def _phase0_next_viewpoint(nav, candidates, visited, marker_sd_ok, n_expected, o
     """The candidate most worth a sweep: near the weak markers (placed but
     not yet within marker_sd_ok), and, while markers are still missing,
     facing the widest gap in the markers seen so far from the start point
-    (where an unseen one most likely is). Candidates inside an obstacle's
-    safety circle are skipped. None when nothing is worth it."""
+    (where an unseen one most likely is), and near the obstructions -- marker
+    blocks the CNN saw whose tags didn't read, quite possibly the missing
+    markers. Candidates inside an obstacle's safety circle are skipped. None
+    when nothing is worth it."""
     pos = nav.marker_positions()
     weak = [xy for t, xy in pos.items() if nav.marker_sd(t) > marker_sd_ok]
     missing = n_expected - len(pos)
     bearings = [math.atan2(y, x) for x, y in pos.values()]
+    unread = ([(o.x, o.y) for o in nav.obstructions.confirmed()]
+              if nav.obstructions is not None and nav.obstructions_enabled else [])
     best, best_score = None, 0.0
     for c in candidates:
         if any(math.hypot(c[0] - v[0], c[1] - v[1]) < 0.15 for v in visited):
@@ -5182,6 +5748,8 @@ def _phase0_next_viewpoint(nav, candidates, visited, marker_sd_ok, n_expected, o
             cb = math.atan2(c[1], c[0])
             gap = min((abs(_normalize_angle(cb - b)) for b in bearings), default=math.pi)
             score += missing * gap / (math.pi / 2)
+            # close enough to read the tag, not so close the block fills the frame
+            score += sum(1.0 for (ox, oy) in unread if 0.35 <= math.hypot(ox - c[0], oy - c[1]) <= 1.0)
         if score > best_score:
             best, best_score = c, score
     return best
@@ -5520,7 +6088,8 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
         closed off, and went to parking seen from one direction)."""
         pos = mapper.positions()
         radii = {n: object_radii_csv.get(n, 0.08) + mapper.zone_extra(n) for n in pos}
-        obs = path_planner.build_obstacles(aruco_true_pos, pos, path_planner.ROBOT_RADIUS,
+        obs = build_obstacles(aruco_true_pos, pos, path_planner.ROBOT_RADIUS,
+                                           obstructions=('plain' if tight else 'full'),
                                            object_radii=radii,
                                            safety_margin=(0.5 * safety_margin if tight else safety_margin),
                                            object_safety_margin=(fruit_margin if tight
@@ -6129,7 +6698,7 @@ def _plan_visit_order(start, targets, positions, aruco_true_pos, object_radii=No
 
     def obstacles_for(t):
         if t not in grids:
-            obs = path_planner.build_obstacles(aruco_true_pos, positions, path_planner.ROBOT_RADIUS,
+            obs = build_obstacles(aruco_true_pos, positions, path_planner.ROBOT_RADIUS,
                                                object_radii=radii, safety_margin=safety_margin, exclude=t,
                                                object_safety_margin=fruit_margin)
             fx, fy = positions[t]
@@ -6794,6 +7363,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-face-ids", action="store_true",
                          help="don't remember which printed face of each block points where (no heading reset "
                               "from a remembered face)")
+    parser.add_argument("--no-obstructions", action="store_true",
+                         help="ignore the CNN's 'marker' class: no obstructions (marker blocks no ArUco marker "
+                              "explains) on the map and no stopping short of them before a drive")
     parser.add_argument("--log-dir", type=str, default='run_logs',
                          help="run logs go to <log-dir>/<date-time>/ (see RunLog, analyze_run.py)")
     parser.add_argument("--p0-step", type=float, default=10.0,
@@ -6880,8 +7452,11 @@ if __name__ == "__main__":
                          help="half-width of the slow pan about the best view direction, deg")
     parser.add_argument("--pan-step", type=float, default=5.0,
                          help="slow-pan step size, deg (one encoder tick is ~5 deg)")
-    parser.add_argument("--yolo-path", type=str, default='cv/model/best.pt',
-                         help="YOLO weights for fruit-based localisation; '' disables it")
+    parser.add_argument("--yolo-path", type=str, default='cv/model/include_marker_model.pt',
+                         help="YOLO weights for fruit-based localisation; '' disables it. "
+                              "cv/model/M3_best.pt is the old fruit-only model (was best.pt). The default model "
+                              "also has a 'marker' class: marker blocks it sees that no ArUco marker explains "
+                              "become obstructions (ObstructionMap)")
     parser.add_argument("--no-fruit-localise", action="store_true",
                          help="don't use fruit detections to correct the robot pose")
     parser.add_argument("--planner", choices=['astar', 'rrt'], default='astar',
@@ -7035,6 +7610,10 @@ if __name__ == "__main__":
 
     nav.log = run_log
     nav.refit_enabled = not args.no_refit
+    nav.obstructions_enabled = not args.no_obstructions
+    if args.no_obstructions:
+        ObstructionMap.active = None
+        print("Obstructions: off (--no-obstructions)")
     if nav.refit_enabled:
         import importlib.util
         if importlib.util.find_spec('scipy') is None:   # solve_pose_graph() needs scipy.optimize
@@ -7061,6 +7640,11 @@ if __name__ == "__main__":
                    'refit_faces': nav.refit_faces, 'start_heading_sd_deg': math.degrees(nav.start_heading_sd),
                    'polynomial_applied': nav.marker_corrector.applies_polynomial,
                    'config': {k: v for k, v in faces_cfg.items() if not k.startswith('_')}}),
+        'obstructions': (None if not nav.obstructions_enabled else
+                         {k: getattr(nav.obstructions, k) for k in (
+                             'box_height_m', 'half_block', 'max_range', 'close_range', 'cut_range_max',
+                             'merge_radius', 'replace_marker', 'replace_marker_max', 'replace_fruit', 'max_misses',
+                             'miss_range', 'max_sd', 'max_extra', 'min_sightings', 'expire_frames')}),
         'noise': {'marker_sd_base': getattr(nav, 'marker_sd_base', None),
                   'marker_sd_per_m': getattr(nav, 'marker_sd_per_m', None),
                   'innovation_gate': ekf.innovation_gate, 'new_landmark_inflation': ekf.new_landmark_inflation,
@@ -7133,6 +7717,8 @@ if __name__ == "__main__":
             compare_result = report_against_truth(nav, args.compare_map)
         if 'nav' in dir() and nav.marker_corrector is not None:
             print(nav.marker_corrector.summary())
+        if 'nav' in dir() and nav.obstructions_enabled and nav.obstructions is not None:
+            print(nav.obstructions.summary())
         if 'nav' in dir() and nav.face_residuals:
             r = np.array(nav.face_residuals)
             print("direction planning: turn left before the next leg after {} re-localisation(s) -- median {:.0f} deg, "
@@ -7161,6 +7747,12 @@ if __name__ == "__main__":
                 'turn_scale_learned': {'slow': nav.turn_scale, 'fast': nav.turn_scale_fast},
                 'refits_applied': nav.n_refits,
                 'faces': (nav.marker_corrector.summary() if nav.marker_corrector is not None else None),
+                'obstructions': ({'summary': nav.obstructions.summary(),
+                                  'left': [{'id': o.id, 'xy': [o.x, o.y], 'sd': o.sd_eff, 'sightings': o.n,
+                                            'looks': o.looks, 'misses': o.misses, 'partial': o.partial,
+                                            'confirmed': o.n >= nav.obstructions.min_sightings}
+                                           for o in nav.obstructions.items]}
+                                 if nav.obstructions_enabled and nav.obstructions is not None else None),
                 'compare': compare_result,
             })
         except Exception as e:

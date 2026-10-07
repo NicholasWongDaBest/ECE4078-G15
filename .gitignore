@@ -46,6 +46,9 @@ pip-delete-this-directory.txt
 !turn_scale_fast.txt
 
 *.png
+# ...except the GUI's own images: slam/ekf.py, operate.py and m3_display.py load them at start-up
+# (a "stop tracking PNG files" commit on ck deleted them, and every program crashed without them)
+!ui/**/*.png
 
 # Robot ZIP
 *.ZIP
@@ -235,3 +238,17 @@ __marimo__/
 *.json
 lab_output/object_rmse_log.csv
 lab_output/slam_state.json
+
+# ---- exclude all images and datasets ----
+*.jpg
+*.jpeg
+*.bmp
+cv/compare_out/
+cv/images/*
+cv/datasets/**
+!cv/datasets/**/
+
+# keep dataset config so the next chat can see the class layout
+!cv/datasets/merged_v2/merged_split/data.yaml
+!cv/datasets/merged_v2/merged_split/classes.txt
+
