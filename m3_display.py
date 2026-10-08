@@ -24,7 +24,9 @@ Phases:
 ESC or closing the window stops the robot and quits, in any phase.
 T (any phase) shows / hides the TRUE map's fruits (--compare-map, default
 truemap.txt) over the estimates: actual position, a line to the estimate and
-the error in cm, also printed to the console. Display only -- nothing from that
+the error in cm, also printed to the console. Errors and grades are eval.py's
+(eval_like_score): each fruit the smaller of its raw and aligned error, the
+M1 / M2 grades with eval.py's constants. Display only -- nothing from that
 file ever reaches the robot's map, planning or driving.
 The run clock starts when ENTER locks the pose in setup (or, without the
 window's setup, when the run starts) and is shown large in the bottom bar;
@@ -102,6 +104,87 @@ def fit_rigid_2d(est, true):
     theta = math.atan2(float(np.sum(a[0] * b[1] - a[1] * b[0])), float(np.sum(a[0] * b[0] + a[1] * b[1])))
     R = np.array([[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]])
     return R, mu_t - R @ mu_e
+
+
+# eval.py's grading constants (its argparse defaults) -- keep in step with eval.py
+EVAL_M1 = (0.30, 0.02, 8.0)      # markers: aligned RMSE rating 0, rating 1, base
+EVAL_M2 = (0.35, 0.025, 8.0)     # objects: error rating 0, rating 1, base
+EVAL_MISSING = 1.0               # m, an object missing from the estimate (eval_object's MAX_ERROR)
+EVAL_TOTAL_MARKERS = 10
+
+
+def eval_like_score(est_markers, est_fruits, true_markers, true_fruits):
+    """
+    Score a map exactly as eval.py does, so the window and the end-of-run
+    report show the numbers eval.py will print for the saved files:
+      - markers: best rigid alignment of the shared markers (2+), aligned
+        RMSE, grade = (B**rating - 1) / (B - 1) x markers in the estimate / 10;
+      - objects (eval_object): every true fruit gets its raw (unaligned)
+        error, a missing one EVAL_MISSING. With an alignment, each FOUND fruit
+        also gets min(aligned error, raw error); if the average of those is
+        below the raw average (missing ones included), those are the errors
+        used (missing fruits then drop out of the average, as in eval.py);
+        object grade from each fruit's own error, a missing fruit rating 0.
+    @param est_markers / true_markers: {tag: (x, y)}
+    @param est_fruits / true_fruits: {name: (x, y)}
+    @return: dict -- align (R, t) or None, n_markers, marker_rmse_raw,
+        marker_rmse, marker_grade, fruits {name: {raw, aligned, eval, source}}
+        (source 'raw' / 'aligned' / 'missing'), obj_mean, obj_grade,
+        obj_aligned_used
+    """
+    out = {'align': None, 'n_markers': len(est_markers), 'n_shared': 0, 'marker_rmse_raw': None,
+           'marker_rmse': None, 'marker_grade': None, 'fruits': {}, 'obj_mean': None, 'obj_grade': None,
+           'obj_aligned_used': False}
+    rms = lambda d: float(np.sqrt(np.mean(np.sum(d ** 2, axis=0))))
+    tags = sorted(set(est_markers) & set(true_markers))
+    out['n_shared'] = len(tags)
+    if len(tags) >= 2:
+        E = np.array([est_markers[t] for t in tags], dtype=float).T
+        T = np.array([true_markers[t] for t in tags], dtype=float).T
+        R, t = fit_rigid_2d(E, T)
+        out['align'] = (R, t)
+        out['marker_rmse_raw'] = rms(E - T)
+        al = rms(R @ E + t - T)
+        out['marker_rmse'] = al
+        mx, mn, base = EVAL_M1
+        rating = float(np.clip((mx - al) / (mx - mn), 0.0, 1.0))
+        out['marker_grade'] = 100.0 * (base ** rating - 1) / (base - 1) * len(est_markers) / EVAL_TOTAL_MARKERS
+    if not true_fruits:
+        return out
+    raw = {}
+    for name, txy in true_fruits.items():
+        if name in est_fruits:
+            raw[name] = math.hypot(est_fruits[name][0] - txy[0], est_fruits[name][1] - txy[1])
+        else:
+            raw[name] = EVAL_MISSING
+    errors = dict(raw)
+    aligned = {}
+    if out['align'] is not None:
+        R, t = out['align']
+        for name, txy in true_fruits.items():
+            if name in est_fruits:
+                p = R @ np.array(est_fruits[name], dtype=float).reshape(2, 1) + t
+                aligned[name] = math.hypot(float(p[0, 0]) - txy[0], float(p[1, 0]) - txy[1])
+        if aligned:
+            after = {n: min(aligned[n], raw[n]) for n in aligned}
+            if sum(after.values()) / len(after) < sum(raw.values()) / len(raw):
+                errors = after
+                out['obj_aligned_used'] = True
+    for name in true_fruits:
+        if name not in est_fruits:
+            src = 'missing'
+        elif out['obj_aligned_used'] and aligned.get(name, math.inf) < raw[name]:
+            src = 'aligned'
+        else:
+            src = 'raw'
+        out['fruits'][name] = {'raw': raw[name] if name in est_fruits else None, 'aligned': aligned.get(name),
+                               'eval': errors.get(name), 'source': src}
+    out['obj_mean'] = sum(errors.values()) / len(errors) if errors else None
+    mx, mn, base = EVAL_M2
+    ratings = [float(np.clip((mx - float(errors.get(n, EVAL_MISSING))) / (mx - mn), 0.0, 1.0)) for n in true_fruits]
+    avg = float(np.mean(ratings)) if ratings else 0.0
+    out['obj_grade'] = 100.0 * (base ** avg - 1) / (base - 1)
+    return out
 
 
 class _RunClock:
@@ -417,6 +500,23 @@ class M3Display(_RunClock):
             out[name] = math.hypot(est[name][0] - tx, est[name][1] - ty) if name in est else None
         return out
 
+    @staticmethod
+    def eval_summary(sc):
+        """One line of eval.py's numbers for the console / notification."""
+        parts = []
+        if sc['marker_rmse'] is not None:
+            parts.append("markers {:.1f} cm aligned (grade {:.1f})".format(100 * sc['marker_rmse'], sc['marker_grade']))
+        if sc['obj_mean'] is not None:
+            parts.append("objects {:.1f} cm (grade {:.1f}{})".format(
+                100 * sc['obj_mean'], sc['obj_grade'], "" if sc['obj_aligned_used'] else ", unaligned"))
+        return "as eval.py scores it: " + (", ".join(parts) if parts else "nothing to score yet")
+
+    def eval_score(self):
+        """The current map scored exactly as eval.py scores the saved files
+        (eval_like_score): marker RMSE and grade, each fruit's error by
+        eval.py's rule (the smaller of raw and aligned), object mean and grade."""
+        return eval_like_score(self._est_markers(), self._estimates(), self.compare_markers, self.compare_truth)
+
     def toggle_compare(self, quiet=False):
         """T: show / hide the true map's fruits. Re-read on every show, so an
         edited file is picked up. Display only. quiet: no printout (turning it
@@ -453,6 +553,7 @@ class M3Display(_RunClock):
                   "{:.3f} m, aligned {:.3f} m".format(align['n'], th, align['t'][0, 0], align['t'][1, 0],
                                                       align['raw'], align['aligned']))
         est = self._estimates()
+        sc = self.eval_score()
         for name in sorted(truth, key=lambda n: (n not in self.search_list, n)):
             tx, ty = self.truth_in_est_frame(truth[name], align)
             e = errors[name]
@@ -460,13 +561,16 @@ class M3Display(_RunClock):
             if e is None:
                 print("  {:10s} {}  true [{:+.2f}, {:+.2f}]  NOT ON THE ROBOT'S MAP".format(name, tag, tx, ty))
             else:
-                print("  {:10s} {}  true [{:+.2f}, {:+.2f}]  est [{:+.2f}, {:+.2f}]  error {:5.1f} cm".format(
-                    name, tag, tx, ty, est[name][0], est[name][1], e * 100))
+                f = sc['fruits'].get(name, {})
+                print("  {:10s} {}  true [{:+.2f}, {:+.2f}]  est [{:+.2f}, {:+.2f}]  aligned {:5.1f} cm, raw {:5.1f} cm"
+                      " -> eval {:5.1f} cm".format(name, tag, tx, ty, est[name][0], est[name][1], e * 100,
+                                                  100 * (f.get('raw') or 0.0), 100 * (f.get('eval') or 0.0)))
         if found:
-            print("  fruits: mean {:.1f} cm, worst {:.1f} cm over {} fruit(s)".format(
+            print("  fruits (aligned): mean {:.1f} cm, worst {:.1f} cm over {} fruit(s)".format(
                 100 * sum(found) / len(found), 100 * max(found), len(found)))
-            self.notification = "True map: mean error {:.1f} cm, worst {:.1f} cm ({} fruits)".format(
-                100 * sum(found) / len(found), 100 * max(found), len(found))
+        print("  " + self.eval_summary(sc))
+        if found or sc['marker_rmse'] is not None:
+            self.notification = self.eval_summary(sc)
         else:
             self.notification = "True map loaded -- no fruit estimates to compare yet"
 
@@ -817,10 +921,16 @@ class M3Display(_RunClock):
         else:
             fe = mapper.fruit_ekf
             locked = getattr(mapper, 'frozen', False)
-            found_err = [e for e in self.compare_errors().values() if e is not None] if self.compare_on else []
-            if found_err:
-                lines.append(("TRUE mean {:.1f} max {:.1f}cm".format(
-                    100 * sum(found_err) / len(found_err), 100 * max(found_err)), (110, 210, 210)))
+            sc = self.eval_score() if self.compare_on else None
+            if sc is not None and (sc['marker_rmse'] is not None or any(
+                    f['source'] != 'missing' for f in sc['fruits'].values())):
+                # what eval.py will print for the files saved now: grade (error)
+                # eval.py's grade and error (cm) for M1 markers and M2 objects
+                mk = ("M1 {:.0f} {:.1f}".format(sc['marker_grade'], 100 * sc['marker_rmse'])
+                      if sc['marker_rmse'] is not None else "M1 -")
+                ob = ("M2 {:.0f} {:.1f}".format(sc['obj_grade'], 100 * sc['obj_mean'])
+                      if sc['obj_mean'] is not None else "M2 -")
+                lines.append(("{}  {}cm".format(mk, ob), (110, 210, 210)))
             else:
                 lines.append(("YOLO {} frames  acc {}  rej {}{}".format(
                     getattr(self.nav, '_n_detect_frames', 0), mapper.n_accepted, mapper.n_rejected,
@@ -840,10 +950,13 @@ class M3Display(_RunClock):
                 colour = BAD if provisional else (GOOD if ok else WARN)
                 idx = "{}:".format(self.search_list.index(label) + 1) if label in self.search_list else "  "
                 lines.append(("{}{:9s} {:+.2f} {:+.2f}".format(idx, label[:9], pos[0, 0], pos[1, 0]), colour))
-                err = self.compare_errors().get(label) if self.compare_on else None
+                fr = sc['fruits'].get(label) if sc is not None else None
+                err = fr['eval'] if fr is not None and fr['source'] != 'missing' else None
                 if err is not None:
-                    lines.append(("   ERR {:.1f}cm  sd {:.0f}cm {}v".format(
-                        err * 100, mapper.sigma(label) * 100, fe.n_views(label)),
+                    # eval.py's error for this fruit, and which one it took
+                    # (raw = unaligned beat the aligned one)
+                    lines.append(("   EVAL {:.1f}cm {} sd{:.0f}".format(
+                        err * 100, "raw" if fr['source'] == 'raw' else "al", mapper.sigma(label) * 100),
                         GOOD if err < 0.05 else (WARN if err < 0.10 else BAD)))
                 else:
                     lines.append(("   sd {:.0f}cm  {}v {:.0f}deg  {}".format(
@@ -1065,6 +1178,7 @@ class M3Display(_RunClock):
         if self.compare_on and (self.compare_truth or self.compare_markers):
             est = self._estimates()
             align = self.compare_alignment()
+            sc = self.eval_score()
             est_m = self._est_markers()
             for tag, txy in self.compare_markers.items():
                 t_px = self._px(*self.truth_in_est_frame(txy, align))
@@ -1083,8 +1197,13 @@ class M3Display(_RunClock):
                 if name in est:
                     e_px = self._px(*est[name])
                     cv2.line(img, e_px, t_px, (40, 40, 40), 1, cv2.LINE_AA)
-                    err = math.hypot(est[name][0] - tx, est[name][1] - ty)
-                    txt = "{:.0f}cm".format(err * 100)
+                    fr = sc['fruits'].get(name) or {}
+                    err = fr.get('eval')
+                    if err is None:
+                        err = math.hypot(est[name][0] - tx, est[name][1] - ty)
+                    # eval.py's error (raw if that beat the aligned one)
+                    txt = "{:.0f}cm{}".format(err * 100, " raw" if fr.get('source') == 'raw'
+                                              and fr.get('aligned') is not None else "")
                 else:
                     txt = "missed"
                 cv2.circle(img, t_px, r_true + 2, (20, 20, 20), 3, cv2.LINE_AA)
@@ -1097,9 +1216,16 @@ class M3Display(_RunClock):
             else:
                 caption = "TRUE MAP aligned on {} markers: RMSE raw {:.1f} / aligned {:.1f} cm".format(
                     align['n'], align['raw'] * 100, align['aligned'] * 100)
-            cv2.putText(img, caption, (8, res - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 20, 20), 1, cv2.LINE_AA)
-            cv2.putText(img, "open square/ring = true, black/diamond = estimate", (8, res - 10),
+            parts = []
+            if sc['marker_rmse'] is not None:
+                parts.append("markers {:.1f}cm -> {:.1f}".format(100 * sc['marker_rmse'], sc['marker_grade']))
+            if sc['obj_mean'] is not None:
+                parts.append("objects {:.1f}cm -> {:.1f}".format(100 * sc['obj_mean'], sc['obj_grade']))
+            cv2.putText(img, "EVAL.PY: " + ("  ".join(parts) if parts else "-"), (8, res - 46),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 20, 20), 1, cv2.LINE_AA)
+            cv2.putText(img, caption, (8, res - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 20, 20), 1, cv2.LINE_AA)
+            cv2.putText(img, "ring = true, diamond = est; cm = eval.py's (raw: unaligned won)",
+                        (8, res - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 20, 20), 1, cv2.LINE_AA)
 
         # the current target's 0.4 m success zone
         if self.target_xy is not None and self.phase in ('run', 'wait'):

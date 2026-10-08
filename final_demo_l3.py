@@ -79,7 +79,7 @@ from slam import aruco_faces
 FRUIT_TAG_BASE = 100
 
 import path_planner
-from m3_display import M3Display, NullDisplay, M3Abort
+from m3_display import M3Display, NullDisplay, M3Abort, eval_like_score
 
 DIST_CORRECTION_FILE = 'distortion_correction.json'
 
@@ -216,8 +216,12 @@ class RunLog:
 
             def write(self, text):
                 self.stream.write(text)
-                self.file.write(text)
-                self.file.flush()
+                # Other code can keep a reference to this stream past close() --
+                # colorama (via ultralytics) writes a reset to it at exit -- so a
+                # closed log file is skipped, not an error.
+                if not self.file.closed:
+                    self.file.write(text)
+                    self.file.flush()
 
             def flush(self):
                 self.stream.flush()
@@ -722,12 +726,119 @@ def _obstructions_in_play(nav):
     return bool(getattr(nav, 'obstructions_enabled', False) and om is not None and om.confirmed())
 
 
+# Room to turn: the robot turns on the spot at the end of nearly every leg
+# (a re-localise pan, facing the next leg, the next leg's first turn). With
+# the small squeeze margins a stop could end 2-4 cm from a block or a fruit,
+# and the turn there is what hit it. turn_room(p) is the gap between the
+# robot's body at p and the nearest object body; a stop needs at least
+# TURN_CLEARANCE of it (--turn-clearance). TURN_RADIUS is the radius the body
+# sweeps when turning on the spot (--turn-radius; the planner's ROBOT_RADIUS
+# unless measured: wheel-axle midpoint to the furthest point of the chassis).
+TURN_CLEARANCE = 0.05
+TURN_RADIUS = None
+_BODIES = np.empty((0, 3))   # object bodies (x, y, physical radius) from the latest build_obstacles()
+
+
+def _note_bodies(aruco_positions, object_positions):
+    """Record every object's BODY (no robot radius, no margins) for turn_room():
+    markers, every fruit (the current target included), obstructions."""
+    global _BODIES
+    radii = path_planner.load_object_radii()
+    rows = [[float(x), float(y), path_planner.DEFAULT_MARKER_RADIUS]
+            for x, y in np.asarray(aruco_positions, dtype=float).reshape(-1, 2) if abs(x) + abs(y) > 1e-9]
+    rows += [[float(p[0]), float(p[1]), radii.get(n, 0.08)] for n, p in dict(object_positions).items()]
+    om = ObstructionMap.active
+    if om is not None and om.confirmed():
+        rows += om.circles(0.0, path_planner.DEFAULT_MARKER_RADIUS, 0.0, widen=False).tolist()
+    _BODIES = np.array(rows, dtype=float).reshape(-1, 3)
+
+
+def turn_room(p):
+    """Gap (m) between the robot's turning body at p and the nearest object body."""
+    if not len(_BODIES):
+        return math.inf
+    r = TURN_RADIUS if TURN_RADIUS is not None else path_planner.ROBOT_RADIUS
+    d = np.hypot(_BODIES[:, 0] - float(p[0]), _BODIES[:, 1] - float(p[1])) - _BODIES[:, 2] - r
+    return float(np.min(d))
+
+
+def turn_safe(p):
+    return turn_room(p) >= TURN_CLEARANCE
+
+
+def _gap_plan(start, towards, length, obstacles, bounds=None, final=False, step=0.02, pre_margin=0.03,
+              min_leg=0.08, through_max=0.80):
+    """
+    The double drive through a tight stretch -- anywhere the robot could not
+    turn on the spot (turn_room < TURN_CLEARANCE: between two markers, a
+    marker and a fruit, a fruit and the edge of a squeeze route...).
+    Only acts when the leg start -> `towards`, `length` long, would END in
+    such a spot:
+      - start can turn and the stretch is at least min_leg ahead: stop
+        pre_margin short of it (a full pose check there, then the next leg
+        faces along the gap and drives through);
+      - otherwise (at its mouth, or already in it): carry the drive straight
+        on through, past the planned end, to the first point where it can
+        turn again -- one drive, however long the leg cap, up to through_max,
+        as long as the extension stays inside the current safety circles'
+        free space and `bounds`;
+      - no way out in a straight line: end where planned, but with no pan
+        and no facing turn there ('confirm').
+    final: `towards` is the route's goal -- never driven past.
+    @return: None (nothing to change) or ((x, y) end, relocalise mode, note, pre_stop)
+    """
+    sx, sy = float(start[0]), float(start[1])
+    d = math.hypot(towards[0] - sx, towards[1] - sy)
+    if d < 1e-6 or length < 1e-6:
+        return None
+    ux, uy = (towards[0] - sx) / d, (towards[1] - sy) / d
+
+    def pt(t):
+        return (sx + ux * t, sy + uy * t)
+    end_t = min(length, d)
+    if turn_safe(pt(end_t)):
+        return None
+    room_end = turn_room(pt(end_t))
+    if turn_safe(start):
+        t, s_in = 0.0, None
+        while t <= end_t + 1e-9:
+            if not turn_safe(pt(t)):
+                s_in = t
+                break
+            t += step
+        if s_in is not None and s_in - pre_margin >= min_leg:
+            return (pt(s_in - pre_margin), 'auto',
+                    "the leg would end where there is {:.0f} cm to turn -- stopping {:.2f} m short of the tight "
+                    "stretch to check the pose there, then through it in one drive".format(
+                        max(room_end, 0.0) * 100, s_in - pre_margin), True)
+    if final and end_t >= d - 1e-6:
+        return None
+    obs = np.asarray(obstacles, dtype=float).reshape(-1, 3) if obstacles is not None else np.empty((0, 3))
+    base = min(0.0, path_planner.segment_clearance(start, pt(end_t), obs)) if len(obs) else 0.0
+    t = end_t
+    while t + step <= through_max + 1e-9:
+        t += step
+        p = pt(t)
+        if bounds is not None:
+            (xmin, xmax), (ymin, ymax) = bounds
+            if not (xmin <= p[0] <= xmax and ymin <= p[1] <= ymax):
+                break
+        if len(obs) and path_planner.segment_clearance(pt(end_t), p, obs) < base - 0.005:
+            break
+        if turn_safe(p):
+            return (p, 'auto', "through the tight stretch in one drive ({:.2f} m) to where it can turn "
+                               "again".format(t), False)
+    return (pt(end_t), 'confirm', "the leg ends with {:.0f} cm to turn and no straight way out -- no pan or "
+                                  "facing turn there, the next leg drives on".format(max(room_end, 0.0) * 100), False)
+
+
 def build_obstacles(aruco_positions, object_positions, robot_radius, obstructions='full', **kwargs):
     """path_planner.build_obstacles() plus the run's obstructions (ObstructionMap.active).
     obstructions: 'full' -- each a marker's safety circle widened by its position
     uncertainty; 'plain' -- a marker's circle (a route the full margins close
     off); 'off' -- left out (the look-ahead still sees them)."""
     obs = path_planner.build_obstacles(aruco_positions, object_positions, robot_radius, **kwargs)
+    _note_bodies(aruco_positions, object_positions)
     om = ObstructionMap.active
     if om is None or not om.confirmed() or obstructions == 'off':
         return obs
@@ -823,10 +934,62 @@ def init_ekf(calib_dir):
     dist_coeffs = np.loadtxt(os.path.join(calib_dir, 'distCoeffs.txt'), delimiter=',')
     scale = np.loadtxt(os.path.join(calib_dir, 'scale.txt'), delimiter=',')
     baseline = np.loadtxt(os.path.join(calib_dir, 'baseline.txt'), delimiter=',')
-    # ticks_per_meter: same value operate.py's init_ekf() currently uses (marked
-    # there as "##change this value" -- if you recalibrate it, update BOTH places).
-    robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=193.3)
+    # ticks_per_meter: encoder ticks per metre of travel, counting the ticks the
+    # wheels roll on after the Pi stops them (see DRIVE_MOTION_FILE). The tape
+    # test on 8 Oct gave 190-197 for every drive of 15 cm or more once the
+    # roll-on was counted; 171.7 only looked right on long drives because it
+    # hid a fixed ~7 cm roll-on. turn_scale*.txt were calibrated with 193.3.
+    robot = Robot(baseline, scale, camera_matrix, dist_coeffs,
+                  ticks_per_meter=load_drive_motion(calib_dir)['ticks_per_meter'])
     return EKF(robot), float(baseline)
+
+
+DRIVE_MOTION_FILE = 'drive_motion.json'   # in calib_dir; written by verify_motion.py 'save'
+DRIVE_MOTION_DEFAULTS = {
+    'ticks_per_meter': 193.3,   # ticks per metre of travel, roll-on included
+    'coast_ticks': 14.0,        # ticks the wheels roll on after a full-speed drive (drive_speed 0.4)
+    'coast_ramp_ticks': 9.0,    # shorter drives roll on less: coast * (1 - exp(-commanded / ramp))
+}
+
+
+def load_drive_motion(calib_dir='calibration/param/', quiet=True):
+    """Drive calibration (DRIVE_MOTION_DEFAULTS, overridden by calib_dir/drive_motion.json)."""
+    out = dict(DRIVE_MOTION_DEFAULTS)
+    path = os.path.join(calib_dir, DRIVE_MOTION_FILE)
+    try:
+        with open(path, 'r') as f:
+            out.update({k: float(v) for k, v in json.load(f).items() if k in DRIVE_MOTION_DEFAULTS})
+        out['source'] = path
+    except (OSError, ValueError):
+        out['source'] = 'defaults'
+    return out
+
+
+TURN_MOTION_FILE = 'turn_motion.json'
+
+
+def load_turn_motion(calib_dir='calibration/param/'):
+    """
+    Turn calibration with the roll-on (calib_dir/turn_motion.json, written by
+    verify_motion.py 'save'): for each speed, the scale for the ticks (same
+    meaning as turn_scale.txt) AND a fixed extra angle every turn adds, from
+    the wheels rolling on after the Pi stops them. On the robot (verify_motion,
+    41 trials) a fast turn came out 7.2 deg per tick + 5.8 deg, a slow one
+    5.8 deg per tick + 1.6 deg: a scale alone cannot fit that (small turns
+    came out +15-30%, big ones +2%).
+    @return: dict with any of turn_scale, turn_scale_fast, offset_deg,
+        offset_fast_deg found, plus 'source' (the path, or None if no file)
+    """
+    path = os.path.join(calib_dir, TURN_MOTION_FILE)
+    try:
+        with open(path, 'r') as f:
+            raw = json.load(f)
+        out = {k: float(raw[k]) for k in ('turn_scale', 'turn_scale_fast', 'offset_deg', 'offset_fast_deg')
+               if k in raw}
+        out['source'] = path
+        return out
+    except (OSError, ValueError, TypeError):
+        return {'source': None}
 
 
 TURN_SCALE_FILE = os.path.join('calibration', 'param', 'turn_scale.txt')            # slow turns (0.25)
@@ -1453,6 +1616,18 @@ class Navigator:
         self.small_turn_max_deg = 20.0
         self.move_timeout = move_timeout
         self.settle_time = settle_time            # s to wait after a move before the next camera frame
+        # Drives (see _drive): the wheels roll on ~coast_ticks after the Pi stops
+        # them. Command that many fewer ticks, so the robot lands where planned,
+        # and tell the EKF the ticks the encoders actually counted once the
+        # wheels have stopped -- not the commanded ones.
+        dm = load_drive_motion()
+        self.coast_ticks = dm['coast_ticks']
+        self.coast_ramp_ticks = dm['coast_ramp_ticks']
+        self.count_drive_ticks = True
+        self.coast_learn_min_ticks = 25          # drives this long teach the roll-on (full speed reached)
+        self._coast_samples = []                 # roll-on of this run's drives, ticks
+        self._drive_stats = {'counted': 0, 'fallback': 0}
+        self._count_warned = False
         self.turn_noise_frac = turn_noise_frac    # heading std dev added per turn, as a fraction of the turn
         self.drive_noise_frac = drive_noise_frac  # x/y std dev added per drive, as a fraction of the distance
         # Wheels slip when turning on the spot, so a turn can come up short even
@@ -1461,6 +1636,10 @@ class Navigator:
         # 90/80 = 1.125 and it will send proportionally more ticks per turn.
         self.turn_scale = turn_scale                  # slow turns (small_turn_speed)
         self.turn_scale_fast = turn_scale if turn_scale_fast is None else turn_scale_fast   # fast turns
+        # fixed extra rotation every turn adds (the wheels roll on after the Pi
+        # stops them), rad: slow / fast -- see load_turn_motion() and _turn_plan()
+        self.turn_offset = 0.0
+        self.turn_offset_fast = 0.0
 
         self.min_move = 0.02                      # m; closer than this counts as "already there"
         self.heading_tolerance = np.deg2rad(5.0)  # re-turn before driving if still off by more than this
@@ -3504,9 +3683,12 @@ class Navigator:
         # of them only came to 266 deg). Keep stepping until the rotation
         # actually commanded adds up to a full turn; n_steps is only the
         # estimate printed with each stop.
-        step_scale = self.turn_scale_fast if abs(step) > math.radians(self.small_turn_max_deg) else self.turn_scale
-        tick_rad = 2.0 / (self.ticks_per_meter * self.wheel_separation * step_scale)
-        per_step = max(1, int(round(abs(step) / tick_rad))) * tick_rad
+        step_fast = self._is_fast(self.turn_speed if abs(step) > math.radians(self.small_turn_max_deg)
+                                  else self.small_turn_speed)
+        per_step = self._turn_plan(step, step_fast)[1]
+        if per_step <= 0.0:
+            step_scale = self.turn_scale_fast if step_fast else self.turn_scale
+            per_step = 2.0 / (self.ticks_per_meter * self.wheel_separation * step_scale)
         n_steps = max(1, int(math.ceil(2 * math.pi / per_step - 1e-6)))
         turned = 0.0
         seen = set()
@@ -4429,7 +4611,7 @@ class Navigator:
         return self.botconnect.get_image()
 
     def _predict_commanded_motion(self, wheel_speeds, dt, dtheta=0.0, distance=0.0, completed=True,
-                                  turn_noise_frac=None):
+                                  turn_noise_frac=None, log_extra=None):
         """Feed the EKF one predict() step for a move the robot was just told to
         make: an in-place turn of `dtheta` rad and/or a straight drive of
         `distance` m."""
@@ -4459,7 +4641,8 @@ class Navigator:
         self._rf_pending.append((float(dtheta), float(distance), bool(completed)))
         if self.log is not None:
             self.log.event('move', dtheta=float(dtheta), distance=float(distance), completed=bool(completed),
-                           dt=float(dt), speeds=[float(v) for v in wheel_speeds], pose_after=self._pose_list())
+                           dt=float(dt), speeds=[float(v) for v in wheel_speeds], pose_after=self._pose_list(),
+                           **(log_extra or {}))
         self._dist_since_check += abs(distance) + (1.0 if not completed else 0.0)
         if abs(distance) > 0.0 or not completed:
             self._pos_trusted = False   # it drove (or a move was cut short): the position is in question again
@@ -4471,8 +4654,9 @@ class Navigator:
     def turn(self, dtheta, speed=None, noise_frac=None):
         """In-place turn by `dtheta` radians (positive = anticlockwise/left,
         matching robot.py's state[2] convention and operate.py's K_LEFT
-        binding of [-0.35, 0.35]). One tick is the smallest possible turn
-        (about 4.8 deg), so anything under half a tick is skipped. Turns of
+        binding of [-0.35, 0.35]). Whole ticks only, plus the speed's fixed
+        roll-on (_turn_plan): one tick is the smallest possible turn, and a
+        request nearer zero than that is skipped. Turns of
         small_turn_max_deg or less go at small_turn_speed with turn_scale,
         bigger ones at turn_speed with turn_scale_fast. `speed` overrides the
         speed (relocalise() pans slowly with it) and then picks the scale of
@@ -4485,9 +4669,7 @@ class Navigator:
         else:
             magnitude = abs(float(speed))
         fast = self._is_fast(magnitude)
-        scale = self.turn_scale_fast if fast else self.turn_scale
-        arc_length = (self.wheel_separation / 2.0) * abs(dtheta)
-        ticks = int(round(arc_length * self.ticks_per_meter * scale))
+        ticks, believed = self._turn_plan(dtheta, fast)
         if ticks < 1:
             return 0.0
         signed = magnitude if dtheta > 0 else -magnitude
@@ -4495,9 +4677,8 @@ class Navigator:
         start = time.time()
         self.botconnect.move_auto_encoder(wheel_speeds, ticks, ticks)
         completed = self._wait_for_move()
-        # the rotation those whole ticks are expected to produce
-        commanded = math.copysign(
-            2.0 * ticks / (self.ticks_per_meter * self.wheel_separation * scale), dtheta)
+        # the rotation those whole ticks are expected to produce, roll-on included
+        commanded = math.copysign(believed, dtheta)
         self._predict_commanded_motion(wheel_speeds, time.time() - start,
                                        dtheta=commanded, completed=completed, turn_noise_frac=noise_frac)
         self._cmd_rot_since_fit += commanded if completed else 0.0
@@ -4509,6 +4690,31 @@ class Navigator:
         self._settle()
         return commanded
 
+    def _turn_plan(self, dtheta, fast):
+        """
+        Ticks to command for a turn of |dtheta|, and the rotation they give.
+        A turn of n >= 1 ticks comes out n x (one tick's angle at that
+        speed's scale) + that speed's fixed roll-on (turn_offset /
+        turn_offset_fast, from turn_motion.json); n = 0 is no turn at all.
+        The n whose result is nearest the request wins -- so a request
+        smaller than about half of (one tick + the roll-on) is skipped, and
+        the commanded ticks are cut by the roll-on, as the drives are.
+        @return: (ticks, rotation in rad >= 0 the EKF is told)
+        """
+        scale = self.turn_scale_fast if fast else self.turn_scale
+        offset = self.turn_offset_fast if fast else self.turn_offset
+        tick = 2.0 / (self.ticks_per_meter * self.wheel_separation * scale)
+        want = abs(dtheta)
+        n = max(1, int(round((want - offset) / tick)))
+        best = (0, 0.0)
+        for k in (n - 1, n, n + 1):
+            if k < 1:
+                continue
+            got = k * tick + offset
+            if abs(got - want) < abs(best[1] - want):
+                best = (k, got)
+        return best
+
     def _is_fast(self, magnitude):
         """True if a turn at wheel speed `magnitude` should use turn_scale_fast:
         it is nearer turn_speed than small_turn_speed."""
@@ -4518,17 +4724,7 @@ class Navigator:
         """Drive straight BACKWARD by `distance` metres (>= 0): the same
         encoder-counted move as drive_forward() with both wheels reversed,
         fed to the EKF as a negative distance."""
-        ticks = int(round(distance * self.ticks_per_meter))
-        if ticks < 1:
-            return
-        self.last_drive_distance = ticks / self.ticks_per_meter
-        wheel_speeds = [-self.drive_speed, -self.drive_speed]
-        start = time.time()
-        self.botconnect.move_auto_encoder(wheel_speeds, ticks, ticks)
-        completed = self._wait_for_move()
-        self._predict_commanded_motion(wheel_speeds, time.time() - start,
-                                       distance=-ticks / self.ticks_per_meter, completed=completed)
-        self._settle()
+        self._drive(distance, -1.0)
 
     def markers_in_view(self, x, y, heading, min_range=0.30, max_range=1.8):
         """How many known markers the camera would see from (x, y) facing
@@ -4575,17 +4771,107 @@ class Navigator:
 
     def drive_forward(self, distance):
         """Drive straight forward by `distance` metres (>= 0)."""
-        ticks = int(round(distance * self.ticks_per_meter))
+        self._drive(distance, 1.0)
+
+    def _coast_full(self):
+        """Roll-on of a full-speed drive, ticks: this run's own drives once there
+        are a few (battery, floor), else the calibrated value."""
+        if len(self._coast_samples) >= 3:
+            return float(np.clip(np.median(self._coast_samples[-12:]), 0.0, 40.0))
+        return float(self.coast_ticks)
+
+    def _coast(self, n):
+        """Ticks the wheels are expected to roll on after an n-tick drive."""
+        return self._coast_full() * (1.0 - math.exp(-max(n, 0.0) / max(self.coast_ramp_ticks, 1e-6)))
+
+    def _drive_ticks(self, distance):
+        """Ticks to command so that commanded + roll-on = distance."""
+        want = abs(distance) * self.ticks_per_meter
+        if not self.count_drive_ticks:
+            return int(round(want))
+        if want < 1.0:
+            return 0
+        lo, hi = 0.0, want
+        for _ in range(40):                       # n + coast(n) rises with n: bisect
+            mid = 0.5 * (lo + hi)
+            if mid + self._coast(mid) < want:
+                lo = mid
+            else:
+                hi = mid
+        return max(1, int(round(0.5 * (lo + hi))))
+
+    def _counted_ticks(self, before, still=0.15, max_wait=1.0):
+        """Watch the encoders after a move until they have not changed for
+        `still` s (the roll-on is over) or `max_wait` s. @return: (dl, dr)
+        ticks since `before`, or None if the counts went down (a listen.py that
+        resets its counters) or never arrived."""
+        bc = self.botconnect
+        step, waited, quiet = 0.02, 0.0, 0.0   # time kept in idle() steps (the window keeps updating)
+        last = tuple(bc.get_encoder_counts())
+        while waited < max_wait:
+            self.display.idle(step)
+            waited += step
+            c = tuple(bc.get_encoder_counts())
+            if c != last:
+                last, quiet = c, 0.0
+            else:
+                quiet += step
+                if quiet >= still:
+                    break
+        dl, dr = last[0] - before[0], last[1] - before[1]
+        return None if dl < 0 or dr < 0 else (dl, dr)
+
+    def _drive(self, distance, sign):
+        """One straight drive of `distance` m (sign +1 forward, -1 back).
+        Stops early by the expected roll-on (_coast), then feeds the EKF the
+        distance the encoders counted once the wheels stopped. If the counts
+        look wrong (none, or far from the command), the EKF gets the command
+        plus the expected roll-on instead."""
+        ticks = self._drive_ticks(distance)
         if ticks < 1:
             return
-        self.last_drive_distance = ticks / self.ticks_per_meter
-        wheel_speeds = [self.drive_speed, self.drive_speed]
+        wheel_speeds = [sign * self.drive_speed, sign * self.drive_speed]
+        before = tuple(self.botconnect.get_encoder_counts())
         start = time.time()
         self.botconnect.move_auto_encoder(wheel_speeds, ticks, ticks)
         completed = self._wait_for_move()
-        self._predict_commanded_motion(wheel_speeds, time.time() - start,
-                                       distance=ticks / self.ticks_per_meter, completed=completed)
-        self._settle()
+        travelled, counted = float(ticks), None
+        if self.count_drive_ticks:
+            counted = self._counted_ticks(before)
+            ok = (completed and counted is not None and min(counted) >= 0.8 * ticks
+                  and max(counted) <= ticks + 60
+                  and abs(counted[0] - counted[1]) <= 0.25 * max(counted) + 6)
+            if ok:
+                travelled = 0.5 * (counted[0] + counted[1])
+                self._drive_stats['counted'] += 1
+                if ticks >= self.coast_learn_min_ticks:
+                    self._coast_samples.append(travelled - ticks)
+            else:
+                travelled = ticks + self._coast(ticks)
+                self._drive_stats['fallback'] += 1
+                if not self._count_warned:
+                    self._count_warned = True
+                    print("  drive: encoder counts {} for a {}-tick drive look wrong -- using the command plus "
+                          "the expected roll-on (warned once)".format(counted, ticks))
+        d = travelled / self.ticks_per_meter
+        self.last_drive_distance = d
+        self._predict_commanded_motion(wheel_speeds, time.time() - start, distance=sign * d, completed=completed,
+                                       log_extra={'ticks_cmd': ticks, 'ticks_counted': counted})
+        if counted is not None:
+            self.display.idle(max(0.0, self.settle_time - 0.15))   # already still for 0.15 s
+        else:
+            self._settle()
+
+    def drive_summary(self):
+        """One line for the end of the run: how the drives were measured."""
+        st = self._drive_stats
+        if not (st['counted'] or st['fallback']):
+            return None
+        rolled = ("roll-on this run: median {:.1f} ticks over {} drive(s) of {}+ ticks (calibration says {:.1f})"
+                  .format(float(np.median(self._coast_samples)), len(self._coast_samples), self.coast_learn_min_ticks,
+                          self.coast_ticks) if self._coast_samples else "no drive long enough to measure the roll-on")
+        return ("Drives: {} told to the EKF from the counted ticks, {} from the command (+ expected roll-on); {}"
+                .format(st['counted'], st['fallback'], rolled))
 
     def _wait_for_move(self):
         """Wait for the robot to finish a move_auto_encoder() command.
@@ -4658,6 +4944,8 @@ def drive_to_point(waypoint, nav, max_distance=None, relocalise=True, allow_reve
     @return: robot pose (np.array([x, y, theta])) after arriving
     """
     nav.display.set_waypoint(waypoint)
+    if not turn_safe(nav.get_robot_pose()[:2]):
+        between_markers = True   # no room to turn here: no pose-check pan before driving out
     trusted_at_start = nav.last_relocalise_converged and not nav.gap_skip_last
     skipped_before = nav.last_check_skipped   # the stop we are starting from went without its check
     nav.last_check_skipped = False
@@ -4787,7 +5075,10 @@ def drive_to_point(waypoint, nav, max_distance=None, relocalise=True, allow_reve
         # Drive out first; the next leg's pose check is from a clear spot.
         nav.last_relocalise_converged = False
         nav.n_gap_skips = getattr(nav, 'n_gap_skips', 0) + 1
-        print("  between two markers -- no re-localise pan here; the next leg drives out first")
+        print("  between two markers -- no re-localise pan here; the next leg drives out first"
+              if turn_safe(pose[:2]) else
+              "  {:.0f} cm to turn here -- no re-localise pan; the next leg drives out first".format(
+                  max(turn_room(pose[:2]), 0.0) * 100))
     elif relocalise and nav.relocalise_enabled:
         pose = nav.relocalise(face_point=face_next, face_reverse=face_reverse, face_pan=face_pan)
         print("  after re-localising: [{:.3f}, {:.3f}, {:.1f}deg]".format(
@@ -4990,6 +5281,9 @@ def choose_standoff(target, start, obstacles, grid, bounds, neighbours, planner=
             cands.append((path_planner.dist_between(start, p) + risk_weight * risk + extra, p, risk, worst, extra))
     if not cands:
         return None, None, None
+    roomy = [c for c in cands if turn_safe(c[1])]
+    if roomy:
+        cands = roomy   # it turns to check its pose (and to leave) at the spot: room to turn first
     cands.sort(key=lambda c: c[0])
     best = None
     for _, p, risk, worst, extra in (cands if n_route_checks is None else cands[:n_route_checks]):
@@ -5079,7 +5373,10 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                close_zone=0.40, close_step=0.05,
                clearance_pref=0.15, stall_legs=4, live_positions=None, object_radii=None,
                fruit_margin=0.06, bounds=None, open_leg_length=0.60, refine_weak=None,
-               object_uncertainty=None, target_margin=0.03, approach_gap=0.06, approach_overshoot=0.40):
+               object_uncertainty=None, target_margin=0.03, approach_gap=0.06, approach_overshoot=0.40,
+               squeeze_margins=((0.04, 0.03), (0.025, 0.02), (0.015, 0.01)), squeeze_leg=0.15,
+               last_resort_rings=(0.35, 0.38),
+               retry_failed=True):
     """
     M3 Level 1: full known map given, navigate to every search_list.txt target
     IN ORDER, then wait for the demonstrator's verification before moving on
@@ -5155,6 +5452,22 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
     fruit's position could be off, so a loosely mapped neighbour is given
     more room. The early "already close enough" stop only fires where the
     robot is no more boxed in than that chosen spot.
+
+    Never giving up on a fruit: when no parking spot can be reached, the
+    margins come down one rung at a time -- normal; tight (half the marker
+    margin, fruits at their bare size); without the obstructions; then the
+    squeeze rungs, squeeze_margins (marker, fruit) in turn: 4 / 3 cm,
+    2.5 / 2 cm, and 1.5 / 1 cm with parking spots out to last_resort_rings
+    as well (still inside the 0.4 m scoring radius). A* keeps a
+    route in the middle of whatever gap it uses, so even the last rung runs
+    3-5 cm clear of every block in practice. While squeezing, every drive is
+    at most squeeze_leg with a pose check after it, and as soon as the robot
+    is through, the margins go back up to the lowest rung that still
+    reaches the spot. (A run that drove into the top-left pocket behind
+    markers 1 and 9 for lime, then parked at lemon, could not plan its way
+    out again even with the tight margins and skipped redapple AND orange.)
+    retry_failed: a target that still fails is tried once more after the
+    others, from wherever the robot is by then, before it is skipped.
     """
     if bounds is None:
         bounds = planning_bounds()
@@ -5171,7 +5484,10 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
         display.notify(f"{name}: {reason} -- skipped")
         display.target_done(name, None, False)
 
-    for i, target_name in enumerate(search_list, start=1):
+    queue = list(enumerate(search_list, start=1))
+    retried = set()
+    while queue:
+        i, target_name = queue.pop(0)
         if target_name not in object_positions:
             print(f"WARNING: '{target_name}' from search_list.txt isn't in the true map -- skipping")
             display.target_done(target_name, None, False)
@@ -5182,7 +5498,7 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
         tight = False   # set once a route with the normal margins could not be found
                         # ('bare' once the tight ones failed too and obstructions were in play)
 
-        def route_obstacles():
+        def route_obstacles(level=None):
             """Every other object's safety circle PLUS the target's own body
             (robot radius + fruit radius + target_margin, ~0.18 m -- inside
             the 0.25-0.3 m parking ring, so every parking spot stays
@@ -5200,13 +5516,23 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             pays to keep away from them. Obstructions (marker blocks whose
             tags never read) are at a marker's size then, and left out
             altogether ('bare') when even that leaves no route -- the camera
-            still checks every leg for a block in the way."""
+            still checks every leg for a block in the way. ('squeeze', k):
+            the last rungs (see the docstring above) -- bare sizes, no
+            obstructions, squeeze_margins[k]."""
+            level = tight if level is None else level
+            if level is False:
+                mode, radii, m_mk, m_fr = 'full', object_radii, safety_margin, fruit_margin
+            elif level is True:
+                mode, radii, m_mk, m_fr = 'plain', bare_radii, 0.5 * safety_margin, 0.5 * fruit_margin
+            elif level == 'bare':
+                mode, radii, m_mk, m_fr = 'off', bare_radii, 0.5 * safety_margin, 0.5 * fruit_margin
+            else:   # ('squeeze', k)
+                mode, radii = 'off', bare_radii
+                m_mk, m_fr = squeeze_margins[level[1]]
             obs = build_obstacles(
                 aruco_true_pos, object_positions, path_planner.ROBOT_RADIUS,
-                obstructions=('off' if tight == 'bare' else 'plain' if tight else 'full'),
-                object_radii=(bare_radii if tight else object_radii),
-                safety_margin=(0.5 * safety_margin if tight else safety_margin), exclude=target_name,
-                object_safety_margin=(0.5 * fruit_margin if tight else fruit_margin))
+                obstructions=mode, object_radii=radii,
+                safety_margin=m_mk, exclude=target_name, object_safety_margin=m_fr)
             body = np.array([[float(target[0]), float(target[1]),
                               path_planner.ROBOT_RADIUS + target_r + target_margin]])
             obs = np.vstack([np.asarray(obs, dtype=float).reshape(-1, 3), body])
@@ -5237,13 +5563,44 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             nb = _standoff_neighbours(target_name, target,
                                       {n: p for n, p in object_positions.items() if n != target_name},
                                       aruco_true_pos, object_uncertainty)
+            rings = tuple(park_rings) + (tuple(last_resort_rings) if tight == ladder[-1] else ())
             g, g_risk, g_gap = choose_standoff(target, from_xy, obstacles, grid, bounds, nb, planner=planner,
-                                               rings=park_rings)
+                                               rings=rings)
             if g is not None:
                 bearing = math.degrees(math.atan2(g[1] - target[1], g[0] - target[0]))
                 print(f"[{target_name}] parking spot [{g[0]:.2f}, {g[1]:.2f}] ({bearing:+.0f} deg side of the fruit): "
                       f"{g_gap * 100:.0f} cm clear of the nearest other object after its uncertainty, risk {g_risk:.2f}")
             return g, g_risk, nb
+
+        ladder = [False, True, 'bare'] + [('squeeze', k) for k in range(len(squeeze_margins))]
+
+        def escalate(what):
+            """One rung down the margin ladder (see the docstring); False at the bottom."""
+            nonlocal tight, obstacles, grid
+            k = next(n for n, lv in enumerate(ladder) if lv is tight or lv == tight and not isinstance(lv, bool)) + 1
+            if k < len(ladder) and ladder[k] == 'bare' and not _obstructions_in_play(nav):
+                k += 1
+            if k >= len(ladder):
+                return False
+            tight = ladder[k]
+            obstacles, grid = route_obstacles()
+            display.begin_target(i, target_name, target, obstacles)
+            if tight is True:
+                print(f"[{target_name}] no {what} with the normal margins -- trying tighter ones")
+            elif tight == 'bare':
+                print(f"[{target_name}] still no {what} -- trying without the obstructions "
+                      f"(the camera still checks each leg)")
+            else:
+                m_mk, m_fr = squeeze_margins[tight[1]]
+                print(f"[{target_name}] still no {what} -- squeezing through: {m_mk * 100:.1f} cm margin on the "
+                      f"markers, {m_fr * 100:.1f} cm on the fruits, {squeeze_leg * 100:.0f} cm drives with a pose "
+                      f"check after each"
+                      + (f", parking spots out to {max(last_resort_rings):.2f} m from the fruit" if tight == ladder[-1]
+                         else "") + " (skipping would lose the fruit)")
+            display.notify(f"{target_name}: no {what} -- " + ("tighter margins" if tight is True else
+                                                               "ignoring obstructions" if tight == 'bare' else
+                                                               "squeezing through"))
+            return True
         for leg in range(1, max_legs + 1):
             if live_positions is not None and leg > 1:
                 latest = dict(live_positions())
@@ -5330,50 +5687,38 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                     goal, goal_risk, neighbours = new_goal, new_risk, new_nb
             if goal is None:
                 goal, goal_risk, neighbours = pick_goal(start)
-                if goal is None and not tight:
-                    tight = True
-                    obstacles, grid = route_obstacles()
-                    display.begin_target(i, target_name, target, obstacles)
-                    print(f"[{target_name}] no free parking spot with the normal margins -- trying tighter ones")
-                    goal, goal_risk, neighbours = pick_goal(start)
-                if goal is None and tight is True and _obstructions_in_play(nav):
-                    tight = 'bare'
-                    obstacles, grid = route_obstacles()
-                    display.begin_target(i, target_name, target, obstacles)
-                    print(f"[{target_name}] still no free parking spot -- trying without the obstructions "
-                          f"(the camera still checks each leg)")
+                while goal is None and escalate("reachable parking spot"):
                     goal, goal_risk, neighbours = pick_goal(start)
                 if goal is None:
-                    failure = "no collision-free standoff point"
+                    failure = f"no reachable parking spot from [{start[0]:.2f}, {start[1]:.2f}], even with the tightest margins"
                     break
 
             remaining = path_planner.dist_between(start, goal)
             if remaining <= goal_tolerance:
                 break
 
+            if isinstance(tight, tuple) and planner == 'astar':
+                # Through the squeeze? Back up to the lowest rung that still
+                # reaches the spot, once the robot is clear of that rung's circles.
+                for lower in [False, True] + (['bare'] if _obstructions_in_play(nav) else []):
+                    obs_l, grid_l = route_obstacles(lower)
+                    if path_planner.point_in_collision(goal, obs_l) or path_planner.point_in_collision(start, obs_l):
+                        continue
+                    if path_planner.plan(start, goal, obs_l, planner=planner, grid=grid_l, bounds=bounds) is None:
+                        continue
+                    print(f"[{target_name}] through the tight part -- back to the "
+                          f"{'normal' if lower is False else 'tight' if lower is True else 'no-obstruction'} margins")
+                    tight, obstacles, grid = lower, obs_l, grid_l
+                    display.begin_target(i, target_name, target, obstacles)
+                    break
             path = path_planner.plan(start, goal, obstacles, planner=planner, grid=grid, bounds=bounds)
-            if path is None and not tight:
-                tight = True
-                obstacles, grid = route_obstacles()
-                display.begin_target(i, target_name, target, obstacles)
+            while path is None and escalate("route to the parking spot"):
                 goal, goal_risk, neighbours = pick_goal(start)
-                print(f"[{target_name}] no route with the normal margins -- planning with half margins "
-                      f"(the target sits in a tight pocket; skipping it would lose the fruit)")
-                if goal is None:
-                    failure = "no collision-free standoff point even with tight margins"
-                    break
-                path = path_planner.plan(start, goal, obstacles, planner=planner, grid=grid, bounds=bounds)
-            if path is None and tight is True and _obstructions_in_play(nav):
-                tight = 'bare'
-                obstacles, grid = route_obstacles()
-                display.begin_target(i, target_name, target, obstacles)
-                goal, goal_risk, neighbours = pick_goal(start)
-                print(f"[{target_name}] still no route -- planning without the obstructions (marker blocks whose "
-                      f"tags never read; the camera still checks each leg)")
-                if goal is None:
-                    failure = "no collision-free standoff point even without the obstructions"
-                    break
-                path = path_planner.plan(start, goal, obstacles, planner=planner, grid=grid, bounds=bounds)
+                if goal is not None:
+                    path = path_planner.plan(start, goal, obstacles, planner=planner, grid=grid, bounds=bounds)
+            if goal is None:
+                failure = f"no reachable parking spot from [{start[0]:.2f}, {start[1]:.2f}], even with the tightest margins"
+                break
             if path is None and planner != 'astar':
                 # RRT* refuses a start inside a circle; only then fall back to an escape point.
                 alt = _escape_obstacles(start, obstacles, bounds=bounds)
@@ -5430,6 +5775,9 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                           f"drive is capped at {close_step * 100:.0f} cm")
                 leg_cap = min(leg_cap, close_step)
                 open_leg = False
+            if isinstance(tight, tuple):
+                leg_cap = min(leg_cap, squeeze_leg)   # squeezing past things: short drives, a pose check after each
+                open_leg = False
             guarded = _overshoot_cap(start, next_wp, min(leg_cap, leg_len), obstacles)
             # The drive toward the fruit itself: even if it runs
             # approach_overshoot (40%) long -- this robot's worst measured --
@@ -5454,7 +5802,23 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
 
             reloc_mode = 'auto'
             gap_stop = False
-            if nav.avoid_gap_stops:
+            tight_end = False
+            gp = None if in_close else _gap_plan(start, next_wp, path_planner.dist_between(start, next_wp), obstacles,
+                                                 bounds=bounds,
+                                                 final=path_planner.dist_between(next_wp, goal) < 1e-6)
+            if gp is not None:
+                end, reloc_mode, note, gap_stop = gp
+                print(f"[{target_name}] {note}")
+                old = next_wp
+                next_wp = end
+                if path_planner.dist_between(start, end) > path_planner.dist_between(start, old) + 1e-6:
+                    waypoints = [end] + list(waypoints[1:])   # driven through, past the old end
+                elif path_planner.dist_between(end, old) > 1e-6:
+                    waypoints = [end] + list(waypoints)         # stopping short of the tight stretch
+                leg_cap = leg_len = path_planner.dist_between(start, next_wp)
+                open_leg = False
+                tight_end = reloc_mode == 'confirm'
+            elif nav.avoid_gap_stops:
                 d_wp = path_planner.dist_between(start, next_wp)
                 capped = min(leg_cap, d_wp)
                 frac = min(1.0, capped / max(d_wp, 1e-9))
@@ -5497,7 +5861,7 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             face_next = waypoints[1] if len(waypoints) > 1 else (float(target[0]), float(target[1]))
             face_rev = len(waypoints) > 1 and _reverse_likely(nav, next_wp, face_next, target, obstacles[:-1],
                                                                max_leg_length, close_zone)
-            if path_planner.dist_between(next_wp, target) <= close_zone + 0.10 or \
+            if path_planner.dist_between(next_wp, target) <= close_zone + 0.10 or tight_end or \
                     path_planner.dist_between(next_wp, face_next) < 0.15:
                 # Next to the fruit the drives are a few cm each, and after a
                 # short leg a few degrees of heading are a few mm of position:
@@ -5516,6 +5880,13 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                   f"standoff point after {max_legs} legs -- reporting where it got to")
 
         if failure is not None:
+            if retry_failed and queue and target_name not in retried:
+                retried.add(target_name)
+                print(f"[{target_name}] {failure} -- trying it again after {', '.join(n for _, n in queue)}, "
+                      f"from wherever the robot is by then")
+                display.notify(f"{target_name}: {failure} -- retrying after the others")
+                queue.append((i, target_name))
+                continue
             skip(target_name, failure)
             continue
 
@@ -6009,10 +6380,36 @@ def report_against_truth(nav, fname):
     if errs:
         print("[compare] fruits (aligned): {} mapped, RMSE {:.3f} m".format(
             len(errs), float(np.sqrt(np.mean(np.square(errs))))))
+    # ...and exactly as eval.py will score the saved files (each fruit the
+    # smaller of its raw and aligned error; M1 / M2 grades)
+    sc = eval_like_score({int(t): (float(x), float(y)) for t, (x, y) in est_m.items()},
+                         {n: (float(x), float(y)) for n, (x, y) in fruits.items()},
+                         {int(k[len('aruco'):].split('_')[0]): (float(v['x']), float(v['y']))
+                          for k, v in gt.items() if k.startswith('aruco')},
+                         {k.split('_')[0]: (float(v['x']), float(v['y'])) for k, v in gt.items()
+                          if not k.startswith('aruco')})
+    ev = None
+    if sc['marker_rmse'] is not None or sc['obj_mean'] is not None:
+        print("[compare] as eval.py scores it: markers {} | objects {}".format(
+            "-" if sc['marker_rmse'] is None else "{:.3f} m aligned, grade {:.1f}".format(sc['marker_rmse'],
+                                                                                        sc['marker_grade']),
+            "-" if sc['obj_mean'] is None else "mean {:.3f} m, grade {:.1f}{}".format(
+                sc['obj_mean'], sc['obj_grade'], "" if sc['obj_aligned_used'] else " (unaligned)")))
+        for name, f in sorted(sc['fruits'].items()):
+            if f['source'] == 'missing':
+                print("            {:10s} missing".format(name))
+            else:
+                print("            {:10s} raw {:5.1f} cm  aligned {:5.1f} cm  -> eval {:5.1f} cm".format(
+                    name, 100 * f['raw'], 100 * (f['aligned'] if f['aligned'] is not None else f['raw']),
+                    100 * f['eval']))
+        ev = {'marker_rmse': sc['marker_rmse'], 'marker_grade': sc['marker_grade'], 'obj_mean': sc['obj_mean'],
+              'obj_grade': sc['obj_grade'], 'obj_aligned_used': sc['obj_aligned_used'],
+              'fruits': {n: f['eval'] for n, f in sc['fruits'].items()}}
     return {'truemap': fname, 'markers_mapped': len(pairs), 'marker_rmse_raw': raw, 'marker_rmse_aligned': al,
             'marker_errors_aligned': {str(p[0]): float(np.hypot(*(aligned[:, i] - T[:, i])))
                                       for i, p in enumerate(pairs)},
-            'fruit_rmse_aligned': (float(np.sqrt(np.mean(np.square(errs)))) if errs else None)}
+            'fruit_rmse_aligned': (float(np.sqrt(np.mean(np.square(errs)))) if errs else None),
+            'eval': ev}
 
 
 def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_resolution=0.05,
@@ -6024,7 +6421,8 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                hard_max_viewpoints=None, explore_fruit_margin=0.12, optimise_order=True,
                looks_on_the_way=2, look_max_range=1.0, look_min_range=0.40, look_min_new=np.deg2rad(30.0),
                tight_leg_length=0.25, viewpoint_looks=3, viewpoint_look_range=(0.30, 1.1), viewpoint_others_bonus=1.0,
-               park_early_range=1.0, centre_scanned=False, **level1_kwargs):
+               park_early_range=1.0, centre_scanned=False, squeeze_margins=(0.025, 0.02), squeeze_leg=0.15,
+               **level1_kwargs):
     """
     M3 Level 3: only the ArUco markers are given. Map the fruits first, then
     park at the search_list ones in order.
@@ -6134,8 +6532,20 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
         for reaching a viewpoint on a search-list fruit that the normal
         margins seal off (a fruit in a pocket between markers at the edge:
         lime between markers 5, 6 and 10 had every spot in front of it
-        closed off, and went to parking seen from one direction)."""
+        closed off, and went to parking seen from one direction).
+        tight='squeeze': only for getting OUT of a pocket that even the
+        tight margins seal (run_level1's squeeze rung: bare sizes, no
+        obstructions, squeeze_margins) -- the robot drove in, so there is a
+        way out, and every fruit left to map is on the other side of it."""
         pos = mapper.positions()
+        if tight == 'squeeze':
+            obs = build_obstacles(aruco_true_pos, pos, path_planner.ROBOT_RADIUS, obstructions='off',
+                                  object_radii={n: object_radii_csv.get(n, 0.08) for n in pos},
+                                  safety_margin=squeeze_margins[0], object_safety_margin=squeeze_margins[1])
+            grd = (path_planner.OccupancyGrid(obs, bounds=bounds, resolution=grid_resolution,
+                                              clearance_pref=clearance_pref)
+                   if planner == 'astar' else None)
+            return obs, grd
         radii = {n: object_radii_csv.get(n, 0.08) + mapper.zone_extra(n) for n in pos}
         obs = build_obstacles(aruco_true_pos, pos, path_planner.ROBOT_RADIUS,
                                            obstructions=('plain' if tight else 'full'),
@@ -6147,6 +6557,31 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                                           clearance_pref=clearance_pref)
                if planner == 'astar' else None)
         return obs, grd
+
+    def escaping(goal):
+        """Obstacles for _go_to while squeezing out of a pocket: the squeeze
+        margins (and squeeze_leg drives) only until a route to `goal` exists
+        with the tight or the normal exploring ones from where the robot is
+        (and it stands clear of their circles) -- the rest of the way is
+        driven like any other route."""
+        def src():
+            here = tuple(float(v) for v in nav.get_robot_pose()[:2])
+            for lv in (False, True):
+                obs, grd = current_obstacles(tight=lv)
+                if len(obs) and (path_planner.point_in_collision(here, obs)
+                                 or path_planner.point_in_collision(goal, obs)):
+                    continue
+                if path_planner.plan(here, goal, obs, planner=planner, grid=grd, bounds=bounds) is None:
+                    continue
+                if src.max_leg:
+                    print("[explore] out of the tight part -- back to the {} margins".format(
+                        "tight" if lv else "normal exploring"))
+                src.max_leg = None
+                return obs, grd
+            src.max_leg = squeeze_leg
+            return current_obstacles(tight='squeeze')
+        src.max_leg = squeeze_leg
+        return src
 
     print("\n=== Level 3, phase 1: mapping the fruits ===")
     display.notify("Level 3: mapping fruits")
@@ -6458,6 +6893,26 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                     if vp_t is not None:
                         vp, focus, tight_route = vp_t, focus_t, True
                         why = why_t + " (reachable only with tighter margins: the exploring ones seal it off)"
+                    elif 'sealed off' in why_t:
+                        # The robot itself is in a pocket even the tight
+                        # margins close (it drove in through a gap that a
+                        # fruit's refined estimate has since narrowed): squeeze
+                        # out rather than end the exploration in there.
+                        obs_s, grid_s = current_obstacles(tight='squeeze')
+                        vp_s, why_s, focus_s = _next_viewpoint(mapper, search_list, pose, obs_s, view_ring,
+                                                               bounds=bounds, markers=markers_xy, look_half=look_half,
+                                                               half_fov=half_fov, avoid=avoid, grid=grid_s,
+                                                               planner=planner, rough=rough, tried=tried,
+                                                               others_bonus=(viewpoint_others_bonus if viewpoint_looks
+                                                                             else 0.0),
+                                                               others_range=tuple(viewpoint_look_range),
+                                                               others_min_new=look_min_new)
+                        if vp_s is not None:
+                            vp, focus, tight_route = vp_s, focus_s, 'squeeze'
+                            why = why_s + " (the robot is boxed in even with the tight margins: squeezing out)"
+                            print("[explore] boxed in: {} -- squeezing out ({:.1f} cm margin on the markers, "
+                                  "{:.1f} cm on the fruits, {:.0f} cm drives)".format(
+                                      why_t, squeeze_margins[0] * 100, squeeze_margins[1] * 100, squeeze_leg * 100))
             if vp is None:
                 weak = not_ok()
                 weak_targets = [l for l in weak if l in search_list]
@@ -6520,13 +6975,16 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                 # A route only the tighter margins allow squeezes past things:
                 # short legs, no open ones, so a drive that runs long or
                 # drifts is caught by the next pose check before it adds up.
-                pose, failure = _go_to(nav, vp, ((lambda: current_obstacles(tight=True)) if tight_route
+                pose, failure = _go_to(nav, vp, (escaping(vp) if tight_route == 'squeeze' else
+                                                 (lambda: current_obstacles(tight=True)) if tight_route
                                                  else current_obstacles), None, planner=planner,
-                                       max_leg_length=(min(explore_leg_length, tight_leg_length) if tight_route
+                                       max_leg_length=(explore_leg_length if tight_route == 'squeeze'
+                                                       else min(explore_leg_length, tight_leg_length) if tight_route
                                                        else explore_leg_length),
                                        clearance_pref=clearance_pref,
                                        label="explore", bounds=bounds,
-                                       open_leg_length=(0.0 if tight_route else open_leg_length),
+                                       open_leg_length=(open_leg_length if tight_route == 'squeeze'
+                                                        else 0.0 if tight_route else open_leg_length),
                                        after_leg=way, markers=markers_xy, face_at_goal=face_goal,
                                        stop_when=found_on_the_way, **level1_kwargs)
             if failure is not None and failure.endswith("found no route") and not tight_route:
@@ -6540,6 +6998,17 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                                            max_leg_length=min(explore_leg_length, tight_leg_length),
                                            clearance_pref=clearance_pref,
                                            label="explore", bounds=bounds, open_leg_length=0.0,
+                                           after_leg=way, markers=markers_xy, face_at_goal=face_goal,
+                                           stop_when=found_on_the_way, **level1_kwargs)
+            if failure is not None and failure.endswith("found no route") and tight_route != 'squeeze':
+                # Still boxed in: the robot got in here, so squeeze back out.
+                print(f"[explore] still no route -- squeezing out ({squeeze_margins[0] * 100:.1f} cm margin on the "
+                      f"markers, {squeeze_margins[1] * 100:.1f} cm on the fruits, {squeeze_leg * 100:.0f} cm drives)")
+                with nav.mapping_policy('new'):
+                    pose, failure = _go_to(nav, vp, escaping(vp), None, planner=planner,
+                                           max_leg_length=explore_leg_length,
+                                           clearance_pref=clearance_pref,
+                                           label="explore", bounds=bounds, open_leg_length=open_leg_length,
                                            after_leg=way, markers=markers_xy, face_at_goal=face_goal,
                                            stop_when=found_on_the_way, **level1_kwargs)
             if failure is not None:
@@ -7262,8 +7731,12 @@ def _go_to(nav, goal, obstacles, grid, planner='astar', max_leg_length=0.25, cle
             if why:
                 print(f"[{label}] {why} -- not driving on to [{goal[0]:.2f}, {goal[1]:.2f}]")
                 return pose, None
+        leg_now, open_now = max_leg_length, open_leg_length
         if obstacles_src is not None:
             obstacles, grid = obstacles_src()
+            if getattr(obstacles_src, 'max_leg', None):
+                # squeezing out of a pocket (run_level3): short legs, no open ones, until it is out
+                leg_now, open_now = min(max_leg_length, obstacles_src.max_leg), 0.0
             if n_known is not None and len(obstacles) != n_known:
                 print(f"[{label}] obstacle map changed ({len(obstacles) - n_known:+d}) -- re-planning against it")
                 if len(obstacles) and path_planner.point_in_collision(goal, np.asarray(obstacles, dtype=float)):
@@ -7292,7 +7765,7 @@ def _go_to(nav, goal, obstacles, grid, planner='astar', max_leg_length=0.25, cle
         if not waypoints:
             return pose, None
         next_wp = waypoints[0]
-        leg_cap, open_leg = _leg_cap(nav, start, next_wp, obstacles, max_leg_length, open_leg_length,
+        leg_cap, open_leg = _leg_cap(nav, start, next_wp, obstacles, leg_now, open_now,
                                      bounds=bounds)
         leg_len = path_planner.dist_between(start, next_wp)
         guarded = _overshoot_cap(start, next_wp, min(leg_cap, leg_len), obstacles)
@@ -7305,7 +7778,15 @@ def _go_to(nav, goal, obstacles, grid, planner='astar', max_leg_length=0.25, cle
             next_wp = (start[0] + f * (next_wp[0] - start[0]), start[1] + f * (next_wp[1] - start[1]))
         reloc_mode = 'auto'
         gap_stop = False
-        if markers is not None and nav.avoid_gap_stops:
+        tight_end = False
+        gp = _gap_plan(start, waypoints[0], path_planner.dist_between(start, next_wp), obstacles, bounds=bounds,
+                       final=len(waypoints) == 1)
+        if gp is not None:
+            next_wp, reloc_mode, note, gap_stop = gp
+            print(f"[{label}] {note}")
+            leg_cap = leg_len = path_planner.dist_between(start, next_wp)
+            tight_end = reloc_mode == 'confirm'
+        elif markers is not None and nav.avoid_gap_stops:
             capped = min(leg_cap, path_planner.dist_between(start, next_wp))
             cap2, reloc_mode, note = _legs_around_gaps(start, next_wp, capped, markers)
             if reloc_mode == 'confirm' and nav.gap_skip_last:
@@ -7329,11 +7810,11 @@ def _go_to(nav, goal, obstacles, grid, planner='astar', max_leg_length=0.25, cle
             face_next = seq[1] if len(seq) > 1 else None
         else:
             face_next = face_at_goal
-        if not nav.face_explore:
+        if not nav.face_explore or tight_end:
             face_next = None
         nav.display.set_route(goal, waypoints)
         print(f"[{label}] leg {leg}: {route_len:.2f} m of route to go -> driving to [{next_wp[0]:.2f}, {next_wp[1]:.2f}]"
-              f"{' (open leg)' if open_leg and leg_len > max_leg_length else ''}")
+              f"{' (open leg)' if open_leg and leg_len > leg_now else ''}")
         # Backwards only once every fruit is on the map: while exploring, the
         # camera's look-ahead is what catches one that is not.
         m = nav.fruit_mapper
@@ -7464,10 +7945,29 @@ if __name__ == "__main__":
                               "(faster, but errors accumulate)")
     parser.add_argument("--small-turn-speed", type=float, default=0.25,
                          help="wheel speed for turns of --small-turn-deg or less (bigger turns use --turn-speed)")
+    parser.add_argument("--no-turn-offset", action="store_true",
+                         help="ignore calibration/param/turn_motion.json: turn_scale*.txt and no roll-on (the old turns)")
+    parser.add_argument("--turn-offset", type=float, default=None, metavar="DEG",
+                         help="slow turns' roll-on, deg (default: turn_motion.json, else 0)")
+    parser.add_argument("--turn-offset-fast", type=float, default=None, metavar="DEG",
+                         help="fast turns' roll-on, deg (default: turn_motion.json, else 0)")
     parser.add_argument("--small-turn-deg", type=float, default=20.0,
                          help="turns of this many degrees or less are small turns (slow speed, turn_scale.txt)")
+    parser.add_argument("--no-count-ticks", action="store_true",
+                         help="drives as before: command distance x ticks_per_meter and tell the EKF the commanded "
+                              "ticks (no early stop for the roll-on, encoders not read)")
+    parser.add_argument("--coast-ticks", type=float, default=None,
+                         help="roll-on after a full-speed drive, ticks (default: calibration/param/drive_motion.json, "
+                              "else 14)")
     parser.add_argument("--no-straight-skip", action="store_true",
                          help="re-localise at every stop, even in the middle of a straight run")
+    parser.add_argument("--turn-clearance", type=float, default=0.05, metavar="M",
+                        help="room (m) the robot needs between its body and any marker or fruit to turn on the "
+                             "spot. No leg ends, and no pan or facing turn happens, where it has less: it stops "
+                             "before such a stretch and drives through it in one go (default 0.05)")
+    parser.add_argument("--turn-radius", type=float, default=None, metavar="M",
+                        help="radius (m) the body sweeps when turning on the spot: wheel-axle midpoint to the "
+                             "furthest point of the chassis (default: the planner's robot radius)")
     parser.add_argument("--tiny-hop", type=float, default=0.10,
                          help="skip a first waypoint closer than this (m) when the line to the next one is clear; "
                               "0 = always drive to it")
@@ -7513,7 +8013,7 @@ if __name__ == "__main__":
                          help="don't use fruit detections to correct the robot pose")
     parser.add_argument("--planner", choices=['astar', 'rrt'], default='astar',
                          help="path planner (default A*; rrt keeps the old RRT* for comparison)")
-    parser.add_argument("--grid-res", type=float, default=0.05, help="A* cell size, m")
+    parser.add_argument("--grid-res", type=float, default=0.025, help="A* cell size, m")
     parser.add_argument("--max-leg", type=float, default=0.25,
                          help="longest single drive between re-localisations, m")
     parser.add_argument("--safety-margin", type=float, default=0.10,
@@ -7550,16 +8050,16 @@ if __name__ == "__main__":
     parser.add_argument("--min-views", type=int, default=2,
                          help="Level 3: distinct bearings (10+ deg apart) a fruit must be seen from to count as "
                               "well mapped")
-    parser.add_argument("--min-sightings", type=int, default=4,
+    parser.add_argument("--min-sightings", type=int, default=5,
                          help="Level 3: sightings fused into a search-list fruit's estimate before it counts as "
                               "well mapped (1 = the old bar)")
-    parser.add_argument("--target-sightings", type=int, default=6,
+    parser.add_argument("--target-sightings", type=int, default=8,
                          help="Level 3: fused sightings a search-list fruit needs before exploration stops working "
                               "on it (1 = the old bar)")
-    parser.add_argument("--target-spread", type=float, default=60.0,
+    parser.add_argument("--target-spread", type=float, default=100.0,
                          help="Level 3: a search-list fruit counts as pinned down once its views span this "
                               "many degrees (and it has one from within --target-close), deg")
-    parser.add_argument("--target-views", type=int, default=4,
+    parser.add_argument("--target-views", type=int, default=5,
                          help="Level 3: distinct directions a search-list fruit must be seen from to count as "
                               "pinned down")
     parser.add_argument("--no-unlock", action="store_true",
@@ -7603,9 +8103,17 @@ if __name__ == "__main__":
     aruco_sensor = CorrectedArucoSensor(ekf.robot, marker_length=0.06, enabled=args.dist_correction,
                                         faces_config=(faces_cfg if faces_cfg.get('faces', True) else None))
 
-    turn_scale = args.turn_scale if args.turn_scale is not None else load_turn_scale()
+    tm = {'source': None} if args.no_turn_offset else load_turn_motion(args.calib_dir)
+    if args.turn_scale is not None:
+        turn_scale = args.turn_scale
+    elif 'turn_scale' in tm:
+        turn_scale = tm['turn_scale']
+    else:
+        turn_scale = load_turn_scale()
     if args.turn_scale_fast is not None:
         turn_scale_fast = args.turn_scale_fast
+    elif 'turn_scale_fast' in tm:
+        turn_scale_fast = tm['turn_scale_fast']
     elif os.path.exists(TURN_SCALE_FAST_FILE):
         turn_scale_fast = load_turn_scale(TURN_SCALE_FAST_FILE)
     else:
@@ -7619,10 +8127,30 @@ if __name__ == "__main__":
     nav.face_planning = not args.no_face_planning
     nav.straight_skip = not args.no_straight_skip
     nav.tiny_hop = max(0.0, args.tiny_hop)
+    TURN_CLEARANCE = max(0.0, args.turn_clearance)
+    TURN_RADIUS = args.turn_radius
     nav.small_turn_speed = args.small_turn_speed
     nav.small_turn_max_deg = max(0.0, args.small_turn_deg)
-    print("Turns: <= {:.0f} deg at {:.2f} with turn_scale {:.4f}; bigger at {:.2f} with turn_scale_fast {:.4f}".format(
-        nav.small_turn_max_deg, nav.small_turn_speed, nav.turn_scale, nav.turn_speed, nav.turn_scale_fast))
+    nav.turn_motion_source = tm['source']
+    nav.turn_offset = math.radians(args.turn_offset if args.turn_offset is not None else tm.get('offset_deg', 0.0))
+    nav.turn_offset_fast = math.radians(args.turn_offset_fast if args.turn_offset_fast is not None
+                                        else tm.get('offset_fast_deg', 0.0))
+    print("Turns: <= {:.0f} deg at {:.2f} with turn_scale {:.4f} + {:.1f} deg roll-on; bigger at {:.2f} with "
+          "turn_scale_fast {:.4f} + {:.1f} deg roll-on (from {})".format(
+              nav.small_turn_max_deg, nav.small_turn_speed, nav.turn_scale, math.degrees(nav.turn_offset),
+              nav.turn_speed, nav.turn_scale_fast, math.degrees(nav.turn_offset_fast),
+              tm['source'] or ("--no-turn-offset" if args.no_turn_offset else
+                               "turn_scale*.txt, no turn_motion.json: no roll-on")))
+    dm = load_drive_motion(args.calib_dir)
+    nav.coast_ticks = dm['coast_ticks'] if args.coast_ticks is None else max(0.0, args.coast_ticks)
+    nav.coast_ramp_ticks = dm['coast_ramp_ticks']
+    nav.count_drive_ticks = not args.no_count_ticks
+    if nav.count_drive_ticks:
+        print("Drives: {:.1f} ticks/m, roll-on ~{:.0f} ticks after a full-speed drive (from {}): stopped that much "
+              "early, EKF told the ticks counted once the wheels stop".format(
+                  nav.ticks_per_meter, nav.coast_ticks, dm['source'] if args.coast_ticks is None else '--coast-ticks'))
+    else:
+        print("Drives: {:.1f} ticks/m, commanded ticks only (--no-count-ticks)".format(nav.ticks_per_meter))
     nav.one_marker_heading = not args.no_one_marker_heading
     if nav.marker_corrector is None:
         print("ArUco faces: off (--no-faces) -- face-centre readings, no heading from faces")
@@ -7688,6 +8216,9 @@ if __name__ == "__main__":
         'started': time.strftime('%Y-%m-%d %H:%M:%S'), 'git': _git_version(), 'script': 'final_demo_l3.py',
         'args': vars(args), 'search_list': search_list, 'submission_index': sub_index,
         'calibration': {'turn_scale': nav.turn_scale, 'turn_scale_fast': nav.turn_scale_fast,
+                        'turn_offset_deg': math.degrees(nav.turn_offset),
+                        'turn_offset_fast_deg': math.degrees(nav.turn_offset_fast),
+                        'turn_motion': getattr(nav, 'turn_motion_source', None),
                         'baseline': float(baseline), 'ticks_per_meter': float(nav.ticks_per_meter),
                         'camera_matrix': np.asarray(ekf.robot.camera_matrix),
                         'dist_coeffs': np.asarray(ekf.robot.dist_coeffs)},
@@ -7699,6 +8230,9 @@ if __name__ == "__main__":
                    'refit_faces': nav.refit_faces, 'start_heading_sd_deg': math.degrees(nav.start_heading_sd),
                    'polynomial_applied': nav.marker_corrector.applies_polynomial,
                    'config': {k: v for k, v in faces_cfg.items() if not k.startswith('_')}}),
+        'drive': {'ticks_per_meter': nav.ticks_per_meter, 'count_ticks': nav.count_drive_ticks,
+                  'coast_ticks': nav.coast_ticks, 'coast_ramp_ticks': nav.coast_ramp_ticks,
+                  'speed': nav.drive_speed},
         'obstructions': (None if not nav.obstructions_enabled else
                          {k: getattr(nav.obstructions, k) for k in (
                              'box_height_m', 'half_block', 'max_range', 'close_range', 'cut_range_max',
@@ -7743,6 +8277,18 @@ if __name__ == "__main__":
         # are re-solved with it.
         nav.refit_markers("after phase 0")
         save_submission(nav, args.out_dir, sub_index)   # markers on disk now, in case the run dies later
+        # ...and again after every later re-fit (each viewpoint), so the files on
+        # disk are never more than one viewpoint old if the run is killed.
+        _refit = nav.refit_markers
+
+        def refit_and_save(*a, _refit=_refit, **k):
+            result = _refit(*a, **k)
+            try:
+                save_submission(nav, args.out_dir, sub_index)
+            except Exception as e:
+                print("Could not save the submission files: {}".format(e))
+            return result
+        nav.refit_markers = refit_and_save
 
         run_log.set_phase('level3')
         run_level3(nav, search_list, nav.markers_live, nav.fruit_mapper,
@@ -7758,8 +8304,12 @@ if __name__ == "__main__":
                    viewpoint_looks=max(0, args.viewpoint_looks), park_early_range=max(0.0, args.park_early_range),
                    centre_scanned=nav.fruit_mapper is not None and bool(nav.fruit_mapper.positions()))
         print("Level 3 run finished.")
+        # Save the final map NOW, before waiting for ESC: closing the terminal at
+        # that prompt skips the save below (run_logs/20261007-222402 kept the
+        # after-phase-0 files: 3.0 cm markers instead of the final 2.2 cm).
+        save_submission(nav, args.out_dir, sub_index)
         if display is not None:
-            display.finish("Run finished. ESC to exit")
+            display.finish("Run finished (files saved). ESC to exit")
     except (M3Abort, KeyboardInterrupt):
         print("Stopped by user.")
         run_log.event('stopped_by_user')
@@ -7769,9 +8319,13 @@ if __name__ == "__main__":
     finally:
         botconnect.stop()
         run_log.set_phase('end')
-        # Always leave this attempt's files behind, however the run ended.
+        # Always leave this attempt's files behind, however the run ended --
+        # unless nothing was mapped (stopped before ENTER): no empty attempt files.
         try:
-            save_submission(nav, args.out_dir, sub_index)
+            if nav.marker_positions():
+                save_submission(nav, args.out_dir, sub_index)
+            else:
+                print("Nothing mapped -- no submission files written for this attempt")
         except Exception as e:
             print("Could not save the submission files: {}".format(e))
         if args.compare_map:
@@ -7784,15 +8338,21 @@ if __name__ == "__main__":
             r = np.array(nav.face_residuals)
             print("direction planning: turn left before the next leg after {} re-localisation(s) -- median {:.0f} deg, "
                   "{:.0f}% under 25 deg, max {:.0f} deg".format(len(r), np.median(r), 100 * np.mean(r <= 25), r.max()))
+        if 'nav' in dir() and nav.drive_summary():
+            print(nav.drive_summary())
         if 'nav' in dir() and nav._turn_scale_samples:
             print("turn_scale (slow turns): started at {:.3f}, learned {:.3f} from {} marker-measured turn(s). To keep it: "
                   "--turn-scale {:.3f}, or write it to {}".format(
-                      nav.turn_scale_initial, nav.turn_scale, nav._turn_scale_samples, nav.turn_scale, TURN_SCALE_FILE))
+                      nav.turn_scale_initial, nav.turn_scale, nav._turn_scale_samples, nav.turn_scale,
+                      (nav.turn_motion_source + " (turn_scale)") if getattr(nav, 'turn_motion_source', None)
+                      else TURN_SCALE_FILE))
         if 'nav' in dir() and nav._turn_scale_fast_samples:
             print("turn_scale_fast (fast turns): started at {:.3f}, learned {:.3f} from {} marker-measured turn(s). "
                   "To keep it: --turn-scale-fast {:.3f}, or write it to {}".format(
                       nav.turn_scale_fast_initial, nav.turn_scale_fast, nav._turn_scale_fast_samples,
-                      nav.turn_scale_fast, TURN_SCALE_FAST_FILE))
+                      nav.turn_scale_fast,
+                      (nav.turn_motion_source + " (turn_scale_fast)") if getattr(nav, 'turn_motion_source', None)
+                      else TURN_SCALE_FAST_FILE))
         try:
             mapper = nav.fruit_mapper
             fe = mapper.fruit_ekf

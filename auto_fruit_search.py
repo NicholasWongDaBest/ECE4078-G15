@@ -135,7 +135,7 @@ def init_ekf(calib_dir):
     baseline = np.loadtxt(os.path.join(calib_dir, 'baseline.txt'), delimiter=',')
     # ticks_per_meter: same value operate.py's init_ekf() currently uses (marked
     # there as "##change this value" -- if you recalibrate it, update BOTH places).
-    robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=193.3)
+    robot = Robot(baseline, scale, camera_matrix, dist_coeffs, ticks_per_meter=171.7) #193.3 (sometimes)
     return EKF(robot), float(baseline)
 
 
