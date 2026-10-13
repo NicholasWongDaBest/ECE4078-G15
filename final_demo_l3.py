@@ -57,6 +57,7 @@ import cv2
 import ast
 import json
 import time
+import hashlib
 import math
 import argparse
 import contextlib
@@ -202,6 +203,21 @@ class RunLog:
         self.phase = name
         self.phase_times[name] = [now, None]
         self.event('phase', name=name)
+
+    def save_true_map(self, src):
+        """Copy the true map into the log folder as truemap.txt.
+        @return: {'source', 'saved', 'sha1'} or None when there is no file"""
+        if not src or not os.path.isfile(src):
+            print("True map: {} not found -- not saved with the run log".format(src))
+            return None
+        with open(src, 'rb') as f:
+            data = f.read()
+        dst = os.path.join(self.dir, 'truemap.txt')
+        with open(dst, 'wb') as f:
+            f.write(data)
+        print("True map: {} saved as {}".format(src, dst))
+        return {'source': os.path.abspath(src), 'saved': 'truemap.txt',
+                'sha1': hashlib.sha1(data).hexdigest()}
 
     def write_json(self, name, obj):
         with open(os.path.join(self.dir, name), 'w', encoding='utf-8') as f:
@@ -8346,6 +8362,7 @@ if __name__ == "__main__":
     parser.add_argument("--target-close", type=float, default=0.90,
                          help="Level 3: ...and has been seen from at least this close, m; 99 = no such requirement")
     args, _ = parser.parse_known_args()
+    true_map_file = args.compare_map   # copied into the run log even with --no-compare
     if args.no_compare or not args.compare_map or not os.path.isfile(args.compare_map):
         if args.compare_map and not args.no_compare:
             print("True map for comparison: {} not found -- no comparison".format(args.compare_map))
@@ -8357,6 +8374,10 @@ if __name__ == "__main__":
     run_log = RunLog(args.log_dir)
     run_log.tee_stdout()
     print("Run log: {}".format(run_log.dir))
+    # Keep the true map this run was on next to its log: the arena gets
+    # re-laid and truemap.txt rewritten, and a log is only gradeable (or
+    # useful for tuning against truth) with the map of ITS arena.
+    true_map_saved = run_log.save_true_map(true_map_file)
 
     botconnect = BotConnect(args.ip)
     time.sleep(1)  # give connection threads a moment to establish
@@ -8504,6 +8525,7 @@ if __name__ == "__main__":
     run_log.write_json('meta.json', {
         'started': time.strftime('%Y-%m-%d %H:%M:%S'), 'git': _git_version(), 'script': 'final_demo_l3.py',
         'args': vars(args), 'search_list': search_list, 'submission_index': sub_index,
+        'true_map': true_map_saved,
         'calibration': {'turn_scale': nav.turn_scale, 'turn_scale_fast': nav.turn_scale_fast,
                         'turn_offset_deg': math.degrees(nav.turn_offset),
                         'turn_offset_fast_deg': math.degrees(nav.turn_offset_fast),

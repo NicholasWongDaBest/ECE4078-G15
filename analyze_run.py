@@ -3,7 +3,7 @@ Summarise a final_demo_l3.py run log (run_logs/<date-time>/, see RunLog).
 
     python analyze_run.py                      # newest run in run_logs/
     python analyze_run.py run_logs/20261007-141500
-    python analyze_run.py --truemap truemap.txt   # + measurement errors against a known map
+    python analyze_run.py --truemap truemap.txt   # compare with this map instead of the run's own
 
 Sections:
   phases        time spent in each phase
@@ -17,7 +17,8 @@ Sections:
   markers       sd at the lock, late markers, final positions
   fruits        sightings handed to the mapper, accepted, per fruit
   targets       'found' events and their distances
-  vs truth      (--truemap, or the run's own --compare-map) marker errors
+  vs truth      (--truemap, else the truemap.txt saved in the run folder,
+                else the run's --compare-map path) marker errors
                 after alignment, and every marker READING compared with
                 where the true marker should have appeared from the
                 logged pose: bias and sd in depth and sideways by range,
@@ -283,7 +284,8 @@ def section_truth(events, final, truemap):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('run', nargs='?', default=None, help="run folder (default: newest in run_logs/)")
-    ap.add_argument('--truemap', default=None, help="known map to compare with (default: the run's --compare-map)")
+    ap.add_argument('--truemap', default=None,
+                    help="known map to compare with (default: the truemap.txt saved in the run folder)")
     args = ap.parse_args()
     run_dir = args.run or latest_run()
     if not run_dir or not os.path.isdir(run_dir):
@@ -304,7 +306,17 @@ def main():
     section_markers(events, final)
     section_fruits(events, final)
     section_targets(events)
-    truemap = args.truemap or a.get('compare_map')
+    saved = os.path.join(run_dir, 'truemap.txt')
+    if args.truemap:
+        truemap = args.truemap
+    elif os.path.exists(saved):
+        truemap = saved
+    else:
+        # older logs: no copy, only the path -- may be a DIFFERENT arena by now
+        truemap = a.get('compare_map')
+        if truemap and os.path.exists(truemap):
+            print("\n(no truemap.txt in the run folder -- using {} as it is NOW; "
+                  "wrong if the arena changed since this run)".format(truemap))
     if truemap and os.path.exists(truemap):
         section_truth(events, final, truemap)
     elif truemap:
