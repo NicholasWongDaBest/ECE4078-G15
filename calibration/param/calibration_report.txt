@@ -1,0 +1,44 @@
+
+Comparing distortion models by 4-fold cross-validation.
+In-sample RMS always improves with more parameters, which is exactly why it
+is the wrong thing to choose on.  Trust the held-out column.
+
+  model                         in-sample       held-out
+  fixed aspect, k1,k2              0.3042         0.2921
+  k1,k2 only (no k3)               0.2818         0.2721
+  k1,k2 + tangential               0.2805         0.2701
+  k1,k2,k3 + tangential            0.2805         0.2700
+  rational (k1..k6)                0.2804         0.2699
+
+Selected: rational (k1..k6)  (held-out error 0.2699 px)
+
+Final RMS reprojection error: 0.2804 px
+  per-image: min 0.166, median 0.252, max 0.397
+
+Camera matrix:
+  fx 1079.426   fy 1076.344
+  cx 320.192   cy 194.960
+
+Sanity checks:
+  principal point   (320.2, 195.0), 45.0 px from centre  [SUSPECT - should sit near the centre]
+    -> constant bearing bias +0.01 deg yaw, -2.40 deg pitch
+    -> lateral error on a marker 2 m away: +0 mm
+  fx/fy ratio       1.0029  [ok]
+  horizontal FOV    33.0 deg  (narrow is expected: cropped sensor mode)
+  distortion        24.3478, 16.7082, -0.0009, -0.0009, -12.7783
+    WARNING: |k3| = 12.78 is large.  Check what fraction of the
+    correction it carries at the frame corner - if it dominates there,
+    it is fitted to noise, not to the lens.
+  k3 share of the radial correction at the frame corner: 1%
+
+Focal-length stability (bootstrap over 12 resamples):
+  fx = 1079.0 +/- 1.9  (0.17% spread)
+  -> every ArUco distance inherits about this much uncertainty.
+  Good - fx is well determined by this image set.
+
+Compared with intrinsic_WORKING.txt:
+  fx 1076.1 -> 1079.4  (+0.30%)
+  cx 310.5 -> 320.2,  cy 204.9 -> 195.0
+  ArUco ranges scale with fx, so every distance the robot measures
+  should move by about +0.30%.  If your bench test said ranges were
+  too LONG, you want this number NEGATIVE.
