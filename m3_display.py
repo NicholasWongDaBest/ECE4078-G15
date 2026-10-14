@@ -189,17 +189,39 @@ def eval_like_score(est_markers, est_fruits, true_markers, true_fruits):
 
 class _RunClock:
     """Run timer shared by both displays: started once (ENTER in setup, or
-    the start of the run), laps stamped and printed."""
+    the start of the run), laps stamped and printed. pause_timer() /
+    resume_timer() stop it while the demonstrator checks a parked fruit;
+    elapsed() leaves the paused time out."""
     run_start = None
+    paused_at = None        # time.time() when the clock was paused, None while running
+    paused_total = 0.0      # s spent paused so far
 
     def start_timer(self):
         if self.run_start is None:
             self.run_start = time.time()
             self.laps = []
+            self.paused_at, self.paused_total = None, 0.0
             print("[time] clock started")
 
     def elapsed(self):
-        return None if self.run_start is None else time.time() - self.run_start
+        if self.run_start is None:
+            return None
+        now = self.paused_at if self.paused_at is not None else time.time()
+        return now - self.run_start - self.paused_total
+
+    def pause_timer(self):
+        if self.run_start is None or self.paused_at is not None:
+            return
+        self.paused_at = time.time()
+        print("[time] clock paused at {}".format(_fmt_clock(self.elapsed())))
+
+    def resume_timer(self):
+        if self.paused_at is None:
+            return
+        held = time.time() - self.paused_at
+        self.paused_total += held
+        self.paused_at = None
+        print("[time] clock running again at {} (paused {})".format(_fmt_clock(self.elapsed()), _fmt_clock(held)))
 
     def lap(self, label):
         if self.run_start is None:
@@ -812,6 +834,8 @@ class M3Display(_RunClock):
             if self.laps:
                 label, lt = self.laps[-1]
                 sub = "{} {}".format(label.replace(" found", "").replace("scanning done", "scan"), _fmt_clock(lt))
+            if self.paused_at is not None:
+                colour, sub = DIM, "PAUSED -- ENTER to go on"
         surf = self.clock_font.render(big, False, colour)
         c.blit(surf, (rect.centerx - surf.get_width() // 2, rect.y + 14))
         small = self._fit_text(sub, rect.w - 16, DIM, small=True)
@@ -1018,7 +1042,7 @@ class M3Display(_RunClock):
                 lines.append(("{} {}".format(k, name), DIM))
 
         if self.run_start is not None:
-            elapsed = int(time.time() - self.run_start)
+            elapsed = int(self.elapsed())
             ts = getattr(self.nav, 'turn_scale', None)
             ts0 = getattr(self.nav, 'turn_scale_initial', ts)
             learned = getattr(self.nav, '_turn_scale_samples', 0)

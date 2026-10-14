@@ -1804,6 +1804,21 @@ class Navigator:
         self.move_timeout = move_timeout
         self.settle_time = settle_time            # s to wait after a move before the next camera frame (was 0.2)
         self.roll_still = 0.10                    # s the encoders must stay unchanged before a drive counts as over (was 0.15)
+        # Fresh frame after every move (_settle): wait for the wheels to stop
+        # (encoders unchanged for roll_still, at most still_max_wait -- turns
+        # did not wait for that before), then for fresh_frames NEW camera
+        # frames to arrive (at most fresh_frame_max_wait), and never less than
+        # settle_time in all. The camera streams one frame per request, so the
+        # frame in hand right after a move was usually taken while turning.
+        # Run 20261013-170922 (settle_time 0.1 s only): frames < 0.3 s after a
+        # pan step detected 18% of the markers the map put in view, 0.3-0.6 s
+        # after 76% -> 2.6 rounds per re-localise instead of 1.1, a third not
+        # converging. --fresh-frames 0 = the fixed settle_time only, as before.
+        self.fresh_frames = 2
+        self.fresh_frame_max_wait = 0.4
+        self.still_max_wait = 0.5
+        self._settle_waits = []                   # s waited per move, for the end-of-run summary
+        self._settle_capped = 0                   # moves where the frames did not arrive in time
         # Drives (see _drive): the wheels roll on ~coast_ticks after the Pi stops
         # them. Command that many fewer ticks, so the robot lands where planned,
         # and tell the EKF the ticks the encoders actually counted once the
@@ -5107,7 +5122,7 @@ class Navigator:
         self._predict_commanded_motion(wheel_speeds, time.time() - start, distance=sign * d, completed=completed,
                                        log_extra={'ticks_cmd': ticks, 'ticks_counted': counted})
         if counted is not None:
-            self.display.idle(max(0.0, self.settle_time - self.roll_still))   # already still for roll_still s
+            self._settle(wheels_still=True, credit=self.roll_still)   # already still for roll_still s
         else:
             self._settle()
 
@@ -5136,12 +5151,76 @@ class Navigator:
             self.display.idle(0.02)   # keeps the window updating while the robot moves
         return completed
 
-    def _settle(self):
+    def _settle(self, wheels_still=False, credit=0.0):
         """Give the camera time to deliver a frame taken AFTER the robot
         stopped, so the next marker update isn't comparing the new pose with a
         blurred frame from mid-move. (Called after the move has been fed to
-        the EKF, so the map already shows where the robot should now be.)"""
-        self.display.idle(self.settle_time)
+        the EKF, so the map already shows where the robot should now be.)
+
+        Waits for the wheels to stop (unless wheels_still: a drive's tick count
+        already waited for that), then for fresh_frames new camera frames, and
+        tops up to settle_time; `credit` s of stillness already waited count
+        towards settle_time. fresh_frames 0: just settle_time - credit."""
+        start = time.time()
+        if self.fresh_frames <= 0:
+            self.display.idle(max(0.0, self.settle_time - credit))
+            return
+        if not wheels_still:
+            self._wait_wheels_still()
+        if not self._wait_fresh_frames(self.fresh_frames, self.fresh_frame_max_wait):
+            self._settle_capped += 1
+        rest = self.settle_time - credit - (time.time() - start)
+        if rest > 0:
+            self.display.idle(rest)
+        self._settle_waits.append(time.time() - start + credit)
+
+    def _wait_wheels_still(self):
+        """Until the encoder counts have not changed for roll_still s (the
+        roll-on after the Pi stops the motors is over), at most still_max_wait."""
+        get = getattr(self.botconnect, 'get_encoder_counts', None)
+        if get is None or self.roll_still <= 0:
+            return
+        step, waited, quiet = 0.02, 0.0, 0.0
+        last = tuple(get())
+        while waited < self.still_max_wait:
+            self.display.idle(step)
+            waited += step
+            c = tuple(get())
+            if c != last:
+                last, quiet = c, 0.0
+            else:
+                quiet += step
+                if quiet >= self.roll_still:
+                    return
+
+    def _wait_fresh_frames(self, count, max_wait):
+        """Until `count` new camera frames have arrived (BotConnect replaces
+        .frame with a new image object for each one), at most max_wait s.
+        @return: False if they did not all arrive in time (or there is no
+        frame stream to watch -- a simulated robot)"""
+        bc = self.botconnect
+        if not hasattr(bc, 'frame'):
+            return False
+        last = bc.frame
+        seen, waited, step = 0, 0.0, 0.01
+        while seen < count and waited < max_wait:
+            self.display.idle(step)
+            waited += step
+            cur = bc.frame
+            if cur is not last and cur is not None:
+                seen += 1
+                last = cur
+        return seen >= count
+
+    def settle_summary(self):
+        """One line for the end of the run: how long the waits for a fresh frame took."""
+        w = self._settle_waits
+        if not w:
+            return None
+        return ("Fresh frames: {} waits after a move, median {:.2f} s, 90% {:.2f} s, {} without {} new frame(s) "
+                "within {:.1f} s (--fresh-frames {})".format(len(w), float(np.median(w)), float(np.percentile(w, 90)),
+                                                             self._settle_capped, self.fresh_frames,
+                                                             self.fresh_frame_max_wait, self.fresh_frames))
 
 
 def _normalize_angle(angle):
@@ -6154,7 +6233,13 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
         print(f"=== Found {target_name} at [{target[0]:.2f}, {target[1]:.2f}] "
               f"(robot is {dist_to_target:.3f}m away -- {status}) ===")
         display.target_done(target_name, dist_to_target, dist_to_target <= 0.4)
-        display.wait_for_key(f"Found {target_name} ({dist_to_target:.2f} m). ENTER when verified")
+        # The run clock stops while the demonstrator checks the parked fruit
+        # and starts again on the ENTER that sends the robot on.
+        getattr(display, 'pause_timer', lambda: None)()
+        try:
+            display.wait_for_key(f"Found {target_name} ({dist_to_target:.2f} m). ENTER when verified")
+        finally:
+            getattr(display, 'resume_timer', lambda: None)()
 
 
 def _skip_tiny_hop(nav, start, waypoints, obstacles, clearance=0.02):
@@ -8224,6 +8309,9 @@ if __name__ == "__main__":
                          help="fast turns' roll-on, deg (default: turn_motion.json, else 0)")
     parser.add_argument("--small-turn-deg", type=float, default=20.0,
                          help="turns of this many degrees or less are small turns (slow speed, turn_scale.txt)")
+    parser.add_argument("--fresh-frames", type=int, default=2,
+                        help="after every move, wait for the wheels to stop and then for this many NEW camera "
+                             "frames (at most 0.4 s) before looking; 0 = only the fixed 0.1 s settle time, as before")
     parser.add_argument("--no-count-ticks", action="store_true",
                          help="drives as before: command distance x ticks_per_meter and tell the EKF the commanded "
                               "ticks (no early stop for the roll-on, encoders not read)")
@@ -8445,6 +8533,7 @@ if __name__ == "__main__":
     nav.coast_ticks = dm['coast_ticks'] if args.coast_ticks is None else max(0.0, args.coast_ticks)
     nav.coast_ramp_ticks = dm['coast_ramp_ticks']
     nav.count_drive_ticks = not args.no_count_ticks
+    nav.fresh_frames = max(0, args.fresh_frames)
     if nav.count_drive_ticks:
         print("Drives: {:.1f} ticks/m, roll-on ~{:.0f} ticks after a full-speed drive (from {}): stopped that much "
               "early, EKF told the ticks counted once the wheels stop".format(
@@ -8651,6 +8740,8 @@ if __name__ == "__main__":
                   "{:.0f}% under 25 deg, max {:.0f} deg".format(len(r), np.median(r), 100 * np.mean(r <= 25), r.max()))
         if 'nav' in dir() and nav.drive_summary():
             print(nav.drive_summary())
+        if 'nav' in dir() and nav.settle_summary():
+            print(nav.settle_summary())
         if 'nav' in dir() and nav._turn_scale_samples:
             print("turn_scale (slow turns): started at {:.3f}, learned {:.3f} from {} marker-measured turn(s). To keep it: "
                   "--turn-scale {:.3f}, or write it to {}".format(
