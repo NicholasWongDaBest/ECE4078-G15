@@ -425,11 +425,16 @@ def solve_pose_graph(poses0, edges, readings, sd_depth=(0.03, 0.02), sd_side=(0.
     return {t: (float(Mk[ti[t], 0]), float(Mk[ti[t], 1])) for t in tags}, P, info
 
 
-def refit_fruit_positions(poses, fruit_reads, min_reads=3, sd_bearing=np.deg2rad(2.0), sd_range=(0.05, 0.15)):
+def refit_fruit_positions(poses, fruit_reads, min_reads=3, sd_bearing=np.deg2rad(2.0), sd_range=(0.05, 0.08)):
     """
     Each fruit's position re-solved from all its stored sightings through
-    re-fitted poses: the bearing (box centre -- accurate) weighted hard, the
-    range (box height -- 20% off at 1.6 m) weakly, robust loss. Offline on
+    re-fitted poses: the bearing (box centre) and the range (box height),
+    robust loss. sd_range = 5 cm + 8 cm per metre (was 5 + 15 cm/m): on 33
+    logged runs (2026-10-16, pose-graph replay through this function, marker-
+    aligned fruit error) M2 84.0 -> 84.5 overall -- arena A +0.5, B +0.6,
+    C +0.7, D unchanged (5 cm/m was +0.7 overall but D -0.5). With the box
+    heights refitted the range is better than 15 cm/m assumed, and the
+    bearings carry the pose's heading error. Offline on
     four runs (sightings attached to their nearest marker node), mean fruit
     error vs as submitted: 5.8 -> 4.2 cm (20261007-134902), 4.2 -> 4.1
     (143413), 5.4 -> 3.1 (170534), 6.4 -> 5.0 (174140). Fruits with fewer
@@ -1241,6 +1246,15 @@ class FruitMapper:
         self.max_box_frac = 0.55
         self.frame_h = 480.0
         self.n_close_skipped = 0
+        # A sighting from further than max_update_range does not move a fruit
+        # already on the map (it can still put a new fruit on it). The re-fit
+        # already ignores them (record_fruit_sightings: depth > 2 m); the live
+        # map did not, and in 20261016-222238 capsicum/redapple sightings from
+        # 1.8-2.2 m, 15-22 cm off, after the last re-fit took the fruit map
+        # from 2.0 cm (M2 98.3) to 3.2 cm (93.1). On the logs one sighting is
+        # 12 cm off (median) beyond 2 m, 6-8 cm within it.
+        self.max_update_range = 2.0
+        self.n_far_skipped = 0
 
     def box_too_close(self, box):
         """True when this box is too tall to trust (see max_box_frac)."""
@@ -1380,6 +1394,9 @@ class FruitMapper:
             fuse_label, x, y, dist = located
             self._confirm_provisional(fuse_label, x, y)
             if fuse_label in self.fruit_ekf.estimates:
+                if dist > self.max_update_range and fuse_label not in self.provisional:
+                    self.n_far_skipped += 1     # too far to move a mapped fruit (see max_update_range)
+                    continue
                 if loose and fuse_label not in self.provisional:
                     self.n_loose_skipped += 1   # heading too uncertain to move a mapped fruit
                     continue
@@ -1718,6 +1735,9 @@ class FruitMapper:
         if self.n_pulled_back or self.n_outside_dropped:
             lines.append("    sightings outside the arena: {} pulled back along their ray, {} dropped".format(
                 self.n_pulled_back, self.n_outside_dropped))
+        if self.n_far_skipped:
+            lines.append("    sightings from beyond {:.1f} m left out (they would only move a mapped fruit): {}".format(
+                self.max_update_range, self.n_far_skipped))
         return "\n".join(lines) if lines else "    (no fruits mapped yet)"
 
     def save(self, fname):
@@ -1857,7 +1877,11 @@ class Navigator:
         self.max_reverse = 0.40
         # relocalise(): when the map offers no direction, at most
         # max_spare_sweeps look-anywhere sweeps, and only headings with at
-        # least min_view_depth of arena in front of the camera.
+        # least min_view_depth of arena in front of the camera -- and only
+        # while this re-localisation has seen NO marker at all (the pose may
+        # be badly off). Once it has seen markers, a blind sweep of a
+        # direction the map says is empty found nothing in the logs (the lime
+        # corner, 20261016-212027: 9 pan stops of '0 marker(s)' at a time).
         self.max_spare_sweeps = 2
         self.min_view_depth = 0.70
         # Fruit frames taken during pose checks and drives (see
@@ -1891,6 +1915,13 @@ class Navigator:
         # cm of lateral error becomes degrees of heading error. Too far: too
         # few pixels for a reliable range.
         self.marker_range_profile = (0.35, 0.60, 1.40, 2.00)
+        # Beyond the profile's 2 m, out to max_loc_marker_range, a marker is
+        # still worth far_marker_quality (ramping to 0 at that range) when
+        # choosing where to look: from a corner the only other markers are
+        # 2-3 m away (measured reading error 5 cm at 2.0-2.3 m, 6.5 cm at
+        # 2.3-2.6 m, 9 cm beyond), and with them worth 0 the scan saw
+        # 'no direction' and swept blind.
+        self.far_marker_quality = 0.3
         self.fruit_range_profile = (0.35, 0.45, 0.90, 1.20)
         self.view_turn_penalty = 0.02             # score per radian of turning: a 180 deg turn costs
                                                   # ~2 s, a poor view costs a whole extra pan
@@ -2152,7 +2183,19 @@ class Navigator:
         self.slam_live = False
         self.markers_live = []
         self.valid_tags = set(range(1, 11))
+        # max_marker_range: readings that BUILD the marker map (phase 0 SLAM,
+        # the re-fit graph, late markers, the remembered faces) -- unchanged.
+        # max_loc_marker_range: readings that only CORRECT the robot's pose
+        # against the map once it is locked (default: the arena diagonal), the
+        # ones past max_marker_range with their noise scaled by
+        # far_marker_noise_scale on top of the 3 cm + 3 cm/m model.
         self.max_marker_range = 2.0
+        self.max_loc_marker_range = math.hypot(path_planner.ARENA_INNER_SIZE, path_planner.ARENA_INNER_SIZE)
+        self.far_marker_noise_scale = 1.5
+        # far readings are only used in a frame with fewer than this many
+        # known markers within max_marker_range (on the logs, adding them to
+        # frames that already had two near ones made the pose slightly worse)
+        self.far_markers_below = 2
         self.late_marker_sightings = 3
         self.late_marker_spread = 0.10
         self._late_sightings = {}   # tag -> [(x, y)] in the world frame
@@ -2197,7 +2240,9 @@ class Navigator:
         # and the prior has to be LARGER than the marker noise model (3 cm +
         # 3 cm/m, i.e. ~7-9 cm at typical ranges) or a single good view only
         # closes half the error. Relocalise's job is to replace the
-        # dead-reckoned pose, not nudge it.
+        # dead-reckoned pose, not nudge it. (12 cm / 9 deg was tried on
+        # 2026-10-16: on a log replay it converged more often but made the
+        # worst 10% of poses ~0.7 cm worse, so it was put back.)
         self.relocalise_prior_sd = (0.20, np.deg2rad(15.0))   # (m, rad)
 
         self._localised = False       # True once the initial marker fix succeeded
@@ -2569,7 +2614,7 @@ class Navigator:
 
         @return: ('anchor' | 'update' | 'heading' | 'none', n_aruco_known, n_fruit)
         """
-        aruco = self.filter_markers(aruco)
+        aruco, aruco_near = self._split_far_markers(aruco)
         self._face_frame = None
         if self.slam_live:
             # Phase 0: plain SLAM, markers move with the robot. Fruits are
@@ -2586,15 +2631,18 @@ class Navigator:
                 self.ekf.add_landmarks(aruco)
             return ('update' if n_ar else 'none'), n_ar, 0
         n_ar = sum(1 for lm in aruco if lm.tag in self.ekf.taglist)
-        self._frame_markers = sum(1 for lm in aruco if lm.tag in self.ekf.taglist and lm.tag < FRUIT_TAG_BASE)
+        n_near = sum(1 for lm in aruco_near if lm.tag in self.ekf.taglist)
+        # markers within the map-building range: what 'a marker in the frame'
+        # means for fruit mapping, re-anchoring and position trust (unchanged)
+        self._frame_markers = sum(1 for lm in aruco_near if lm.tag in self.ekf.taglist and lm.tag < FRUIT_TAG_BASE)
         self._frame_markers_gated = False
         if (self.one_marker_heading and self._pos_trusted and n_ar == 1 and self._frame_markers == 1
                 and not fruits):
             lm = next(lm for lm in aruco if lm.tag in self.ekf.taglist)
             if self._heading_from_one_marker(lm):
-                self._fold_in_faces(aruco)
+                self._fold_in_faces(aruco_near)
                 self._map_fruits_from_last_frame()
-                self._note_unknown_markers(aruco)   # (this return skips the finally below)
+                self._note_unknown_markers(aruco_near)   # (this return skips the finally below)
                 self._note_obstructions(aruco)
                 return 'heading', 1, 0
         if n_ar or fruits:
@@ -2604,18 +2652,19 @@ class Navigator:
             self.ekf.P[1, 1] = max(self.ekf.P[1, 1], pos_sd ** 2)
             self.ekf.P[2, 2] = max(self.ekf.P[2, 2], theta_sd ** 2)
         try:
-            if allow_anchor and n_ar >= self.anchor_min_markers:
-                _, residual = self.ekf.preview_recovery(aruco)
+            # the rigid re-anchor is an unweighted fit: near readings only
+            if allow_anchor and n_near >= self.anchor_min_markers:
+                _, residual = self.ekf.preview_recovery(aruco_near)
                 if residual is not None and residual <= self.relocalise_max_residual:
-                    self.ekf.recover_from_pause(aruco)
+                    self.ekf.recover_from_pause(aruco_near)
                     self._pos_trusted = True
                     self._learn_turn_scale(float(self.ekf.robot.state[2, 0]),
                                            math.sqrt(max(self.ekf.P[2, 2], 0.0)))
                     if fruits:
                         self.ekf.update(fruits)
                     return 'anchor', n_ar, len(fruits)
-            if n_ar >= 2 and self.heading_fusion:
-                self._fuse_heading_from_markers(aruco)
+            if n_near >= 2 and self.heading_fusion:
+                self._fuse_heading_from_markers(aruco_near)
             if n_ar or fruits:
                 measurement = list(aruco) + list(fruits)
                 self.ekf.update(measurement)
@@ -2630,12 +2679,12 @@ class Navigator:
         finally:
             # Heading from the markers' faces first (slam/aruco_faces.py), so
             # the fruits below are stamped with the best pose this frame gives.
-            self._fold_in_faces(aruco)
+            self._fold_in_faces(aruco_near)
             # Only frames that anchored or updated carry a pose worth
             # stamping a fruit with; a frame with no markers is stamped with
             # dead reckoning, which is still the best available.
             self._map_fruits_from_last_frame()
-            self._note_unknown_markers(aruco)
+            self._note_unknown_markers(aruco_near)
             # marker blocks the CNN saw that no marker explains (ObstructionMap)
             self._note_obstructions(aruco)
 
@@ -3049,13 +3098,33 @@ class Navigator:
     # Final demo: marker map built on the fly
     # ------------------------------------------------------------------
 
-    def filter_markers(self, aruco):
+    def filter_markers(self, aruco, max_range=None):
         """Drop ids that are not arena markers (1-10) and readings past
-        max_marker_range: a spurious id would become a phantom landmark, and
-        a far PnP fix is mostly depth error."""
+        max_range (default max_marker_range, the map-building range): a
+        spurious id would become a phantom landmark, and a far PnP fix is
+        mostly depth error."""
+        lim = self.max_marker_range if max_range is None else max_range
         return [lm for lm in (aruco or [])
                 if int(lm.tag) in self.valid_tags
-                and float(np.linalg.norm(np.asarray(lm.position, dtype=float).reshape(-1)[:2])) <= self.max_marker_range]
+                and float(np.linalg.norm(np.asarray(lm.position, dtype=float).reshape(-1)[:2])) <= lim]
+
+    def _split_far_markers(self, aruco):
+        """(every reading usable to CORRECT the pose, the ones within the
+        map-building range). Before the lock both are the map-building ones;
+        after it the first adds readings out to max_loc_marker_range, each
+        tagged with far_marker_noise_scale (slam/ekf.py's per-reading
+        noise_scale) so the filter trusts it less."""
+        near = self.filter_markers(aruco)
+        if self.slam_live or self.max_loc_marker_range <= self.max_marker_range:
+            return near, near
+        if sum(1 for lm in near if lm.tag in self.ekf.taglist) >= self.far_markers_below:
+            return near, near   # enough near markers: far ones would only add noise
+        ids = {id(lm) for lm in near}
+        both = self.filter_markers(aruco, self.max_loc_marker_range)
+        for lm in both:
+            if id(lm) not in ids:
+                lm.noise_scale = self.far_marker_noise_scale
+        return both, near
 
     def marker_sd(self, tag):
         """Largest std dev (m) of one live marker's 2x2 covariance block."""
@@ -3810,6 +3879,9 @@ class Navigator:
             dx, dy = markers[0, i] - x, markers[1, i] - y
             d = math.hypot(dx, dy)
             q = self._range_quality(d, self.fruit_range_profile if is_fruit else self.marker_range_profile)
+            if not is_fruit and d > self.marker_range_profile[2] and d < self.max_loc_marker_range:
+                q = max(q, min(self.far_marker_quality, self.far_marker_quality * (self.max_loc_marker_range - d)
+                                                           / max(self.max_loc_marker_range - self.max_marker_range, 1e-6)))
             if q <= 0.0:
                 continue
             bearing = math.atan2(dy, dx)
@@ -4700,6 +4772,12 @@ class Navigator:
                 spare = [2 * math.pi * k / 8 for k in range(8)]
                 spare = [h for h in spare if self.view_depth(pose, h) >= self.min_view_depth]
                 gap = {h: min((abs(_normalize_angle(h - s0)) for s0 in scanned), default=math.pi) for h in spare}
+                if total_hits > 0:
+                    # It has seen markers this time: the pose is roughly right,
+                    # so the map's "nothing that way" is believable -- a blind
+                    # sweep would only add pan stops that see nothing.
+                    print("  relocalise: no useful direction left to scan (markers already seen; no blind sweep)")
+                    break
                 if spare_sweeps >= self.max_spare_sweeps or not spare:
                     print("  relocalise: no useful direction left to scan")
                     break
@@ -5710,7 +5788,7 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                object_uncertainty=None, target_margin=0.03, approach_gap=0.06, approach_overshoot=0.40,
                squeeze_margins=((0.04, 0.03), (0.025, 0.02), (0.015, 0.01)), squeeze_leg=0.15,
                last_resort_rings=(0.35, 0.38),
-               retry_failed=True):
+               retry_failed=True, extra_legs=20):
     """
     M3 Level 1: full known map given, navigate to every search_list.txt target
     IN ORDER, then wait for the demonstrator's verification before moving on
@@ -5801,7 +5879,14 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
     markers 1 and 9 for lime, then parked at lemon, could not plan its way
     out again even with the tight margins and skipped redapple AND orange.)
     retry_failed: a target that still fails is tried once more after the
-    others, from wherever the robot is by then, before it is skipped.
+    others, from wherever the robot is by then, before it is skipped -- the
+    last target too (straight away: there are no others to do first).
+
+    max_legs / extra_legs: after max_legs legs the robot carries on, up to
+    extra_legs more, for as long as each leg still shortens the route (a long
+    squeeze route of 15 cm legs needs more than 20). Running out of legs
+    outside the 0.4 m scoring radius is a failure (so it is retried), not a
+    "found".
     """
     if bounds is None:
         bounds = planning_bounds()
@@ -5886,8 +5971,9 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             pose = nav.relocalise(face_point=target)   # start every target from a converged pose
         goal = None
         failure = None
-        best_path_len = math.inf
+        best_len = {}        # (margin rung, parking spot) -> shortest route seen to it
         stalled = 0
+        out_of_legs, legs_done = False, 0
         refined = refine_weak is None or not getattr(refine_weak, 'needed', lambda n: True)(target_name)
         planned_positions = dict(object_positions)
         goal_risk = None
@@ -5935,7 +6021,14 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                                                                "ignoring obstructions" if tight == 'bare' else
                                                                "squeezing through"))
             return True
-        for leg in range(1, max_legs + 1):
+        for leg in range(1, max_legs + extra_legs + 1):
+            if leg > max_legs:
+                if stalled:
+                    out_of_legs, legs_done = True, leg - 1   # past the budget and the last leg did not shorten the route
+                    break
+                if leg == max_legs + 1:
+                    print(f"[{target_name}] {max_legs} legs used but the route is still getting shorter -- "
+                          f"carrying on (up to {max_legs + extra_legs} legs)")
             if live_positions is not None and leg > 1:
                 latest = dict(live_positions())
                 moved = max((path_planner.dist_between(latest[n], planned_positions[n])
@@ -6070,6 +6163,15 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             # grow for several legs while the robot is doing exactly the
             # right thing.
             route_len = path_planner.path_length(path)
+            # Progress is per route: new margins (tighter, or back up after a
+            # squeeze) or a new parking spot make a different one, compared
+            # only with its own best. Against the whole attempt's best, a
+            # 0.64 m squeeze route followed by a 2.94 m one on the normal
+            # margins 'stalled' though it shrank every leg (20261013-170922,
+            # lime). Kept per route (not reset), so flipping between two
+            # spots without getting closer to either still stalls.
+            route_key = (tight, None if goal is None else (round(float(goal[0]), 2), round(float(goal[1]), 2)))
+            best_path_len = best_len.get(route_key, math.inf)
             if leg > 1 and route_len > best_path_len - 0.02:
                 stalled += 1
                 if stalled >= stall_legs:
@@ -6077,7 +6179,7 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
                     break
             else:
                 stalled = 0
-            best_path_len = min(best_path_len, route_len)
+            best_len[route_key] = min(best_path_len, route_len)
 
             # path[0] is the planning start; only drive to it if an escape moved it.
             waypoints = path[1:] if path_planner.dist_between(path[0], pose[:2]) < nav.min_move else path
@@ -6213,15 +6315,28 @@ def run_level1(nav, search_list, object_list, object_true_pos, aruco_true_pos,
             # an unchecked stop, either kind: the next stop must be checked
             nav.gap_skip_last = reloc_mode == 'confirm' or nav.last_check_skipped
         else:
-            print(f"[{target_name}] still {path_planner.dist_between(pose[:2], goal):.2f} m from the "
-                  f"standoff point after {max_legs} legs -- reporting where it got to")
+            out_of_legs, legs_done = True, leg
+        if out_of_legs and failure is None:
+            here = nav.get_robot_pose()
+            d_fruit = math.hypot(here[0] - target[0], here[1] - target[1])
+            left = f"{path_planner.dist_between(here[:2], goal):.2f} m from the standoff point, " if goal is not None else ""
+            print(f"[{target_name}] still {left}{d_fruit:.2f} m from the fruit after {legs_done} legs")
+            if d_fruit > 0.4:
+                failure = f"ran out of legs {d_fruit:.2f} m from the fruit (outside the 0.4 m scoring radius)"
+            else:
+                print(f"[{target_name}] inside the 0.4 m scoring radius -- reporting where it got to")
 
         if failure is not None:
-            if retry_failed and queue and target_name not in retried:
+            if retry_failed and target_name not in retried:
                 retried.add(target_name)
-                print(f"[{target_name}] {failure} -- trying it again after {', '.join(n for _, n in queue)}, "
-                      f"from wherever the robot is by then")
-                display.notify(f"{target_name}: {failure} -- retrying after the others")
+                if queue:
+                    print(f"[{target_name}] {failure} -- trying it again after {', '.join(n for _, n in queue)}, "
+                          f"from wherever the robot is by then")
+                    display.notify(f"{target_name}: {failure} -- retrying after the others")
+                else:
+                    print(f"[{target_name}] {failure} -- trying it again now (the last target: nothing else to "
+                          f"do first), from scratch with the normal margins")
+                    display.notify(f"{target_name}: {failure} -- retrying now")
                 queue.append((i, target_name))
                 continue
             skip(target_name, failure)
@@ -7123,7 +7238,9 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                            planner=planner, grid_resolution=grid_resolution, max_leg_length=max_leg_length,
                            safety_margin=safety_margin, clearance_pref=clearance_pref, fruit_margin=fruit_margin,
                            live_positions=None, object_radii=radii, bounds=bounds, open_leg_length=open_leg_length,
-                           refine_weak=close_check, object_uncertainty=unc, **level1_kwargs)
+                           refine_weak=close_check, object_uncertainty=unc,
+                           retry_failed=False,   # a failed park stays on the list: phase 2 retries it
+                           **level1_kwargs)
         finally:
             display.target_done = orig_done
             nav.allow_reverse = was_reverse
@@ -7449,6 +7566,17 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
         print(f"WARNING: exploration ended with {', '.join(weak_left)} still not well mapped "
               f"({visited} viewpoints) -- parking at it will rely on the close look on the way in")
         display.notify("Still weak: " + ", ".join(weak_left))
+    # One last re-fit before the fruit map is locked (and so before the run
+    # ends: the locked map is what gets submitted, and it takes no sightings
+    # after this). The re-fits otherwise only ran after each viewpoint, so
+    # whatever the live map took in after the last one -- parking during
+    # exploration, looks on the way -- went in unchecked: in 20261016-222238
+    # sightings from 1.8-2.2 m after viewpoint 7 took the fruits from 2.0 to
+    # 3.2 cm. On 33 logged runs (pose-graph replay) re-solving every fruit at
+    # this point: M2 arena A 84.9 -> 87.8, B 77.9 -> 79.9, C 77.7 -> 78.4,
+    # D 92.5 -> 92.5; 18 runs better, 7 worse.
+    if nav.refit_markers("before locking the fruit map") is not None:
+        pose = nav.get_robot_pose()
     mapper.save(map_out)
     positions = mapper.positions()
     if not live_map:
@@ -8382,6 +8510,10 @@ if __name__ == "__main__":
     parser.add_argument("--keep-order", action="store_true",
                          help="Level 3: park in the search-list order instead of the shortest route "
                               "(Levels 1 and 2 always keep the list order)")
+    parser.add_argument("--loc-marker-range", type=float, default=None, metavar="M",
+                        help="markers out to this range CORRECT the pose after the marker map is locked (default: "
+                             "the arena diagonal, ~3.5 m; their noise is scaled up beyond 2 m). The marker MAP is "
+                             "still built from readings within 2 m only. 2.0 = the old behaviour")
     parser.add_argument("--pan-half", type=float, default=20.0,
                          help="half-width of the slow pan about the best view direction, deg")
     parser.add_argument("--pan-step", type=float, default=5.0,
@@ -8552,6 +8684,8 @@ if __name__ == "__main__":
     nav.heading_fix_use_range = not args.one_marker_no_range
     nav.learn_turn_scale = not args.no_learn_turn_scale
     nav.pan_half = np.deg2rad(args.pan_half)
+    if args.loc_marker_range is not None:
+        nav.max_loc_marker_range = max(nav.max_marker_range, args.loc_marker_range)
     nav.pan_step = np.deg2rad(args.pan_step)
     nav.scan_frames = max(1, args.scan_frames)
     nav.refine_pan_half = np.deg2rad(args.refine_half)
