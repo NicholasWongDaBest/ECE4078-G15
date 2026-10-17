@@ -801,6 +801,72 @@ def turn_safe(p):
     return turn_room(p) >= TURN_CLEARANCE
 
 
+def _drive_room(p):
+    """Gap (m) between the robot's DRIVING body at p (ROBOT_RADIUS: the sides
+    and front, not the corners a turn sweeps) and the nearest object body."""
+    if not len(_BODIES):
+        return math.inf
+    d = np.hypot(_BODIES[:, 0] - float(p[0]), _BODIES[:, 1] - float(p[1])) - _BODIES[:, 2] - path_planner.ROBOT_RADIUS
+    return float(np.min(d))
+
+
+def _body_gap(p, heading):
+    """Gap (m) between the robot's RECTANGULAR body at pose (p, heading) --
+    ROBOT_RADIUS to the front and back, TURN_RADIUS to the corners -- and the
+    nearest object body."""
+    if not len(_BODIES):
+        return math.inf
+    hl = path_planner.ROBOT_RADIUS
+    r = TURN_RADIUS if TURN_RADIUS is not None else path_planner.ROBOT_RADIUS
+    hw = math.sqrt(max(r * r - hl * hl, 0.0)) or hl
+    c, s = math.cos(heading), math.sin(heading)
+    dx, dy = _BODIES[:, 0] - float(p[0]), _BODIES[:, 1] - float(p[1])
+    lx, ly = np.abs(c * dx + s * dy) - hl, np.abs(-s * dx + c * dy) - hw
+    return float(np.min(np.hypot(np.maximum(lx, 0.0), np.maximum(ly, 0.0)) - _BODIES[:, 2]))
+
+
+def _turn_room_exit(p, heading, need, allow_reverse=True, max_turn_deg=30.0, max_dist=0.15, step=0.01,
+                    edge=None):
+    """
+    The cheapest short straight drive from p to a spot with at least `need`
+    of room to turn on the spot (turn_room): forwards along the current
+    heading or within max_turn_deg of it, or backwards the same way when
+    `allow_reverse` -- never a big turn, since turning is exactly what there
+    is no room for here. The drive must not bring the body any closer to
+    anything than it already is (_drive_room), nor the centre past `edge`
+    (|x|, |y|; default: the robot fully inside the tape) unless it is out
+    there already. Cost: metres driven + 3 cm per 10 deg of turn.
+    @return: (turn rad, distance m, reverse bool, room after m) or None
+    """
+    if edge is None:
+        edge = path_planner.ARENA_INNER_SIZE / 2 - path_planner.ROBOT_RADIUS
+    px, py = float(p[0]), float(p[1])
+    floor = min(_drive_room((px, py)), 0.02) - 0.005
+    lim_x, lim_y = max(edge, abs(px)), max(edge, abs(py))
+    turns = sorted({0.0} | {s * a for a in np.arange(10.0, max_turn_deg + 1e-9, 10.0) for s in (1.0, -1.0)}, key=abs)
+    body_floor = min(_body_gap((px, py), heading), 0.02) - 0.005
+    best = None
+    for turn_deg in turns:
+        # the small turn first must not swing a corner any closer to anything either
+        if any(_body_gap((px, py), heading + math.radians(a)) < body_floor
+               for a in np.linspace(0.0, turn_deg, max(2, int(abs(turn_deg) / 2) + 1))):
+            continue
+        for reverse in ((False, True) if allow_reverse else (False,)):
+            a = heading + math.radians(turn_deg) + (math.pi if reverse else 0.0)
+            ux, uy = math.cos(a), math.sin(a)
+            for dist in np.arange(step, max_dist + 1e-9, step):
+                c = (px + ux * dist, py + uy * dist)
+                if abs(c[0]) > lim_x or abs(c[1]) > lim_y or _drive_room(c) < floor:
+                    break   # further along this line is no better
+                room = turn_room(c)
+                if room >= need and dist >= 0.02:
+                    cost = dist + 0.003 * abs(turn_deg)
+                    if best is None or cost < best[0]:
+                        best = (cost, math.radians(turn_deg), float(dist), reverse, room)
+                    break
+    return None if best is None else best[1:]
+
+
 def _gap_plan(start, towards, length, obstacles, bounds=None, final=False, step=0.02, pre_margin=0.03,
               min_leg=0.08, through_max=0.80):
     """
@@ -1136,6 +1202,7 @@ class FruitMapper:
         self.target_min_spread_deg = 60.0
         self.target_min_views = 4
         self.target_close_dist = 0.90
+        self.early_park_views_short = 1   # ready_to_park_early(): views a fruit may still lack to be parked at mid-exploration
         self.max_birth_range_drive = 1.0
         self.n_far_births_skipped = 0
         K = np.asarray(camera_matrix, dtype=float)
@@ -1676,6 +1743,24 @@ class FruitMapper:
                 and fe.min_view_dist.get(label, math.inf) <= self.target_close_dist
                 and self.n_sightings(label) >= self.target_min_sightings)
 
+    def ready_to_park_early(self, label):
+        """
+        target_ready(), or short of it ONLY by up to early_park_views_short
+        views: park_now() always takes a close look on the way in, and that
+        look is the missing view. Run 20261017-160524: lemon had 4 views over
+        122 deg, one from 0.38 m and 24 sightings at a viewpoint 0.41 m from
+        it, so exploration drove on, and phase 2 came back 2.6 m for it (87 s).
+        """
+        if self.target_ready(label):
+            return True
+        fe = self.fruit_ekf
+        return (self.early_park_views_short > 0
+                and self.well_mapped(label)
+                and fe.n_views(label) >= self.target_min_views - self.early_park_views_short
+                and fe.bearing_spread(label) >= self.target_min_spread_deg
+                and fe.min_view_dist.get(label, math.inf) <= self.target_close_dist
+                and self.n_sightings(label) >= self.target_min_sightings)
+
     def all_targets_ready(self):
         return all(self.target_ready(l) for l in self.expected)
 
@@ -1875,6 +1960,13 @@ class Navigator:
         # reverse_marker_credit of turning.
         self.allow_reverse = True
         self.max_reverse = 0.40
+        # make_turn_room(): room (m) to turn on the spot that a PAN needs
+        # (relocalise, pan_at_fruit, scan_around) -- above TURN_CLEARANCE,
+        # which only plans where legs end: the pose is good to ~4 cm, and run
+        # 20261017-160524 hit marker 8 panning with 2.8 cm of room (by its own
+        # map) at a viewpoint, then panned with 0-1.6 cm there again in the
+        # close look before parking. 0 = no check (as before).
+        self.pan_clearance = 0.05
         # relocalise(): when the map offers no direction, at most
         # max_spare_sweeps look-anywhere sweeps, and only headings with at
         # least min_view_depth of arena in front of the camera -- and only
@@ -3990,6 +4082,8 @@ class Navigator:
         tight covariance rather than left to drift.
         @return: set of fruit labels seen at least once during the scan
         """
+        if not self.make_turn_room('360'):
+            return set()
         frames = self.scan_frames if frames is None else int(frames)
         # A step is whole encoder ticks, so it is rarely exactly `step`
         # (with turn_scale 0.578 a 10 deg step is 1 tick = 7.4 deg, and 36
@@ -4348,6 +4442,8 @@ class Navigator:
         @return: dict(seen=bool, mapped_stops=int, skipped_stops=int,
                       others=set of other labels that were in view)
         """
+        if not self.make_turn_room('{} look'.format(name)):
+            return {'seen': False, 'mapped_stops': 0, 'skipped_stops': 0, 'others': set()}
         half = self.refine_pan_half if half is None else abs(float(half))
         step = self.refine_pan_step if step is None else abs(float(step))
         frames = self.scan_frames if frames is None else int(frames)
@@ -4717,6 +4813,11 @@ class Navigator:
         self.last_check_skipped = False
         if self.ekf.number_landmarks() == 0:
             return pose
+        if not self.make_turn_room('re-localise'):
+            self.last_check_skipped = True   # the next leg checks the pose before anything tight
+            return pose
+        state = self.ekf.robot.state
+        pose = np.array([state[0, 0], state[1, 0], state[2, 0]])
         if not self.face_planning:
             face_point = None
 
@@ -4991,6 +5092,49 @@ class Navigator:
     # ------------------------------------------------------------------
     # Driving
     # ------------------------------------------------------------------
+
+    def make_turn_room(self, why):
+        """
+        Before a pan on the spot (relocalise(), pan_at_fruit(), scan_around()):
+        with under pan_clearance of room to turn here, first drive a few cm
+        straight out to where there is (_turn_room_exit: along the heading
+        or backwards, at most a 30 deg turn first); failing that, to where
+        there is TURN_CLEARANCE. Planned legs already end turn_safe(), but
+        the pose check on arrival can move the estimate a few cm closer to
+        something -- and every pan after that turned regardless.
+        @return: True to go ahead with the pan, False to skip it (no short
+                 straight way out: a pan here would sweep into something)
+        """
+        if self.pan_clearance <= 0.0 or not len(_BODIES):
+            return True
+        x, y, th = (float(v) for v in self.get_robot_pose()[:3])
+        room = turn_room((x, y))
+        if room >= self.pan_clearance:
+            return True
+        way = _turn_room_exit((x, y), th, self.pan_clearance, allow_reverse=self.allow_reverse)
+        if way is None and self.pan_clearance > TURN_CLEARANCE:
+            way = _turn_room_exit((x, y), th, TURN_CLEARANCE, allow_reverse=self.allow_reverse)
+        if way is None:
+            print("  {:.1f} cm to turn here and no short straight way out -- no {} pan here".format(
+                max(room, 0.0) * 100, why))
+            if self.log is not None:
+                self.log.event('turn_room', action='skip', why=why, room=room, pose=[x, y, th])
+            return False
+        dtheta, dist, reverse, room_after = way
+        print("  {:.1f} cm to turn here -- {} {:.0f} cm{} first ({:.1f} cm of room there), then the {} pan".format(
+            max(room, 0.0) * 100, 'backing' if reverse else 'creeping forward', dist * 100,
+            " after a {:+.0f} deg turn".format(math.degrees(dtheta)) if abs(dtheta) > 1e-6 else '',
+            room_after * 100, why))
+        if self.log is not None:
+            self.log.event('turn_room', action='exit', why=why, room=room, pose=[x, y, th],
+                           dtheta=dtheta, distance=dist, reverse=reverse, room_after=room_after)
+        if abs(dtheta) > 1e-6:
+            self.turn(dtheta, speed=self.small_turn_speed)
+        if reverse:
+            self.drive_backward(dist)
+        else:
+            self.drive_forward(dist)
+        return True
 
     def turn(self, dtheta, speed=None, noise_frac=None):
         """In-place turn by `dtheta` radians (positive = anticlockwise/left,
@@ -7229,7 +7373,9 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
         was_reverse = nav.allow_reverse
         nav.allow_reverse = was_reverse and all_mapped
         display.target_done = target_done
-        print(f"\n=== {name} is pinned down and {path_planner.dist_between(nav.get_robot_pose()[:2], positions_now[name]):.2f} m "
+        state_word = 'pinned down' if mapper.target_ready(name) else 'a view short of pinned down (the close look adds it)'
+        print(f"\n=== {name} is {state_word} and "
+              f"{path_planner.dist_between(nav.get_robot_pose()[:2], positions_now[name]):.2f} m "
               f"away -- parking at it now, then back to exploring ===")
         display.notify(f"Parking at {name} now")
         try:
@@ -7262,7 +7408,7 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
             est = mapper.positions()
             ready = [(path_planner.dist_between(here[:2], est[l]), l) for l in search_list
                      if l in est and l not in parked and l not in tried_now and not mapper.is_provisional(l)
-                     and mapper.target_ready(l)]
+                     and mapper.ready_to_park_early(l)]
             ready = [(d, l) for d, l in ready if d <= park_early_range]
             if not ready:
                 return
@@ -8573,6 +8719,14 @@ if __name__ == "__main__":
     parser.add_argument("--target-spread", type=float, default=100.0,
                          help="Level 3: a search-list fruit counts as pinned down once its views span this "
                               "many degrees (and it has one from within --target-close), deg")
+    parser.add_argument("--early-park-views-short", type=int, default=1,
+                         help="Level 3: park at a search-list fruit during exploration (within --park-early-range) "
+                              "even when it is this many views short of --target-views, all else pinned down: the "
+                              "close look on the way in adds the view. 0 = only once fully pinned down (as before)")
+    parser.add_argument("--pan-clearance", type=float, default=0.05, metavar="M",
+                         help="room (m) to turn on the spot a pan needs (re-localise, fruit look, 360): with less, "
+                              "the robot first drives a few cm straight out to where it has it (or --turn-clearance), "
+                              "or skips the pan. 0 = pan wherever it is (as before)")
     parser.add_argument("--target-views", type=int, default=5,
                          help="Level 3: distinct directions a search-list fruit must be seen from to count as "
                               "pinned down")
@@ -8648,6 +8802,7 @@ if __name__ == "__main__":
     nav.confident_skip = not args.no_confident_skip
     nav.tiny_hop = max(0.0, args.tiny_hop)
     TURN_CLEARANCE = max(0.0, args.turn_clearance)
+    nav.pan_clearance = max(0.0, args.pan_clearance)
     TURN_RADIUS = args.turn_radius
     nav.small_turn_speed = args.small_turn_speed
     nav.small_turn_max_deg = max(0.0, args.small_turn_deg)
@@ -8706,6 +8861,7 @@ if __name__ == "__main__":
     nav.fruit_mapper.target_min_spread_deg = args.target_spread
     nav.fruit_mapper.target_close_dist = args.target_close
     nav.fruit_mapper.target_min_views = max(1, args.target_views)
+    nav.fruit_mapper.early_park_views_short = max(0, args.early_park_views_short)
     nav.unlock_when_certain = not args.no_unlock
     nav.fruit_mapper.min_views = max(1, args.min_views)
     nav.fruit_mapper.min_sightings = max(1, args.min_sightings)
