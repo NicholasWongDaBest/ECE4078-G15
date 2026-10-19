@@ -9004,7 +9004,10 @@ if __name__ == "__main__":
         print("Stopped by user.")
         run_log.event('stopped_by_user')
     except Exception as e:
-        run_log.event('crash', error=repr(e))
+        import traceback
+        tb = traceback.format_exc()
+        run_log.event('crash', error=repr(e), traceback=tb)
+        print(tb)   # into console.txt too (only stdout is copied there)
         raise
     finally:
         botconnect.stop()

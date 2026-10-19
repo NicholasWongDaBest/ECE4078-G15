@@ -58,11 +58,22 @@ class ArucoSensor:
 
         marker_points = self.marker_points
 
-        rvecs, tvecs = [], []
-        for c in corners:
+        # A detection with degenerate corners (a sliver at the frame edge) makes
+        # solvePnP return (False, None, None): drop it, or np.array([None]) fails
+        # the reshape below and ends the run (run_logs/20261019-153422).
+        rvecs, tvecs, keep = [], [], []
+        for i, c in enumerate(corners):
             success, rvec, tvec = cv2.solvePnP(marker_points, c[0], self.camera_matrix, self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            if not success or rvec is None or tvec is None:
+                continue
             rvecs.append(rvec)
             tvecs.append(tvec)
+            keep.append(i)
+        if not keep:
+            return [], img
+        if len(keep) < len(corners):
+            corners = [corners[i] for i in keep]
+            ids = ids[keep]
 
         rvecs, tvecs = np.array(rvecs), np.array(tvecs)
         rvecs, tvecs = rvecs.reshape(-1, 1, 3), tvecs.reshape(-1, 1, 3)
