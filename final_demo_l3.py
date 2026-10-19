@@ -637,7 +637,8 @@ class ObstructionMap:
     active = None   # the run's map; build_obstacles() adds its circles to every obstacle list
 
     def __init__(self, box_height_m=0.0744, half_block=0.03, max_range=1.5, close_range=0.20,
-                 cut_range_max=0.45, merge_radius=0.20, replace_marker=0.25, replace_marker_max=0.40,
+                 cut_range_max=0.45, merge_radius=0.20, merge_radius_max=0.25, replace_marker=0.25,
+                 replace_marker_max=0.40,
                  replace_fruit=0.15, max_misses=3, miss_range=(0.30, 1.20), sd_floor=0.03, max_sd=0.20,
                  max_extra=0.10, min_sightings=2, expire_frames=30):
         self.box_height_m = box_height_m
@@ -646,6 +647,14 @@ class ObstructionMap:
         self.close_range = close_range
         self.cut_range_max = cut_range_max
         self.merge_radius = merge_radius
+        # The 2-sd merge gate is capped: sightings of cut-off blocks from a
+        # shaky pose have sd 0.10-0.17 m, so the gate reached 0.28-0.39 m and
+        # run 20261019-233552 folded marker 8's block (34 cm away) into the
+        # obstruction on marker 5's -- it drifted 10 cm between them, marker 5
+        # replaced it, and block 8 was not avoided at all for 2+ minutes.
+        # Two blocks nearer than 25 cm have no gap the robot fits through, so
+        # one obstruction between them still keeps it out.
+        self.merge_radius_max = merge_radius_max
         self.replace_marker = replace_marker
         self.replace_marker_max = replace_marker_max
         self.replace_fruit = replace_fruit
@@ -679,8 +688,11 @@ class ObstructionMap:
         self.stats['sightings'] += 1
         best = None
         for o in self.items:
+            if frame and o.last_frame == frame:
+                continue   # already took a box from this frame: a second box there is another block
             d = math.hypot(o.x - x, o.y - y)
-            if d <= max(self.merge_radius, 2.0 * math.hypot(sd, o.sd_eff)) and (best is None or d < best[0]):
+            gate = min(self.merge_radius_max, max(self.merge_radius, 2.0 * math.hypot(sd, o.sd_eff)))
+            if d <= gate and (best is None or d < best[0]):
                 best = (d, o)
         if best is None:
             o = Obstruction(x, y, sd, partial, t, pose, frame)
@@ -1322,6 +1334,25 @@ class FruitMapper:
         # 12 cm off (median) beyond 2 m, 6-8 cm within it.
         self.max_update_range = 2.0
         self.n_far_skipped = 0
+        # The box gives the range from the CAMERA; the SLAM pose is the wheel
+        # axle (ArUco block centres add camera_offset to every marker reading),
+        # and the camera sits ~5 cm ahead of it. Without this every fruit was
+        # placed 5 cm too close to wherever it was seen from: on 1700+
+        # sightings from 10 runs (2026-10-16..19) every fruit's range came out
+        # 4-7 cm short, and with 5 cm added back object_list.csv's heights fit
+        # to within 1 mm (capsicum excepted). It cancels for a fruit seen from
+        # all round; an edge fruit, seen only from the arena side, was pulled
+        # towards the centre (capsicum at x=-1.02: 7-10 cm off in every run
+        # that day). main() sets it (--fruit-camera-offset).
+        self.camera_offset = 0.0
+
+    def _estimate_pose(self, robot_pose, box, true_height, f, cx):
+        """estimate_pose() with this mapper's camera_offset (resolve_confusable_class calls it)."""
+        return estimate_pose(robot_pose, box, true_height, f, cx, camera_offset=self.camera_offset)
+
+    def box_world(self, label, box, robot_pose):
+        """World (x, y) of one box seen from robot_pose ([[x], [y], [theta]])."""
+        return self._estimate_pose(robot_pose, box, self.dims[label][2], self.f, self.cx)
 
     def box_too_close(self, box):
         """True when this box is too tall to trust (see max_box_frac)."""
@@ -1331,7 +1362,8 @@ class FruitMapper:
         """How far from `label` the robot must stay for its whole box to fit (m)."""
         if self.max_box_frac <= 0 or label not in self.dims:
             return 0.35
-        return max(0.35, self.f * self.dims[label][2] / (self.max_box_frac * self.frame_h) + margin)
+        return max(0.35, self.f * self.dims[label][2] / (self.max_box_frac * self.frame_h)
+                   + self.camera_offset + margin)
 
     def _pose_quality(self):
         """(heading sd rad or None, markers in the frame or None) for the frame being fused."""
@@ -1495,10 +1527,10 @@ class FruitMapper:
         the lemon/lime style relabel, the birth-range limit for a fruit not
         on the map yet, and the pull-back to inside the arena.
         @return: (fuse_label, x, y, dist) or None if the box is dropped"""
-        x, y = estimate_pose(robot_pose, box, self.dims[label][2], self.f, self.cx)
+        x, y = self.box_world(label, box, robot_pose)
         known = {l: (p[0, 0], p[1, 0]) for l, p in self.fruit_ekf.estimates.items()}
         fuse_label, alt = resolve_confusable_class(label, box, robot_pose, self.dims,
-                                                   self.f, self.cx, estimate_pose, known)
+                                                   self.f, self.cx, self._estimate_pose, known)
         if alt is not None:
             x, y = alt
         # range as measured: the noise model stays honest about a far sighting
@@ -1967,6 +1999,40 @@ class Navigator:
         # map) at a viewpoint, then panned with 0-1.6 cm there again in the
         # close look before parking. 0 = no check (as before).
         self.pan_clearance = 0.05
+        # Unchecked heading after a turn. Turns are this robot's least accurate
+        # move: against the true trajectory (11 runs, 16-19 Oct) the worst 10%
+        # are off by 1.9 deg up to 25 deg, 7.4 deg at 25-90 deg and 9.5 deg past
+        # 90 deg, while straight drives are good to 1.4% (heading_error_bound:
+        # turn_error_p90). _blind_turn is the turning done since a frame last
+        # confirmed the heading, _unchecked_drift how far sideways the drives
+        # since the position was last confirmed can have put the robot. Run
+        # 20261019-164113: a 146 deg turn with no marker in view, a 0.35 m
+        # drive, and the robot was 10 cm from where it thought, with 10 cm of
+        # turn room by its own map and none really -- the re-localise turn
+        # hit marker 9.
+        #  - turn_checked(): a turn over mid_turn_check_deg whose end heading
+        #    shows no known marker stops once on the way, where the map puts
+        #    one in view, so the heading is checked and only a small (accurate)
+        #    turn is left; 0 = off.
+        #  - drift_margin: make_turn_room() asks for the drift since the last
+        #    check on top of pan_clearance (creeping out for it, else only
+        #    for the plain pan_clearance, else no pan), and drive_to_point()
+        #    shortens a leg whose end could really have less than
+        #    TURN_CLEARANCE.
+        #  - leg_turn_room: make_turn_room() also before a leg's own turn of
+        #    more than 30 deg (it guarded only the pans: the same run turned
+        #    134 deg with 1.5 cm of room by its own map).
+        self.turn_error_p90 = ((0.0, 2.0), (25.0, 2.0), (90.0, 7.5), (180.0, 9.5))   # (turn deg, error deg)
+        self.mid_turn_check_deg = 60.0
+        self.mid_turn_max_rest_deg = 60.0   # at most this much left to turn after the stop
+        self.mid_turn_min_rest_deg = 8.0    # at least this much (a turn of a tick or two is skipped)
+        self.drift_margin = True
+        self.end_room_min_leg = 0.10        # a leg is never shortened below this
+        self.leg_turn_room = True
+        self._blind_turn = 0.0
+        self._unchecked_drift = 0.0
+        self.turn_check_stats = {'mid_stops': 0, 'mid_confirmed': 0, 'mid_none': 0, 'shortened': 0,
+                                 'margin_moves': 0, 'leg_turn_moves': 0}
         # relocalise(): when the map offers no direction, at most
         # max_spare_sweeps look-anywhere sweeps, and only headings with at
         # least min_view_depth of arena in front of the camera -- and only
@@ -2541,6 +2607,7 @@ class Navigator:
             if forward > self.fruit_max_range:
                 continue
             lateral = -(x_c - cx) * forward / f
+            forward += self._fruit_camera_offset()
             m = Marker(np.array([[forward], [lateral]]), self.fruit_tags[label])
             m.noise_scale = self.fruit_noise_scale
             out.append(m)
@@ -2617,6 +2684,10 @@ class Navigator:
             return
         self.fruit_mapper.observe(self._last_boxes, here, only=self._map_only)
 
+    def _fruit_camera_offset(self):
+        """Camera ahead of the pose (m) for box ranges -- FruitMapper.camera_offset."""
+        return self.fruit_mapper.camera_offset if self.fruit_mapper is not None else 0.0
+
     def _box_range(self, label, box):
         """Pinhole range of one box (m), from its height -- inf if unknown."""
         dims = self.object_dimensions or (self.fruit_mapper.dims if self.fruit_mapper is not None else {})
@@ -2656,13 +2727,16 @@ class Navigator:
         the pose before/after. Behaviour is identical with or without a log."""
         sd_before = math.sqrt(max(float(self.ekf.P[2, 2]), 0.0))
         if self.log is None:
+            prev_diag = self.ekf.last_diagnostics
             result = self._apply_measurements_core(aruco, fruits, allow_anchor)
             self._record_refit_node(aruco, sd_before)
+            self._note_frame_check(result, prev_diag)
             return result
         before = self._pose_list()
         prev_diag = self.ekf.last_diagnostics
         result = self._apply_measurements_core(aruco, fruits, allow_anchor)
         self._record_refit_node(aruco, sd_before)
+        self._note_frame_check(result, prev_diag)
         diag = self.ekf.last_diagnostics
         markers = []
         for lm in aruco or []:
@@ -2685,6 +2759,52 @@ class Navigator:
                        pose_after=self._pose_list(), P_robot=[float(P[0, 0]), float(P[1, 1]), float(P[2, 2])],
                        diag=(diag if diag is not prev_diag else []), **extra)
         return result
+
+    def _note_frame_check(self, result, prev_diag):
+        """After one frame (_apply_measurements_core's result): what it
+        confirmed. The heading -- an anchor, a one-marker heading fix, an
+        update with a marker the gate let through, or a fused face heading --
+        ends the unchecked turning (_blind_turn); the position -- an anchor
+        or two markers through the gate -- also the unchecked drift."""
+        if self.slam_live:
+            return
+        mode = result[0]
+        if mode == 'anchor':
+            self._blind_turn = 0.0
+            self._unchecked_drift = 0.0
+            return
+        if mode == 'heading':
+            self._blind_turn = 0.0
+        elif mode == 'update':
+            diag = self.ekf.last_diagnostics
+            accepted = [d for d in (diag if diag is not prev_diag else None) or []
+                        if d['tag'] < FRUIT_TAG_BASE and not d['gated']]
+            if accepted:
+                self._blind_turn = 0.0
+            if len(accepted) >= 2:
+                self._unchecked_drift = 0.0
+        face = self._face_frame
+        if face is not None and getattr(face, 'fused', 0):
+            self._blind_turn = 0.0
+
+    def heading_error_bound(self):
+        """Worst-10% heading error (rad) the turning since the heading was last
+        confirmed can have left (turn_error_p90, interpolated; past the last
+        entry it grows with the square root of the angle, as independent
+        errors add)."""
+        a = math.degrees(self._blind_turn)
+        pts = self.turn_error_p90
+        if a >= pts[-1][0]:
+            return math.radians(pts[-1][1] * math.sqrt(a / pts[-1][0]))
+        for (a0, e0), (a1, e1) in zip(pts[:-1], pts[1:]):
+            if a <= a1:
+                return math.radians(e0 + (e1 - e0) * (a - a0) / max(a1 - a0, 1e-9))
+        return math.radians(pts[-1][1])
+
+    def unchecked_margin(self):
+        """Extra turn room (m) for the drift since the position was last
+        confirmed (0 with drift_margin off)."""
+        return self._unchecked_drift if self.drift_margin else 0.0
 
     def _apply_measurements_core(self, aruco, fruits, allow_anchor=True):
         """
@@ -2843,8 +2963,19 @@ class Navigator:
             p0['fused' if res.fused else ('held' if res.held else 'gated')] += 1
             p0['moved'] += res.moved_deg
             p0['innov'].append(abs(res.innov_deg))
-        if self.face_heading and (res.fused or res.gated or res.held):
-            problem = self.marker_corrector.squareness_problem()
+        # Squareness is judged on frames AFTER phase 0 only. During the start
+        # sweep the turns are not learnt yet and the heading drifts between
+        # markers, so square blocks disagree with it too: run 20261019-233552
+        # (4 blocks 0.28 m round the start, too close to read) had 21 of 40
+        # sweep frames held, switched the faces off on square blocks, and
+        # every re-fit after that would have turned the map 21 deg (all 12
+        # refused, the map never corrected).
+        if live:
+            self._sq_since = None
+        elif getattr(self, '_sq_since', None) is None:
+            self._sq_since = self.marker_corrector.squareness_counts()
+        if self.face_heading and not live and (res.fused or res.gated or res.held):
+            problem = self.marker_corrector.squareness_problem(since=self._sq_since)
             if problem is not None:
                 # Blocks that don't sit square to the arena would bend the heading
                 # (and the map with it): stop using the faces' directions. Block
@@ -3291,6 +3422,7 @@ class Navigator:
             if depth > 2.0 or (hasattr(m, 'box_too_close') and m.box_too_close(box)):
                 continue   # too far to trust, or too close to fit in the frame (clipped box)
             left = -(float(np.asarray(box).reshape(-1)[0]) - m.cx) * depth / m.f
+            depth += m.camera_offset   # from here on: ahead of the pose (the axle), not the camera
             est = m.fruit_ekf.estimates.get(label)
             if est is not None:
                 wx = px + depth * math.cos(pth) - left * math.sin(pth)
@@ -4251,6 +4383,7 @@ class Navigator:
                 continue
             forward = f * dims[2] / box_h
             lateral = -(x_c - cx) * forward / f
+            forward += self._fruit_camera_offset()   # ahead of the robot's centre, which reach is measured from
             reach = path_planner.ROBOT_RADIUS + 0.5 * max(dims[0], dims[1]) + margin
             if forward <= 0 or abs(lateral) >= reach:
                 continue
@@ -4346,6 +4479,8 @@ class Navigator:
         self._dist_since_check = 0.0
         self._straight_skips = 0
         self.last_check_skipped = False
+        self._blind_turn = 0.0
+        self._unchecked_drift = 0.0
 
     def straight_check(self, trusted_at_start):
         """
@@ -4650,7 +4785,7 @@ class Navigator:
         for label, box in boxes:
             if label in on_map or (only is not None and label not in only) or label not in m.dims:
                 continue
-            x, y = estimate_pose(robot_pose, box, m.dims[label][2], m.f, m.cx)
+            x, y = m.box_world(label, box, robot_pose)
             self.rough_sightings.setdefault(label, []).append((float(x), float(y)))
 
     def rough_position(self, label):
@@ -5086,6 +5221,15 @@ class Navigator:
                            dt=float(dt), speeds=[float(v) for v in wheel_speeds], pose_after=self._pose_list(),
                            **(log_extra or {}))
         self._dist_since_check += abs(distance) + (1.0 if not completed else 0.0)
+        # what this move leaves unchecked (see heading_error_bound; phase 0 is plain SLAM)
+        if not self.slam_live:
+            if abs(distance) > 0.0:
+                self._unchecked_drift += abs(distance) * math.sin(min(self.heading_error_bound(), math.pi / 2))
+            if abs(dtheta) > 0.0:
+                self._blind_turn += abs(dtheta)
+            if not completed:
+                self._blind_turn += np.deg2rad(20.0)
+                self._unchecked_drift += 0.10
         if abs(distance) > 0.0 or not completed:
             self._pos_trusted = False   # it drove (or a move was cut short): the position is in question again
 
@@ -5093,41 +5237,74 @@ class Navigator:
     # Driving
     # ------------------------------------------------------------------
 
-    def make_turn_room(self, why):
+    def make_turn_room(self, why, fresh=True, pan=True):
         """
-        Before a pan on the spot (relocalise(), pan_at_fruit(), scan_around()):
-        with under pan_clearance of room to turn here, first drive a few cm
-        straight out to where there is (_turn_room_exit: along the heading
-        or backwards, at most a 30 deg turn first); failing that, to where
-        there is TURN_CLEARANCE. Planned legs already end turn_safe(), but
-        the pose check on arrival can move the estimate a few cm closer to
-        something -- and every pan after that turned regardless.
+        Before a pan on the spot (relocalise(), pan_at_fruit(), scan_around())
+        or, with pan=False, a leg's own big turn (drive_to_point): with under
+        pan_clearance of room to turn here, first drive a few cm straight out
+        to where there is (_turn_room_exit: along the heading or backwards,
+        at most a 30 deg turn first); failing that, to where there is
+        TURN_CLEARANCE. Planned legs already end turn_safe(), but the pose
+        check on arrival can move the estimate a few cm closer to something
+        -- and every pan after that turned regardless.
+        While the position is unconfirmed (unchecked_margin(): drives since
+        the last check after unchecked turns), that drift is asked for on
+        top; when no short way out gives it, the plain pan_clearance does
+        (as it is, or after a short way out), but not TURN_CLEARANCE.
+        @param fresh: read the pose from a new frame first (False: the
+                      current estimate)
         @return: True to go ahead with the pan, False to skip it (no short
                  straight way out: a pan here would sweep into something)
         """
         if self.pan_clearance <= 0.0 or not len(_BODIES):
             return True
-        x, y, th = (float(v) for v in self.get_robot_pose()[:3])
+        if fresh:
+            x, y, th = (float(v) for v in self.get_robot_pose()[:3])
+        else:
+            s = self.ekf.robot.state
+            x, y, th = float(s[0, 0]), float(s[1, 0]), float(s[2, 0])
         room = turn_room((x, y))
-        if room >= self.pan_clearance:
+        margin = self.unchecked_margin()
+        what = '{} pan'.format(why) if pan else why
+        if room >= self.pan_clearance + margin:
             return True
-        way = _turn_room_exit((x, y), th, self.pan_clearance, allow_reverse=self.allow_reverse)
-        if way is None and self.pan_clearance > TURN_CLEARANCE:
-            way = _turn_room_exit((x, y), th, TURN_CLEARANCE, allow_reverse=self.allow_reverse)
+        way, need = None, None
+        for need in ((self.pan_clearance + margin, TURN_CLEARANCE + margin) if margin > 0.005 else ()):
+            if room >= need:
+                break   # enough for the second rung already: no move for the first one alone
+            way = _turn_room_exit((x, y), th, need, allow_reverse=self.allow_reverse)
+            if way is not None:
+                break
+        if way is None and room >= self.pan_clearance:
+            return True   # the drift margin cannot be had here; the plain room is there
         if way is None:
-            print("  {:.1f} cm to turn here and no short straight way out -- no {} pan here".format(
-                max(room, 0.0) * 100, why))
+            # unconfirmed position: not down to TURN_CLEARANCE (really maybe
+            # `margin` less) -- no pan rather than that
+            for need in ((self.pan_clearance, TURN_CLEARANCE) if self.pan_clearance > TURN_CLEARANCE
+                         and margin <= 0.005 else (self.pan_clearance,)):
+                way = _turn_room_exit((x, y), th, need, allow_reverse=self.allow_reverse)
+                if way is not None:
+                    break
+        if way is None:
+            print("  {:.1f} cm to turn here and no short straight way out -- no {} here".format(
+                max(room, 0.0) * 100, what))
             if self.log is not None:
-                self.log.event('turn_room', action='skip', why=why, room=room, pose=[x, y, th])
+                self.log.event('turn_room', action='skip', why=why, room=room, pose=[x, y, th], margin=margin)
             return False
         dtheta, dist, reverse, room_after = way
-        print("  {:.1f} cm to turn here -- {} {:.0f} cm{} first ({:.1f} cm of room there), then the {} pan".format(
-            max(room, 0.0) * 100, 'backing' if reverse else 'creeping forward', dist * 100,
+        print("  {:.1f} cm to turn here{} -- {} {:.0f} cm{} first ({:.1f} cm of room there), then the {}".format(
+            max(room, 0.0) * 100,
+            " (+{:.0f} cm for the drift since the pose was last checked)".format(margin * 100) if margin > 0.005 else '',
+            'backing' if reverse else 'creeping forward', dist * 100,
             " after a {:+.0f} deg turn".format(math.degrees(dtheta)) if abs(dtheta) > 1e-6 else '',
-            room_after * 100, why))
+            room_after * 100, what))
         if self.log is not None:
-            self.log.event('turn_room', action='exit', why=why, room=room, pose=[x, y, th],
-                           dtheta=dtheta, distance=dist, reverse=reverse, room_after=room_after)
+            self.log.event('turn_room', action='exit', why=why, room=room, pose=[x, y, th], margin=margin,
+                           need=need, dtheta=dtheta, distance=dist, reverse=reverse, room_after=room_after)
+        if room >= self.pan_clearance:
+            self.turn_check_stats['margin_moves'] += 1
+        if not pan:
+            self.turn_check_stats['leg_turn_moves'] += 1
         if abs(dtheta) > 1e-6:
             self.turn(dtheta, speed=self.small_turn_speed)
         if reverse:
@@ -5135,6 +5312,60 @@ class Navigator:
         else:
             self.drive_forward(dist)
         return True
+
+    def turn_checked(self, dtheta):
+        """
+        turn() for a leg's big turn: one of more than mid_turn_check_deg whose
+        END heading shows no known marker (markers_in_view) stops once on the
+        way -- at the latest heading where the map puts a marker in view,
+        leaving between mid_turn_min_rest_deg and mid_turn_max_rest_deg to go
+        -- for one frame, which corrects the heading (a one-marker heading
+        fix, or the ordinary update), then turns the rest to the same world
+        heading from the corrected estimate. A big turn is off by up to
+        ~9.5 deg (worst 10%), a small one by ~2. No such heading on the way,
+        or a turn that ends facing a marker anyway (the frame after the turn
+        checks it): a plain turn().
+        @return: the rotation the EKF was told happened in total
+        """
+        if (self.mid_turn_check_deg <= 0.0 or abs(dtheta) <= math.radians(self.mid_turn_check_deg)
+                or self.slam_live or not self.relocalise_enabled or self.ekf.number_landmarks() == 0):
+            return self.turn(dtheta)
+        s = self.ekf.robot.state
+        x, y, th = float(s[0, 0]), float(s[1, 0]), float(s[2, 0])
+        goal = th + dtheta
+        if self.markers_in_view(x, y, goal) > 0:
+            return self.turn(dtheta)
+        step = math.radians(5.0)
+        sgn = 1.0 if dtheta > 0 else -1.0
+        first = None
+        for k in range(int(abs(dtheta) / step), 0, -1):
+            rest = abs(dtheta) - k * step
+            if rest < math.radians(self.mid_turn_min_rest_deg):
+                continue
+            if rest > math.radians(self.mid_turn_max_rest_deg):
+                break
+            if self.markers_in_view(x, y, th + sgn * k * step) > 0:
+                first = sgn * k * step
+                break
+        if first is None:
+            self.turn_check_stats['mid_none'] += 1
+            return self.turn(dtheta)
+        done = self.turn(first)
+        before = float(self.ekf.robot.state[2, 0])
+        self.get_robot_pose()
+        after = float(self.ekf.robot.state[2, 0])
+        confirmed = self._blind_turn == 0.0
+        self.turn_check_stats['mid_stops'] += 1
+        self.turn_check_stats['mid_confirmed'] += int(confirmed)
+        rest = _normalize_angle(goal - after)
+        print("  {:+.0f} deg turn: stopped after {:+.0f} deg where a marker should be in view -- {}, {:+.0f} deg "
+              "to go".format(math.degrees(dtheta), math.degrees(first),
+                             "heading checked ({:+.1f} deg)".format(math.degrees(_normalize_angle(after - before)))
+                             if confirmed else "no marker confirmed it", math.degrees(rest)))
+        if self.log is not None:
+            self.log.event('mid_turn', dtheta=dtheta, first=first, confirmed=confirmed,
+                           correction=_normalize_angle(after - before), rest=rest)
+        return done + self.turn(rest)
 
     def turn(self, dtheta, speed=None, noise_frac=None):
         """In-place turn by `dtheta` radians (positive = anticlockwise/left,
@@ -5348,6 +5579,17 @@ class Navigator:
         else:
             self._settle()
 
+    def turn_check_summary(self):
+        """One line for the end of the run: the unchecked-turn safeguards."""
+        st = self.turn_check_stats
+        if not any(st.values()):
+            return None
+        return ("Unchecked turns: {} big turn(s) stopped on the way at a marker ({} confirmed the heading), {} with "
+                "no marker on the way; {} leg(s) shortened for the room at the end; {} creep(s) for the drift "
+                "margin, {} before a leg's own turn".format(
+                    st['mid_stops'], st['mid_confirmed'], st['mid_none'], st['shortened'],
+                    st['margin_moves'], st['leg_turn_moves']))
+
     def drive_summary(self):
         """One line for the end of the run: how the drives were measured."""
         st = self._drive_stats
@@ -5538,17 +5780,54 @@ def drive_to_point(waypoint, nav, max_distance=None, relocalise=True, allow_reve
         print("  backing up to [{:.2f}, {:.2f}]: {:.0f} deg turn instead of {:.0f}, {} marker(s) in view at the end "
               "instead of {}".format(waypoint[0], waypoint[1], tr, tf, n_r, n_f))
 
+    def leg_heading(p):
+        return math.atan2(waypoint[1] - p[1], waypoint[0] - p[0]) + (math.pi if reverse else 0.0)
+
+    def leg_distance(p):
+        d = math.hypot(waypoint[0] - p[0], waypoint[1] - p[1])
+        return d if max_distance is None else min(d, max_distance)
+
+    def reaim():
+        """After a heading check: aim again from the checked pose."""
+        p = nav.get_robot_pose()
+        dt = _normalize_angle(leg_heading(p) - p[2])
+        if abs(dt) > nav.heading_tolerance:
+            nav.turn_checked(dt)
+            p = nav.get_robot_pose()
+        return p, leg_distance(p)
+
+    # The leg's own turn needs room too (make_turn_room guards the pans): with
+    # too little, drive a few cm straight out first.
+    first_turn = _normalize_angle(leg_heading(pose) - pose[2])
+    if (nav.leg_turn_room and not nav.slam_live and len(_BODIES) and abs(first_turn) > math.radians(30.0)
+            and turn_room(pose[:2]) < nav.pan_clearance + nav.unchecked_margin()):
+        blocked_before = (obstacles is not None and len(obstacles)
+                          and path_planner.segment_in_collision(tuple(pose[:2]), tuple(waypoint), obstacles))
+        start = pose.copy()
+        if not nav.make_turn_room("leg's {:+.0f} deg turn".format(math.degrees(first_turn)), fresh=False,
+                                  pan=False):
+            print("  turning anyway: the leg has to start from here")
+        s = nav.ekf.robot.state
+        if math.hypot(s[0, 0] - start[0], s[1, 0] - start[1]) > 0.005:
+            pose = nav.get_robot_pose()
+            if (obstacles is not None and len(obstacles) and not blocked_before
+                    and path_planner.segment_in_collision(tuple(pose[:2]), tuple(waypoint), obstacles)):
+                print("  the leg from here would cut into a safety circle -- ending it here, the route is planned "
+                      "again")
+                return pose
+
     for attempt in range(1 + nav.max_heading_corrections):
-        target_heading = math.atan2(waypoint[1] - pose[1], waypoint[0] - pose[0]) + (math.pi if reverse else 0.0)
+        target_heading = leg_heading(pose)
         dtheta = _normalize_angle(target_heading - pose[2])
         if attempt > 0 and abs(dtheta) <= nav.heading_tolerance:
             break
-        nav.turn(dtheta)
+        if attempt == 0:
+            nav.turn_checked(dtheta)
+        else:
+            nav.turn(dtheta)
         pose = nav.get_robot_pose()
 
-    distance = math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1])
-    if max_distance is not None:
-        distance = min(distance, max_distance)
+    distance = leg_distance(pose)
     if obstacles is not None and len(obstacles) and nav.relocalise_enabled and nav.check_tight_heading \
             and not between_markers:
         # A tight leg (a narrow gap, a pocket at the edge) with a heading
@@ -5571,15 +5850,49 @@ def drive_to_point(waypoint, nav, max_distance=None, relocalise=True, allow_reve
                       math.degrees(sd_t), max(room, 0.0) * 100, drift * 100))
             nav.n_tight_checks = getattr(nav, 'n_tight_checks', 0) + 1
             nav.relocalise(face_point=waypoint, face_reverse=reverse, face_any_gain=True)
-            pose = nav.get_robot_pose()
-            target_heading = math.atan2(waypoint[1] - pose[1], waypoint[0] - pose[0]) + (math.pi if reverse else 0.0)
-            dtheta = _normalize_angle(target_heading - pose[2])
-            if abs(dtheta) > nav.heading_tolerance:
-                nav.turn(dtheta)
-                pose = nav.get_robot_pose()
-            distance = math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1])
-            if max_distance is not None:
-                distance = min(distance, max_distance)
+            pose, distance = reaim()
+    if (nav.drift_margin and obstacles is not None and nav.relocalise_enabled and not nav.slam_live
+            and len(_BODIES) and distance > nav.min_move):
+        # The END of the leg: the robot turns there (the re-localise pan, the
+        # next leg). Arriving up to `drift` off -- what the drives since the
+        # last check plus this one can do with the heading as (un)checked as
+        # it is -- the turn room there, by its own map, may really be `drift`
+        # less. make_turn_room() on arrival asks for pan_clearance + drift and
+        # creeps out for it; this is for an end that could really be under
+        # TURN_CLEARANCE: end the leg earlier, where it is not (never below
+        # end_room_min_leg). (Checking the heading first instead was tried on
+        # the bench: where the markers are behind, the turn back to the leg is
+        # as big and as unchecked as before, and the extra turns in a tight
+        # spot made a contact of their own.)
+        sgn = -1.0 if reverse else 1.0
+        ux, uy = math.cos(pose[2]), math.sin(pose[2])
+        sin_b = math.sin(min(nav.heading_error_bound(), math.pi / 2))
+
+        def end_at(d):
+            return pose[0] + sgn * ux * d, pose[1] + sgn * uy * d
+
+        def drift_at(d):
+            return nav._unchecked_drift + d * sin_b
+
+        room_end = turn_room(end_at(distance))
+        if room_end < TURN_CLEARANCE + drift_at(distance) and drift_at(distance) > 0.02:
+            short = None
+            d = distance - 0.01
+            while d >= nav.end_room_min_leg:
+                if turn_room(end_at(d)) >= TURN_CLEARANCE + drift_at(d):
+                    short = d
+                    break
+                d -= 0.01
+            if short is not None:
+                print("  this leg can end up to {:.0f} cm off ({:.0f} deg of turning unchecked) with {:.1f} cm of "
+                      "turn room there -- driving {:.2f} m instead of {:.2f} m, to where there is room".format(
+                          drift_at(distance) * 100, math.degrees(nav._blind_turn), max(room_end, 0.0) * 100,
+                          short, distance))
+                if nav.log is not None:
+                    nav.log.event('leg_end_room', action='shorten', room_end=room_end, drift=drift_at(distance),
+                                  distance=distance, short=short, blind_turn=nav._blind_turn)
+                nav.turn_check_stats['shortened'] += 1
+                distance = short
     # The camera is facing along the drive now: if it sees a fruit in the
     # way, stop short of it, whatever the map says about this leg.
     ahead = None if reverse else nav.fruit_ahead(distance * 1.25)
@@ -8606,6 +8919,11 @@ if __name__ == "__main__":
                              "about to be clipped; its range reads 10-20 cm long): it does not update a mapped fruit, "
                              "and viewpoints stay far enough away. 0.55 = 264 px: capsicum ~0.43 m, lemon ~0.29 m. "
                              "0 turns it off")
+    parser.add_argument("--fruit-camera-offset", type=float, default=None, metavar="M",
+                        help="how far the camera sits ahead of the SLAM pose, added to every fruit box's range "
+                             "(m). Default: aruco_faces.json camera_offset (0.05) when marker readings are moved "
+                             "to the axle (faces on, or --dist-correction), 0 with --no-faces. 0 = the old "
+                             "behaviour (every fruit ~5 cm too close to where it was seen from)")
     parser.add_argument("--reanchor", action="store_true",
                         help="move a fruit to where its marker-anchored sightings (heading known to 2.5 deg, a "
                              "marker in the frame, within 1 m, from 2+ spots 30+ deg apart) agree, when that is 7+ cm "
@@ -8727,6 +9045,14 @@ if __name__ == "__main__":
                          help="room (m) to turn on the spot a pan needs (re-localise, fruit look, 360): with less, "
                               "the robot first drives a few cm straight out to where it has it (or --turn-clearance), "
                               "or skips the pan. 0 = pan wherever it is (as before)")
+    parser.add_argument("--mid-turn-deg", type=float, default=60.0, metavar="DEG",
+                         help="a leg's turn bigger than this, ending with no known marker in view, stops once on the "
+                              "way where the map puts one in view to check the heading; 0 = plain turns (as before)")
+    parser.add_argument("--no-drift-margin", action="store_true",
+                         help="don't shorten legs for the turn room at a leg's end, and don't ask the pans' turn room "
+                              "for the drift since the last pose check (as before)")
+    parser.add_argument("--no-leg-turn-room", action="store_true",
+                         help="don't make turn room before a leg's own turn of more than 30 deg (only the pans, as before)")
     parser.add_argument("--target-views", type=int, default=5,
                          help="Level 3: distinct directions a search-list fruit must be seen from to count as "
                               "pinned down")
@@ -8803,6 +9129,9 @@ if __name__ == "__main__":
     nav.tiny_hop = max(0.0, args.tiny_hop)
     TURN_CLEARANCE = max(0.0, args.turn_clearance)
     nav.pan_clearance = max(0.0, args.pan_clearance)
+    nav.mid_turn_check_deg = max(0.0, args.mid_turn_deg)
+    nav.drift_margin = not args.no_drift_margin
+    nav.leg_turn_room = not args.no_leg_turn_room
     TURN_RADIUS = args.turn_radius
     nav.small_turn_speed = args.small_turn_speed
     nav.small_turn_max_deg = max(0.0, args.small_turn_deg)
@@ -8858,6 +9187,13 @@ if __name__ == "__main__":
     nav.fruit_mapper = FruitMapper(ekf.robot.camera_matrix, object_dimensions,
                                    expected_labels=search_list, min_sd=args.fruit_min_sd)
     nav.fruit_mapper.score_labels = sorted(object_dimensions)   # every fruit counts for the object map
+    if args.fruit_camera_offset is not None:
+        nav.fruit_mapper.camera_offset = float(args.fruit_camera_offset)
+    elif faces_cfg.get('faces', True) or args.dist_correction:
+        # marker readings are moved to the axle, so the pose is the axle's
+        nav.fruit_mapper.camera_offset = float(faces_cfg.get('camera_offset') or 0.0)
+    print("Fruit ranges: camera {:.3f} m ahead of the pose (--fruit-camera-offset)".format(
+        nav.fruit_mapper.camera_offset))
     nav.fruit_mapper.target_min_spread_deg = args.target_spread
     nav.fruit_mapper.target_close_dist = args.target_close
     nav.fruit_mapper.target_min_views = max(1, args.target_views)
@@ -9033,6 +9369,8 @@ if __name__ == "__main__":
                   "{:.0f}% under 25 deg, max {:.0f} deg".format(len(r), np.median(r), 100 * np.mean(r <= 25), r.max()))
         if 'nav' in dir() and nav.drive_summary():
             print(nav.drive_summary())
+        if 'nav' in dir() and nav.turn_check_summary():
+            print(nav.turn_check_summary())
         if 'nav' in dir() and nav.settle_summary():
             print(nav.settle_summary())
         if 'nav' in dir() and nav._turn_scale_samples:
@@ -9062,6 +9400,7 @@ if __name__ == "__main__":
                 'submission': {'dir': args.out_dir, 'index': sub_index},
                 'turn_scale_learned': {'slow': nav.turn_scale, 'fast': nav.turn_scale_fast},
                 'refits_applied': nav.n_refits,
+                'turn_checks': dict(nav.turn_check_stats),
                 'faces': (nav.marker_corrector.summary() if nav.marker_corrector is not None else None),
                 'obstructions': ({'summary': nav.obstructions.summary(),
                                   'left': [{'id': o.id, 'xy': [o.x, o.y], 'sd': o.sd_eff, 'sightings': o.n,

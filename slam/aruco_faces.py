@@ -799,7 +799,12 @@ class MarkerCorrector:
                     out.append((f, sd))
         return out
 
-    def squareness_problem(self, min_frames=None, max_off=None):
+    def squareness_counts(self):
+        """(fused, gated, held) frame counts so far -- a baseline for squareness_problem(since=...)."""
+        s = self.stats
+        return s['frames_fused'], s['frames_gated'], s['held']
+
+    def squareness_problem(self, min_frames=None, max_off=None, since=None):
         """
         A guard for an arena whose blocks do NOT sit square to it (turned every
         which way): then the faces keep disagreeing with the heading -- frames
@@ -809,13 +814,16 @@ class MarkerCorrector:
         otherwise. Deliberately loose: early in a run, before the turns are
         learnt, a third of the frames can be held on square blocks too, and a
         run on blocks turned ~8 deg each still did better with the faces than
-        without them (simulation).
+        without them (simulation). since: a squareness_counts() baseline --
+        only frames after it count.
         """
         min_frames = self.cfg['squareness_min_frames'] if min_frames is None else min_frames
         max_off = self.cfg['squareness_max_off'] if max_off is None else max_off
-        s = self.stats
-        off = s['frames_gated'] + s['held']
-        n = s['frames_fused'] + off
+        fused, gated, held = self.squareness_counts()
+        if since is not None:
+            fused, gated, held = fused - since[0], gated - since[1], held - since[2]
+        off = gated + held
+        n = fused + off
         if n < min_frames or off <= max_off * n:
             return None
         return ("{} of {} frames' face headings disagreed with the heading (rejected, or big corrections no "

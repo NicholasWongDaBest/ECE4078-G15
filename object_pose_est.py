@@ -22,12 +22,16 @@ from slam.ekf import (in_frame_fraction, is_box_shape_plausible, resolve_confusa
                        CONFUSABLE_DISTANCE_THRESHOLD)
 
 # estimate the pose (x,y) of a detected object given its bbox and the robot's pose
-def estimate_pose(robot_pose, box, object_true_height, focal_length, cx):
+def estimate_pose(robot_pose, box, object_true_height, focal_length, cx, camera_offset=0.0):
     """
     robot_pose: [[x], [y], [theta]] -- world-frame robot pose from SLAM
     box: [x_center, y_center, width, height] in pixels (YOLO xywh)
     object_true_height: real-world height of the object (m)
     focal_length: fx from the camera intrinsic matrix
+    camera_offset: how far the camera sits ahead of the point robot_pose
+        describes (m). 0 when the pose is the camera's own position; with
+        ArUco block centres the pose is the wheel axle and the camera is
+        ~5 cm ahead of it, so the range is 5 cm short without it.
     """
     x_center, y_center, box_width, box_height = box
 
@@ -47,7 +51,7 @@ def estimate_pose(robot_pose, box, object_true_height, focal_length, cx):
     # Camera frame (forward=depth, image-right=x_camera) -> robot frame
     # (forward, left). "Left" is positive by convention (matches lm.position
     # in ekf.py/aruco_sensor.py), so image-right flips sign to become lateral.
-    forward = depth
+    forward = depth + camera_offset
     lateral = -x_camera
 
     # Rotate + translate from robot frame into world frame
