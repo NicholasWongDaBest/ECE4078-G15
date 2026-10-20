@@ -674,6 +674,15 @@ class ObstructionMap:
         # Two blocks nearer than 25 cm have no gap the robot fits through, so
         # one obstruction between them still keeps it out.
         self.merge_radius_max = merge_radius_max
+        # Camera ahead of the pose (m; main() sets it to FruitMapper.camera_offset):
+        # a box's range and bearing are the CAMERA's, so sightings are placed, and
+        # boxes compared with mapped markers, from the camera's position. From the
+        # axle every obstruction landed ~5 cm short: replayed on runs
+        # 20261020-134959/151720, 6.3-6.7 -> 2.6-2.8 cm median error, and at the
+        # start of 151720 the two blocks beside it went from 0.23-0.27 to
+        # 0.27-0.28 m -- clear of the marker-sized circles instead of boxing the
+        # start in (the drive home then dropped every obstruction and hit block 5).
+        self.camera_offset = 0.0
         self.replace_marker = replace_marker
         self.replace_marker_max = replace_marker_max
         self.replace_fruit = replace_fruit
@@ -3138,9 +3147,12 @@ class Navigator:
                 if a_ > 0.0:
                     decoded.append((int(lm.tag), math.atan2(l_, a_)))
             c, sn = math.cos(TH), math.sin(TH)
+            # the boxes' bearings and ranges are the camera's (ObstructionMap.camera_offset)
+            off = self.obstructions.camera_offset if self.obstructions is not None else 0.0
+            CX, CY = X + off * c, Y + off * sn
             mapped = []
             for t, (mx, my) in self.marker_positions().items():
-                a_, l_ = c * (mx - X) + sn * (my - Y), -sn * (mx - X) + c * (my - Y)
+                a_, l_ = c * (mx - CX) + sn * (my - CY), -sn * (mx - CX) + c * (my - CY)
                 if a_ > 0.05:
                     mapped.append((t, math.atan2(l_, a_), math.hypot(a_, l_)))
             tol_d = math.radians(2.0)
@@ -3221,6 +3233,8 @@ class Navigator:
         P = self.ekf.P
         sd_pos = math.sqrt(max(float(P[0, 0]) + float(P[1, 1]), 0.0))
         sd_t = math.sqrt(max(float(P[2, 2]), 0.0))
+        # each box is seen from the camera, camera_offset ahead of the pose
+        CX, CY = X + om.camera_offset * math.cos(TH), Y + om.camera_offset * math.sin(TH)
         now = time.time()
         for g in info:
             if g['decoded'] is not None or g['mapped'] is not None or g['range'] > om.max_range:
@@ -3236,11 +3250,11 @@ class Navigator:
             sd = math.sqrt(sd_pos ** 2 + (r * math.hypot(sd_t, sd_b)) ** 2 + sd_r ** 2)
             if sd > om.max_sd:
                 continue          # too unsure to place usefully (the look-ahead still sees the block)
-            x, y = X + r * math.cos(TH + b), Y + r * math.sin(TH + b)
+            x, y = CX + r * math.cos(TH + b), CY + r * math.sin(TH + b)
             if self._explained_by_map(x, y, sd):
                 continue
             o, new = om.add(x, y, sd, g['partial'], now, pose=(X, Y, TH), frame=self._yolo_frame,
-                            ray=(X, Y, TH, sd_t, g['span'][0], g['span'][1], g['range'], g['cut_v']))
+                            ray=(CX, CY, TH, sd_t, g['span'][0], g['span'][1], g['range'], g['cut_v']))
             if self.log is not None and new:
                 self.log.event('obstruction', action='noted', id=o.id, xy=[o.x, o.y], sd=o.sd,
                                range=r, partial=g['partial'], cut_v=g['cut_v'])
@@ -3270,6 +3284,8 @@ class Navigator:
         f, cx = float(K[0, 0]), float(K[0, 2])
         half_l, half_r = math.atan2(cx, f), math.atan2(self._yolo_wh[0] - cx, f)
         c, sn = math.cos(TH), math.sin(TH)
+        look = (X, Y, TH)                       # the robot's spot, for counting one miss per look
+        X, Y = X + om.camera_offset * c, Y + om.camera_offset * sn   # in view = from the camera
         others = list(self.marker_positions().values())
         if self.fruit_mapper is not None:
             others += list(self.fruit_mapper.positions().values())
@@ -3294,9 +3310,9 @@ class Navigator:
                 continue                                  # a marker block is there
             if any(ro < r - 0.05 and abs(_normalize_angle(bo - b)) <= math.atan2(0.06, ro) for ro, bo in others_rb):
                 continue                                  # hidden behind a mapped marker or fruit
-            if _same_look((X, Y, TH), o._miss_look):
+            if _same_look(look, o._miss_look):
                 continue                                  # this look already counted
-            o._miss_look = (X, Y, TH)
+            o._miss_look = look
             o.misses += 1
             if o.misses >= max(om.max_misses, o.looks):
                 om.drop(o, 'not_seen')
@@ -9239,6 +9255,7 @@ if __name__ == "__main__":
         nav.fruit_mapper.camera_offset = float(faces_cfg.get('camera_offset') or 0.0)
     print("Fruit ranges: camera {:.3f} m ahead of the pose (--fruit-camera-offset)".format(
         nav.fruit_mapper.camera_offset))
+    nav.obstructions.camera_offset = nav.fruit_mapper.camera_offset   # the same camera sees the marker boxes
     nav.fruit_mapper.target_min_spread_deg = args.target_spread
     nav.fruit_mapper.target_close_dist = args.target_close
     nav.fruit_mapper.target_min_views = max(1, args.target_views)
@@ -9309,7 +9326,8 @@ if __name__ == "__main__":
         'obstructions': (None if not nav.obstructions_enabled else
                          {k: getattr(nav.obstructions, k) for k in (
                              'box_height_m', 'half_block', 'max_range', 'close_range', 'cut_range_max',
-                             'merge_radius', 'replace_marker', 'replace_marker_max', 'replace_fruit', 'max_misses',
+                             'merge_radius', 'merge_radius_max', 'camera_offset', 'replace_marker',
+                             'replace_marker_max', 'replace_fruit', 'max_misses',
                              'miss_range', 'max_sd', 'max_extra', 'min_sightings', 'expire_frames')}),
         'noise': {'marker_sd_base': getattr(nav, 'marker_sd_base', None),
                   'marker_sd_per_m': getattr(nav, 'marker_sd_per_m', None),
