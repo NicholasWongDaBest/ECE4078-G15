@@ -155,6 +155,25 @@ def _jsonable(o):
     return str(o)
 
 
+def _face_records(aruco):
+    """Every ArUco face in one frame, for the run log: both pose solutions
+    (direction phi, reprojection error, printed rotation; deg / px) and what
+    MarkerCorrector picked, so the faces' heading, the squareness check and the
+    face IDs can be replayed offline -- logged whether or not the heading from
+    the faces is in use."""
+    out = []
+    for lm in aruco or []:
+        for f in getattr(lm, 'faces', None) or []:
+            out.append({'tag': int(f.tag), 'k': int(f.k), 'dist': round(float(f.dist), 4),
+                        'bearing': round(float(f.bearing), 2), 'u': round(float(f.u), 1),
+                        'pick': int(f.pick), 'why': f.why, 'coin': bool(f.coin),
+                        'phi': round(float(f.phi), 2), 'view': round(float(f.view), 2),
+                        'axis': None if f.axis is None else round(float(f.axis), 2),
+                        'sols': [[round(float(s.phi), 2), round(float(s.err), 4), round(float(s.rot), 2)]
+                                 for s in f.sols]})
+    return out
+
+
 def _summarise(v, limit=40):
     """Keep a log line small: a big array becomes its shape."""
     if isinstance(v, np.ndarray) and v.size > limit:
@@ -2754,6 +2773,9 @@ class Navigator:
             extra['faces'] = {'meas': round(fr.meas_deg, 2), 'sd': round(fr.sd_deg, 2),
                               'innov': round(fr.innov_deg, 2), 'fused': fr.fused, 'gated': fr.gated,
                               'held': fr.held, 'confirmed': fr.confirmed, 'moved': round(fr.moved_deg, 2)}
+        faces = _face_records(aruco)
+        if faces:
+            extra['face_reads'] = faces
         self.log.event('frame', mode=result[0], n_known=result[1], n_fruit=len(fruits or []),
                        slam_live=self.slam_live, markers=markers, pose_before=before,
                        pose_after=self._pose_list(), P_robot=[float(P[0, 0]), float(P[1, 1]), float(P[2, 2])],
@@ -3123,15 +3145,31 @@ class Navigator:
                     mapped.append((t, math.atan2(l_, a_), math.hypot(a_, l_)))
             tol_d = math.radians(2.0)
             tol_m = math.radians(3.0) + 2.0 * sd_t
-            for mk in self._marker_boxes:
+            for i_box, mk in enumerate(self._marker_boxes):
                 g = self._marker_box_geometry(mk)
                 if g is None:
                     continue
+                g['box'] = i_box   # index into this frame's marker boxes (run log)
                 lo, hi = g['span']
                 g['decoded'] = next((t for t, b in decoded if lo - tol_d <= b <= hi + tol_d), None)
                 g['mapped'] = next((t for t, b, r in mapped if lo - tol_m <= b <= hi + tol_m and (
                     r <= g['range'] + 0.15 if g['cut_v'] else abs(r - g['range']) <= max(0.25, 0.3 * r))), None)
                 out.append(g)
+            if self.log is not None:
+                # The CNN's marker boxes, as the obstructions and the look-ahead see
+                # them: raw box + geometry + what explained it, and the pose (with its
+                # variances) they are placed from -- enough to replay ObstructionMap
+                # offline. Once per YOLO frame that has any marker box.
+                P = self.ekf.P
+                self.log.event('marker_boxes', yolo_frame=self._yolo_frame, pose=[X, Y, TH],
+                               P_robot=[float(P[0, 0]), float(P[1, 1]), float(P[2, 2])],
+                               decoded=[[t, round(b, 4)] for t, b in decoded],
+                               boxes=[{'xyxy': [float(v) for v in mk.get('xyxy', ())],
+                                       'sides': list(mk.get('sides') or [])}
+                                      for mk in self._marker_boxes],
+                               geometry=[{**{k: (round(v, 4) if isinstance(v, float) else v)
+                                             for k, v in g.items() if k != 'span'},
+                                          'span': [round(s_, 4) for s_ in g['span']]} for g in out])
         self._marker_info = (self._yolo_frame, out)
         return out
 
@@ -8812,6 +8850,10 @@ if __name__ == "__main__":
                               "over-corrected, run_logs/20261007-134902)")
     parser.add_argument("--no-refit", action="store_true",
                          help="never re-fit the marker map after a viewpoint (default: re-fit after each one)")
+    parser.add_argument("--marker-size", type=float, default=0.06, metavar="M",
+                        help="edge of the printed black ArUco square (m), default 0.06. Every marker range scales "
+                             "with it: 5.7 cm markers read as 6 cm came out 5%% long and the whole map 5%% too big "
+                             "(runs 20261019-233552, 20261020-134959). The block edge stays 0.06")
     parser.add_argument("--no-faces", action="store_true",
                          help="ArUco faces off: face-centre readings and no heading from the faces (the run as "
                               "it was before slam/aruco_faces.py)")
@@ -9099,7 +9141,10 @@ if __name__ == "__main__":
         faces_cfg['one_marker_fix'] = True
     if args.no_face_ids:
         faces_cfg['face_ids'] = False
-    aruco_sensor = CorrectedArucoSensor(ekf.robot, marker_length=0.06, enabled=args.dist_correction,
+    # --marker-size wins over aruco_faces.json's marker_length (the sensor prefers the config's)
+    faces_cfg['marker_length'] = float(args.marker_size)
+    print("ArUco markers: {:.3f} m black square (--marker-size)".format(args.marker_size))
+    aruco_sensor = CorrectedArucoSensor(ekf.robot, marker_length=float(args.marker_size), enabled=args.dist_correction,
                                         faces_config=(faces_cfg if faces_cfg.get('faces', True) else None))
 
     tm = {'source': None} if args.no_turn_offset else load_turn_motion(args.calib_dir)
@@ -9223,6 +9268,8 @@ if __name__ == "__main__":
     nav.refit_enabled = not args.no_refit
     nav.refit_weight_heading = not args.no_refit_heading_weight
     nav.obstructions_enabled = not args.no_obstructions
+    # the CNN's marker box (square + white border) shrinks with the printed square
+    nav.obstructions.box_height_m *= float(args.marker_size) / 0.06
     if args.no_obstructions:
         ObstructionMap.active = None
         print("Obstructions: off (--no-obstructions)")
