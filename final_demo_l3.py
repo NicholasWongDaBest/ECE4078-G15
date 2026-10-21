@@ -6965,11 +6965,15 @@ def _look_at_target(nav, name, target, live_positions):
 def _phase0_frames(nav, obstacle_mapper, n_frames, gap=0.08):
     """n_frames live-SLAM updates where the robot stands, then the frames'
     consensus fruit boxes go to obstacle_mapper (stamped with the pose after
-    those updates). Only obstacles: the real fruit map starts in phase 1."""
+    those updates). Only obstacles: the real fruit map starts in phase 1.
+    @return: (arena marker tags read in any of the frames, fruit labels boxed
+    in at least two of them -- one when n_frames is 1), for _phase0_sweep()"""
     box_frames = []
+    tags = set()
     for _ in range(max(1, n_frames)):
         img = nav._latest_image()
         aruco, _ = nav.detect_markers(img)   # block centres with faces on, like every other frame
+        tags.update(int(lm.tag) for lm in (aruco or []) if int(lm.tag) in nav.valid_tags)
         nav._apply_measurements(aruco, [], allow_anchor=False)   # slam_live: faces, update + add_landmarks
         if nav.detector is not None:
             box_frames.append(nav._fruit_boxes(img))
@@ -6982,21 +6986,68 @@ def _phase0_frames(nav, obstacle_mapper, n_frames, gap=0.08):
         if boxes:
             s = nav.ekf.robot.state
             obstacle_mapper.observe(boxes, (s[0, 0], s[1, 0], s[2, 0]))
+    counts = {}
+    for frame in box_frames:
+        for label in {lab for lab, _ in frame}:
+            counts[label] = counts.get(label, 0) + 1
+    fruits = {lab for lab, n in counts.items() if n >= min(2, len(box_frames))}
+    return tags, fruits
 
 
-def _phase0_sweep(nav, obstacle_mapper, step, frames, overlap):
-    """One full turn on the spot plus `overlap`, SLAM-updating at every stop.
-    The overlap re-observes the first markers after the whole turn's heading
-    drift has built up -- the loop closure that pulls that drift back out of
-    the robot and every marker seeded along the way."""
-    total = 2.0 * math.pi + overlap
+def _phase0_sweep(nav, obstacle_mapper, step, frames, overlap, max_turn=np.deg2rad(480.0),
+                  resight_gap=np.deg2rad(270.0), where="sweep"):
+    """
+    One full turn on the spot, SLAM-updating at every stop, ended by what the
+    camera sees rather than by the angle: the sweep is round once something it
+    saw earlier -- a marker tag, or a fruit boxed in two of a stop's frames --
+    is in view again at least resight_gap later, and then turns `overlap`
+    further. That overlap re-observes the first markers after the whole turn's
+    heading drift has built up -- the loop closure that pulls that drift back
+    out of the robot and every marker seeded along the way.
+    Counting the angle alone came up short: a 10 deg request rounds to whole
+    ticks, one tick (~7 deg) at turn_scale ~0.65, and the sweep added up the
+    10 deg asked for -- 12 of 18 runs to Oct 20 stopped at 288-314 deg, with
+    no overlap at all and the last ~60 deg never seen (run 20261020-182059
+    missed markers 5 and 7 there). In the runs that did get round, the first
+    marker came back 344-371 deg after it was first seen, whatever turn_scale
+    was doing. The angle is still counted -- the rotation each turn() reports,
+    whole ticks and roll-on -- for the gap and for max_turn, where the sweep
+    stops if nothing comes back (a tag that won't decode the second time).
+    """
     turned = 0.0
-    _phase0_frames(nav, obstacle_mapper, frames)
-    while turned < total - 1e-6:
-        d = min(step, total - turned)
-        nav.turn(d)
-        turned += d
-        _phase0_frames(nav, obstacle_mapper, frames)
+    first = {}            # 'marker 3' / 'the capsicum' -> turned when first seen
+    back = None           # (what, turned when it came back, gap)
+    target = max_turn
+
+    def look():
+        nonlocal back, target
+        tags, fruits = _phase0_frames(nav, obstacle_mapper, frames)
+        for name in ['marker {}'.format(t) for t in sorted(tags)] + ['the {}'.format(f) for f in sorted(fruits)]:
+            if name not in first:
+                first[name] = turned
+            elif back is None and turned - first[name] >= resight_gap - 1e-6:
+                back = (name, turned, turned - first[name])
+                target = min(max_turn, turned + overlap)
+
+    look()
+    while turned < target - 1e-6:
+        d = min(step, target - turned)
+        got = abs(nav.turn(d))
+        turned += got if got > 0.0 else d   # a request under half a tick is skipped: count it so the loop ends
+        look()
+    if back is not None:
+        print("  {}: turned {:.0f} deg -- {} in view again {:.0f} deg after it was first seen, then {:.0f} deg "
+              "more".format(where, math.degrees(turned), back[0], math.degrees(back[2]),
+                            math.degrees(turned - back[1])))
+    else:
+        print("  {}: turned {:.0f} deg -- nothing seen early came back into view; stopped at the {:.0f} deg "
+              "cap".format(where, math.degrees(turned), math.degrees(max_turn)))
+    if nav.log is not None:
+        nav.log.event('phase0_sweep', where=where, turned_deg=math.degrees(turned),
+                      back=None if back is None else back[0],
+                      back_at_deg=None if back is None else math.degrees(back[1]),
+                      gap_deg=None if back is None else math.degrees(back[2]),
+                      seen={k: math.degrees(v) for k, v in first.items()})
 
 
 def _phase0_obstacles(nav, obstacle_mapper, bounds, safety_margin, fruit_margin, resolution, obstructions='full'):
@@ -7144,15 +7195,22 @@ def _phase0_next_viewpoint(nav, candidates, visited, marker_sd_ok, n_expected, o
     return best
 
 
-def map_markers(nav, bounds, step=np.deg2rad(10.0), frames=3, overlap=np.deg2rad(60.0), marker_sd_ok=0.05,
+def map_markers(nav, bounds, step=np.deg2rad(10.0), frames=3, overlap=np.deg2rad(15.0), marker_sd_ok=0.05,
                 n_expected=10, max_viewpoints=2, ring=0.50, safety_margin=0.10, fruit_margin=0.12,
-                object_dimensions=None):
+                object_dimensions=None, max_turn=np.deg2rad(480.0)):
     """
     Phase 0. With slam_live on, sweep 360 deg (+overlap) at the start pose;
     while fewer than n_expected markers are placed to within marker_sd_ok,
     drive to up to max_viewpoints extra points on a `ring` m circle and sweep
-    there too, then drive back to the start point. Fruits seen on the way
-    go into a throwaway FruitMapper, purely so these drives avoid them.
+    there too. Phase 1 starts wherever the last sweep ended: it used to drive
+    back to the start point first, but nothing after needs the robot there
+    (phase 1 re-localises and plans from wherever it is, and skips the centre
+    viewpoint because phase 0 swept it), and that blind ~0.5 m drive is what
+    went wrong -- in 3 of 18 runs it took the pose from 3 cm / 1-4 deg to
+    14-27 cm / 10-13 deg, run 20261020-151720 drove into block 5 on it and
+    20261020-205017 came back 6 cm off beside marker 1 and hit it turning
+    there; it also cost 5-10 s. Fruits seen on the way go into the fruit map
+    as obstacles for these drives.
     """
     print("\n=== Final demo, phase 0: mapping the ArUco markers (live SLAM) ===")
     nav.display.notify("Phase 0: mapping markers")
@@ -7208,7 +7266,7 @@ def map_markers(nav, bounds, step=np.deg2rad(10.0), frames=3, overlap=np.deg2rad
         nav._face_note()   # (resets the per-line face notes: phase 0 prints its own summary above)
         return len(good)
 
-    _phase0_sweep(nav, obstacle_mapper, step, frames, overlap)
+    _phase0_sweep(nav, obstacle_mapper, step, frames, overlap, max_turn=max_turn, where="start sweep")
     n_good = status("the start sweep")
 
     (bxmin, bxmax), (bymin, bymax) = bounds
@@ -7218,7 +7276,6 @@ def map_markers(nav, bounds, step=np.deg2rad(10.0), frames=3, overlap=np.deg2rad
                   for a in np.arange(16) * math.pi / 8]
     candidates = [c for c in candidates if bxmin < c[0] < bxmax and bymin < c[1] < bymax]
     visited = [start]
-    moved = False
     n_swept = 0
     while n_swept < max(0, int(max_viewpoints)) and n_good < n_expected:
         obs, _ = _phase0_obstacles(nav, obstacle_mapper, bounds, safety_margin, fruit_margin, 0.05)
@@ -7232,21 +7289,16 @@ def map_markers(nav, bounds, step=np.deg2rad(10.0), frames=3, overlap=np.deg2rad
         reached = _phase0_goto(nav, vp, obstacle_mapper, bounds, frames, safety_margin, fruit_margin)
         s = nav.ekf.robot.state
         moved_now = math.hypot(float(s[0, 0]) - before[0], float(s[1, 0]) - before[1])
-        moved = moved or moved_now > 0.02
         if not reached:
             if moved_now < 0.20:
                 print("    could not reach it -- trying another")
                 continue
             print("    could not reach it -- sweeping from here instead")
-        _phase0_sweep(nav, obstacle_mapper, step, frames, overlap)
+        _phase0_sweep(nav, obstacle_mapper, step, frames, overlap, max_turn=max_turn,
+                      where="viewpoint {} sweep".format(n_swept + 1))
         n_swept += 1
         n_good = status("viewpoint {}".format(n_swept))
 
-    if moved:
-        print("  back to the start point")
-        if not _phase0_goto(nav, start, obstacle_mapper, bounds, frames, safety_margin, fruit_margin):
-            print("    could not get back exactly -- phase 1 starts from here")
-        _phase0_frames(nav, obstacle_mapper, frames)
     if not nav.marker_positions():
         print("WARNING: phase 0 found NO markers -- the run continues on dead reckoning alone.")
 
@@ -8905,8 +8957,12 @@ if __name__ == "__main__":
                               "too little overlap to carry the heading from marker to marker)")
     parser.add_argument("--p0-frames", type=int, default=3,
                          help="phase 0: SLAM frames taken at each sweep stop")
-    parser.add_argument("--p0-overlap", type=float, default=60.0,
-                         help="phase 0: how far past 360 deg each sweep turns, deg (loop closure)")
+    parser.add_argument("--p0-overlap", type=float, default=15.0,
+                         help="phase 0: how far each sweep turns on once something seen early in it is in view "
+                              "again (the sweep is round: loop closure), deg")
+    parser.add_argument("--p0-sweep-max", type=float, default=480.0,
+                         help="phase 0: a sweep stops after this much turning (counted from the ticks) if nothing "
+                              "seen early in it comes back into view, deg")
     parser.add_argument("--p0-marker-sd", type=float, default=0.05,
                          help="phase 0: a marker counts as placed once its sd is under this, m")
     parser.add_argument("--p0-markers", type=int, default=10,
@@ -9361,7 +9417,7 @@ if __name__ == "__main__":
                     overlap=np.deg2rad(args.p0_overlap), marker_sd_ok=args.p0_marker_sd,
                     n_expected=args.p0_markers, max_viewpoints=args.p0_viewpoints, ring=args.p0_ring,
                     safety_margin=args.safety_margin, fruit_margin=args.explore_fruit_margin,
-                    object_dimensions=object_dimensions)
+                    object_dimensions=object_dimensions, max_turn=np.deg2rad(args.p0_sweep_max))
         lock_marker_map(nav)
         # First re-fit: the sweep's turn drift (8-12 deg in the logged runs)
         # comes out before anything is planned on the map; the phase-0 fruits
