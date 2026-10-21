@@ -207,12 +207,10 @@ class BotConnect:
                 camera_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 camera_socket.connect((self.robot_ip, self.camera_port))
                 print("Connected to camera server")
-                
+                camera_socket.sendall(b'\x01')   # ask for the first frame
+
                 while self.running:
                     try:
-                        # Signal ready for a new frame
-                        camera_socket.sendall(b'\x01')
-                        
                         size_data = camera_socket.recv(4, socket.MSG_WAITALL)
                         if not size_data or len(size_data) != 4:
                             print("Camera server disconnected")
@@ -224,7 +222,12 @@ class BotConnect:
                         if not jpeg_data or len(jpeg_data) != jpeg_size:
                             print("Incomplete frame received")
                             break
-                        
+                        # Ask for the next frame BEFORE decoding this one: the Pi starts
+                        # waiting for it while this one is decoded (the server answers
+                        # each request with a frame taken after the request arrived,
+                        # so asking early never makes a frame older)
+                        camera_socket.sendall(b'\x01')
+
                         image = cv2.imdecode(np.frombuffer(jpeg_data, np.uint8), cv2.IMREAD_COLOR)
                         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                         with self.frame_lock: self.frame = image # Update the global frame with thread safety

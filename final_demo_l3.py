@@ -2578,11 +2578,13 @@ class Navigator:
         self.ekf.P = P
         self.object_dimensions = dict(object_dimensions)
 
-    def enable_fruit_detection(self, yolo_path):
+    def enable_fruit_detection(self, yolo_path, device='gpu'):
         """Load the YOLO detector. Imported here, not at module level, so the
-        script still runs without ultralytics installed (--yolo-path '')."""
+        script still runs without ultralytics installed (--yolo-path '').
+        device: 'gpu' (default: an error at start-up if PyTorch has no CUDA,
+        rather than a run ~4x slower per frame), 'cpu' or 'auto'."""
         from cv.detector import ObjectDetector
-        self.detector = ObjectDetector(yolo_path)
+        self.detector = ObjectDetector(yolo_path, device=device)
 
     def _fruit_boxes(self, img):
         """
@@ -5647,18 +5649,17 @@ class Navigator:
         resets its counters) or never arrived."""
         bc = self.botconnect
         still = self.roll_still if still is None else still
-        step, waited, quiet = 0.02, 0.0, 0.0   # time kept in idle() steps (the window keeps updating)
+        # Real time, not counted idle() steps: a window redraw inside idle()
+        # can make a 20 ms step take twice that, which stretched these waits.
+        start = changed = time.time()
         last = tuple(bc.get_encoder_counts())
-        while waited < max_wait:
-            self.display.idle(step)
-            waited += step
+        while time.time() - start < max_wait:
+            self.display.idle(0.02)   # (the window keeps updating)
             c = tuple(bc.get_encoder_counts())
             if c != last:
-                last, quiet = c, 0.0
-            else:
-                quiet += step
-                if quiet >= still:
-                    break
+                last, changed = c, time.time()
+            elif time.time() - changed >= still:
+                break
         dl, dr = last[0] - before[0], last[1] - before[1]
         return None if dl < 0 or dr < 0 else (dl, dr)
 
@@ -5768,18 +5769,15 @@ class Navigator:
         get = getattr(self.botconnect, 'get_encoder_counts', None)
         if get is None or self.roll_still <= 0:
             return
-        step, waited, quiet = 0.02, 0.0, 0.0
+        start = changed = time.time()   # real time (see _counted_ticks)
         last = tuple(get())
-        while waited < self.still_max_wait:
-            self.display.idle(step)
-            waited += step
+        while time.time() - start < self.still_max_wait:
+            self.display.idle(0.02)
             c = tuple(get())
             if c != last:
-                last, quiet = c, 0.0
-            else:
-                quiet += step
-                if quiet >= self.roll_still:
-                    return
+                last, changed = c, time.time()
+            elif time.time() - changed >= self.roll_still:
+                return
 
     def _wait_fresh_frames(self, count, max_wait):
         """Until `count` new camera frames have arrived (BotConnect replaces
@@ -5790,10 +5788,9 @@ class Navigator:
         if not hasattr(bc, 'frame'):
             return False
         last = bc.frame
-        seen, waited, step = 0, 0.0, 0.01
-        while seen < count and waited < max_wait:
-            self.display.idle(step)
-            waited += step
+        seen, start = 0, time.time()   # real time (see _counted_ticks)
+        while seen < count and time.time() - start < max_wait:
+            self.display.idle(0.01)
             cur = bc.frame
             if cur is not last and cur is not None:
                 seen += 1
@@ -7513,7 +7510,7 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                looks_on_the_way=2, look_max_range=1.0, look_min_range=0.40, look_min_new=np.deg2rad(30.0),
                tight_leg_length=0.25, viewpoint_looks=3, viewpoint_look_range=(0.30, 1.1), viewpoint_others_bonus=1.0,
                park_early_range=1.5, centre_scanned=False, squeeze_margins=(0.025, 0.02), squeeze_leg=0.15,
-               early_park_max_route=2.0, explore_max_route=2.5, explore_extra_legs=8,
+               early_park_max_route=2.0, explore_max_route=2.5, explore_extra_legs=8, explore_max_detour=2.0,
                **level1_kwargs):
     """
     M3 Level 3: only the ArUco markers are given. Map the fruits first, then
@@ -7611,7 +7608,9 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
     max_route), and a drive to one still getting shorter after _go_to's 12
     legs may take explore_extra_legs more. In the 21 runs to Oct 20, 14 of
     the 17 trips of 3 m or more were given up after 12 legs, 5 of them with
-    the fruit then too far to look at -- 21-144 s each for nothing.
+    the fruit then too far to look at -- 21-144 s each for nothing. A spot the
+    planner only falls back on (a narrow gap, the tighter margins) is refused
+    when its route is over explore_max_detour x the straight distance.
     """
     display = nav.display
     getattr(display, 'start_timer', lambda: None)()   # no-op if ENTER in setup already started it
@@ -8023,7 +8022,8 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                                                  avoid=avoid, grid=grid, planner=planner, rough=rough, tried=tried,
                                                  others_bonus=(viewpoint_others_bonus if viewpoint_looks else 0.0),
                                                  others_range=tuple(viewpoint_look_range),
-                                                 others_min_new=look_min_new, max_route=explore_max_route)
+                                                 others_min_new=look_min_new, max_route=explore_max_route,
+                                                 max_detour=explore_max_detour)
                 if vp is None and (not_ok() or mapper.others_pending()
                                    or any(not mapper.target_ready(l) for l in search_list
                                           if l in mapper.positions())):
@@ -8040,7 +8040,8 @@ def run_level3(nav, search_list, aruco_true_pos, mapper, planner='astar', grid_r
                                                            others_bonus=(viewpoint_others_bonus if viewpoint_looks
                                                                          else 0.0),
                                                            others_range=tuple(viewpoint_look_range),
-                                                           others_min_new=look_min_new, max_route=explore_max_route)
+                                                           others_min_new=look_min_new, max_route=explore_max_route,
+                                                           max_detour=explore_max_detour, detour_all=True)
                     if vp_t is not None:
                         vp, focus, tight_route = vp_t, focus_t, True
                         why = why_t + " (reachable only with tighter margins: the exploring ones seal it off)"
@@ -8562,7 +8563,8 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
                     crowd_dist=0.45, max_crowd=3, sightline_extra=0.06, corner_inset=0.05,
                     obstacle_weight=0.7, corner_bonus=0.5, edge_bonus=0.25, outward_bonus=0.3,
                     drive_cost=0.25, others_bonus=0.0, others_range=(0.30, 1.1),
-                    others_min_new=np.deg2rad(30.0), max_route=None):
+                    others_min_new=np.deg2rad(30.0), max_route=None, max_detour=None, detour_min=1.5,
+                    detour_all=False):
     """
     Where to look from next, and at which fruit. Exploration is spent on the
     SEARCH-LIST fruits only -- the others just have to be on the map as
@@ -8634,7 +8636,16 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
     by its planned route (or in a straight line) is only offered when no
     nearer one works -- per metre the drives cost ~28 s, and the drive_cost
     term alone let corner spots 4-5 m away win, most of which were given
-    up after 12 legs.
+    up after 12 legs. max_detour (ratio, None = off): a FALLBACK spot -- one
+    reachable only through a narrow gap, or any spot when detour_all (the
+    caller's tight-margin retry) -- whose route is more than max_detour x
+    its straight-line distance (and over detour_min m) is refused: the gap
+    it was picked for is the one the drive then avoids, by going round.
+    Run 20261021-160807 drove 5.83 m round the arena for a spot 0.89 m away
+    (given up after 12 legs, nothing seen) and 6.07 m for one 1.11 m away;
+    replayed on 25 runs this skips 14 trips, 12 of them given up anyway --
+    1155 s saved, -0.15 object-grade points a run (-3.6 at worst, assuming
+    no later look recovers anything).
     @return: ((x, y), reason, focus_label), or (None, reason, None)
     """
     if bounds is None:
@@ -8856,6 +8867,11 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
             segs = segs[1:]
         gap = min((path_planner.segment_clearance(a, b, obstacles) for a, b in segs), default=math.inf)
         return gap, path_planner.path_length(path_planner.smooth_path(path, obstacles))
+    detoured = 0
+
+    def is_detour(p, length):
+        return (max_detour is not None and length > detour_min
+                and length > max_detour * path_planner.dist_between(start, p))
     for _, p, why, label in scored:
         if tried.get(label, 0) >= per_label_tries:
             continue
@@ -8874,8 +8890,13 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
         gap, length = route
         if gap < min_route_clearance:
             squeezed += 1
-            if narrow is None and gap >= -0.03:
+            if is_detour(p, length):
+                detoured += 1   # the drive would go round, not through the gap
+            elif narrow is None and gap >= -0.03:
                 narrow = (p, why + " (through a narrow gap)", label)
+            continue
+        if detour_all and is_detour(p, length):
+            detoured += 1
             continue
         if max_route is not None and length > max_route:
             if far is None:
@@ -8896,8 +8917,13 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
         gap, length = route
         if gap < min_route_clearance:
             squeezed += 1
-            if narrow is None and gap >= -0.03:
+            if is_detour(p, length):
+                detoured += 1
+            elif narrow is None and gap >= -0.03:
                 narrow = (p, why + " (through a narrow gap)", label)
+            continue
+        if detour_all and is_detour(p, length):
+            detoured += 1
             continue
         return p, why + " ({:.1f} m drive: no nearer spot offers this)".format(length), label
     if narrow is not None:
@@ -8908,9 +8934,10 @@ def _next_viewpoint(mapper, expected, pose, obstacles, ring, bounds=None, detect
         # (that is how the robot went to park with lime, mango and redapple
         # each seen once).
         return narrow
-    return None, "no reachable viewpoint from a new bearing around {}{}{}".format(
+    return None, "no reachable viewpoint from a new bearing around {}{}{}{}".format(
         ", ".join(weight), " ({} only through a tight gap)".format(squeezed) if squeezed else "",
-        " ({} sealed off by obstacles)".format(sealed) if sealed else ""), None
+        " ({} sealed off by obstacles)".format(sealed) if sealed else "",
+        " ({} only by a detour of more than {:g}x the distance)".format(detoured, max_detour) if detoured else ""), None
 
 
 def _fixed_views_for(fixed, labels, mapper, pose, detect_range=1.3, min_new=np.deg2rad(25.0), reachable=None):
@@ -9160,13 +9187,13 @@ if __name__ == "__main__":
                               "explains) on the map and no stopping short of them before a drive")
     parser.add_argument("--log-dir", type=str, default='run_logs',
                          help="run logs go to <log-dir>/<date-time>/ (see RunLog, analyze_run.py)")
-    parser.add_argument("--p0-step", type=float, default=13.0,
+    parser.add_argument("--p0-step", type=float, default=7.0,
                          help="phase 0 (marker + fruit mapping): turn step of each 360 deg sweep, deg. Turns are "
-                              "whole wheel ticks: 13 is two (12.8-13.9 deg), 10 rounds down to one (~7). The camera "
-                              "sees 31 deg across, so at 13 an object is in view at 2-3 stops; replaying the "
-                              "phase-0 re-fit of 7 runs with every other ~7 deg stop left the marker map within "
-                              "0.04 cm on average (worst +0.5 cm) and saves ~30 s a sweep. At ~21 deg it was "
-                              "0.5 cm worse and lost a marker")
+                              "whole wheel ticks, and 7 is always one (~7 deg) whatever turn_scale is learnt (10 "
+                              "became two ticks once turn_scale rose). Two-tick steps (13) turn 10-20%% less than "
+                              "the turn model says: the sweeps came round only after 397-440 deg counted, the "
+                              "faces' heading fixes fell 9-19 deg behind and were held, and run 20261021-134903's "
+                              "markers came out 3.5 cm (88) -- one-tick steps gave 1.2-2.5 cm (96-100)")
     parser.add_argument("--p0-frames", type=int, default=3,
                          help="phase 0: SLAM frames taken at each sweep stop")
     parser.add_argument("--p0-overlap", type=float, default=15.0,
@@ -9304,6 +9331,11 @@ if __name__ == "__main__":
                          help="Level 3: a viewpoint further than this by the planned route (m) is only chosen when "
                               "no nearer one helps; 0 = no limit (14 of 17 trips of 3 m+ were given up after "
                               "12 legs)")
+    parser.add_argument("--explore-max-detour", type=float, default=2.0,
+                         help="Level 3: a viewpoint the planner falls back on (through a narrow gap, or only with the "
+                              "tighter margins) is refused when its route is more than this many times the straight "
+                              "distance (and over 1.5 m): the drive goes round instead (5.8 m for a spot 0.9 m away). "
+                              "0 = off")
     parser.add_argument("--explore-extra-legs", type=int, default=8,
                          help="Level 3: legs a viewpoint drive may take past 12 while each one still gets at "
                               "least 5 cm closer; 0 = give up at 12 as before")
@@ -9329,6 +9361,9 @@ if __name__ == "__main__":
                               "cv/model/M3_best.pt is the old fruit-only model (was best.pt). The default model "
                               "also has a 'marker' class: marker blocks it sees that no ArUco marker explains "
                               "become obstructions (ObstructionMap)")
+    parser.add_argument("--yolo-device", choices=['gpu', 'cpu', 'auto'], default='gpu',
+                         help="where YOLO runs: gpu (default; stops at start-up if PyTorch has no CUDA, instead of "
+                              "running ~4x slower per frame), cpu, or auto (the GPU if there is one)")
     parser.add_argument("--no-fruit-localise", action="store_true",
                          help="don't use fruit detections to correct the robot pose")
     parser.add_argument("--planner", choices=['astar', 'rrt'], default='astar',
@@ -9562,7 +9597,7 @@ if __name__ == "__main__":
     if not args.yolo_path or args.no_fruit_localise:
         sys.exit("Level 3 needs the fruit detector (--yolo-path) to map the fruits.")
     try:
-        nav.enable_fruit_detection(args.yolo_path)
+        nav.enable_fruit_detection(args.yolo_path, device=args.yolo_device)
     except Exception as e:
         sys.exit("Fruit detector not loaded ({}) -- Level 3 cannot map the fruits.".format(e))
     print(f"Planner: {args.planner}" + (f" (grid {args.grid_res} m)" if args.planner == 'astar' else ""))
@@ -9570,7 +9605,8 @@ if __name__ == "__main__":
           + (f" and a {args.early_park_max_route:g} m route" if args.early_park_max_route > 0 else "")
           + f", views over {args.early_park_spread:g} deg, up to {args.early_park_views_short} view(s) short. "
           f"Viewpoints over {args.explore_max_route:g} m away only when nothing nearer helps; "
-          f"{args.explore_extra_legs} extra legs while a drive still gets closer")
+          f"{args.explore_extra_legs} extra legs while a drive still gets closer"
+          + (f"; fallback viewpoints refused past a {args.explore_max_detour:g}x detour" if args.explore_max_detour > 0 else ""))
 
     nav.log = run_log
     nav.refit_enabled = not args.no_refit
@@ -9687,6 +9723,7 @@ if __name__ == "__main__":
                    early_park_max_route=max(0.0, args.early_park_max_route),
                    explore_max_route=(args.explore_max_route if args.explore_max_route > 0 else None),
                    explore_extra_legs=max(0, args.explore_extra_legs),
+                   explore_max_detour=(args.explore_max_detour if args.explore_max_detour > 0 else None),
                    centre_scanned=nav.fruit_mapper is not None and bool(nav.fruit_mapper.positions()))
         print("Level 3 run finished.")
         # Save the final map NOW, before waiting for ESC: closing the terminal at
